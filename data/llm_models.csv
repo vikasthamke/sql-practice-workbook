@@ -1,0 +1,6 @@
+model_name,provider,context_window,is_self_hosted,released_on
+atlas-large,Atlas Labs,128000,false,2024-03-01
+atlas-mini,Atlas Labs,128000,false,2024-07-01
+nimbus-pro,Nimbus AI,200000,false,2024-09-01
+nimbus-lite,Nimbus AI,32000,false,2024-11-01
+orbit-8b,self-hosted,8192,true,2025-01-15

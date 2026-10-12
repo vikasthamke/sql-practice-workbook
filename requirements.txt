@@ -1,0 +1,11 @@
+# Nothing in this file is required to use the workbook with psql, pgAdmin,
+# MySQL Workbench or the mysql CLI. The data generator, setup builder and
+# validation scripts use only the Python standard library (Python 3.9+).
+#
+# Optional: open the notebook and run queries from it via sql_practice.py
+#   pip install -r requirements.txt
+jupyterlab>=4.1          # notebook UI (4.1+ renders the Mermaid ER diagram)
+sqlalchemy>=2.0          # connect() / run() / check() in sql_practice.py
+pandas>=2.0              # tabular results in the notebook
+psycopg[binary]>=3.1     # PostgreSQL driver  (connection URL: postgresql+psycopg://...)
+pymysql>=1.1             # MySQL driver       (connection URL: mysql+pymysql://...)

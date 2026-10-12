@@ -1,0 +1,813 @@
+### SQL-001
+title: European mid-size and enterprise accounts created in 2024
+difficulty: Easy
+primary: SELECT with column aliases and WHERE
+secondary: IN, half-open date range, ORDER BY, CAST to DATE
+concepts: select_alias, where, in_not_in, order_by, cast, date_functions
+roles: DS
+time: 5
+dialect: BOTH
+tables: organizations(org_id, org_name, segment, country_code, created_at)
+columns: org_id, org_name, segment, country_code, created_date
+compare: ordered
+@context
+Sales operations wants a quick list of the larger European accounts that signed up during calendar year 2024 so they can be offered a regional onboarding workshop.
+@problem
+Return every organization whose `segment` is `'Mid-Market'` or `'Enterprise'`, whose `country_code` is Germany (`DE`), the United Kingdom (`GB`) or the Netherlands (`NL`), and that was created in calendar year 2024 (UTC).
+Show the creation date only (no time part) in a column called `created_date`.
+@expected
+One row per organization with columns `org_id, org_name, segment, country_code, created_date`.
+Sort by `created_date`, then `org_id`.
+@edge_cases
+- "Created in 2024" must include 2024-12-31 23:59:59 and exclude 2025-01-01 00:00:00.
+- Several organizations can be created on the same date, so `org_id` is needed as a tie-breaker.
+- Soft-deleted organizations are still customers for this list (no filter on `is_deleted`).
+@hint1
+You need three independent filters combined with AND: one on segment, one on country, one on the creation time.
+@hint2
+`IN (...)` is the readable way to test membership in a short list. For the time filter, prefer a half-open range `>= start AND < next_start` over functions on the column.
+@hint3
+`WHERE segment IN (...) AND country_code IN (...) AND created_at >= '2024-01-01' AND created_at < '2025-01-01'`, then `CAST(created_at AS DATE) AS created_date` in the SELECT list.
+@solution
+SELECT org_id,
+       org_name,
+       segment,
+       country_code,
+       CAST(created_at AS DATE) AS created_date
+FROM organizations
+WHERE segment IN ('Mid-Market', 'Enterprise')
+  AND country_code IN ('DE', 'GB', 'NL')
+  AND created_at >= TIMESTAMP '2024-01-01 00:00:00'
+  AND created_at <  TIMESTAMP '2025-01-01 00:00:00'
+ORDER BY created_date, org_id;
+@explanation
+1. `IN` keeps the segment and country filters short and readable; each list is an OR in disguise.
+2. The year filter uses a **half-open interval**: `>= 2024-01-01 00:00:00` and `< 2025-01-01 00:00:00`. It includes every instant of 2024 regardless of the time part and does not wrap the column in a function, so an index on `created_at` stays usable.
+3. `CAST(created_at AS DATE)` drops the time for display only. Ordering by the alias `created_date` is allowed in both engines because ORDER BY is evaluated after SELECT.
+4. `org_id` makes the ordering deterministic when two organizations share a date.
+
+`TIMESTAMP '...'` is the standard typed literal and works in PostgreSQL and MySQL. A plain string `'2024-01-01'` would also be converted implicitly.
+@mistakes
+- `EXTRACT(YEAR FROM created_at) = 2024` returns the right rows but prevents index use on large tables.
+- `created_at BETWEEN '2024-01-01' AND '2024-12-31'` silently drops everything after midnight on 31 December.
+- Writing `segment = 'Mid-Market' OR segment = 'Enterprise' AND country_code IN (...)` without parentheses changes the meaning (AND binds tighter than OR).
+@performance
+On a large table, a B-tree index on `(country_code, created_at)` or `(created_at)` serves this query. A function on the column, such as `EXTRACT(YEAR FROM created_at)`, would need an expression index instead.
+@interview
+Interviewers look for half-open date ranges and deterministic ordering. They also check that the candidate knows about the BETWEEN-with-timestamps trap without being prompted.
+
+### SQL-002
+title: Distinct acquisition channels including unknowns
+difficulty: Easy
+primary: DISTINCT
+secondary: COALESCE, NULL as a value in DISTINCT, ORDER BY
+concepts: distinct, coalesce_nullif, null_logic
+roles: DS
+time: 5
+dialect: BOTH
+tables: users(acquisition_channel)
+columns: channel
+compare: ordered
+@context
+Marketing is cleaning up its channel taxonomy and needs the list of channel values that actually occur in the user table, including users whose channel was never captured.
+@problem
+List every distinct acquisition channel found in `users`. Show missing channels (NULL) as the text `'unknown'`. Return one row per channel, sorted alphabetically.
+@expected
+Column `channel`; one row per distinct value; sorted ascending. Expect six rows (five real channels plus `unknown`).
+@edge_cases
+- DISTINCT treats all NULLs as one group, so without COALESCE NULL would appear once as an empty value.
+- If a real channel were literally called 'unknown' it would merge with NULLs. Here it is not, but a reviewer would ask.
+@hint1
+DISTINCT works on the expressions in the SELECT list, not only on raw columns.
+@hint2
+Replace NULL with a label before de-duplicating, using COALESCE.
+@hint3
+`SELECT DISTINCT COALESCE(acquisition_channel, 'unknown') AS channel FROM users ORDER BY channel;`
+@solution
+SELECT DISTINCT COALESCE(acquisition_channel, 'unknown') AS channel
+FROM users
+ORDER BY channel;
+@explanation
+`SELECT DISTINCT` removes duplicate result rows after the SELECT expressions have been computed. Applying `COALESCE` first turns the NULL group into the visible label `'unknown'`. NULLs are "not distinct from each other" for DISTINCT and GROUP BY, even though `NULL = NULL` is not true in a WHERE clause.
+
+Ordering by the alias is portable. Sorting the raw column would place NULL differently in the two engines: PostgreSQL puts NULLs last in ascending order, MySQL puts them first. Labelling NULL avoids that difference.
+@mistakes
+- `WHERE acquisition_channel IS NOT NULL` hides the data-quality signal the team asked for.
+- `COUNT(DISTINCT acquisition_channel)` returns 5, because aggregate DISTINCT ignores NULLs, while `SELECT DISTINCT` returns 6 groups. Mixing up the two is a classic off-by-one.
+@performance
+DISTINCT needs a sort or a hash over the expression. On 1,800 rows that is trivial. On very large tables, a GROUP BY on an indexed column can sometimes use the index.
+@interview
+Shows whether the candidate knows how DISTINCT treats NULLs, as opposed to `=` and COUNT(DISTINCT).
+
+### SQL-003
+title: Marketing consent and three-valued logic
+difficulty: Easy
+primary: NULL and three-valued logic
+secondary: conditional aggregation, IS NULL, boolean comparison
+concepts: null_logic, is_null, conditional_aggregation, boolean_logic
+roles: DS
+time: 8
+dialect: BOTH
+tables: users(user_id, marketing_opt_in)
+columns: opted_in, opted_out, unknown, naive_not_opted_in, correct_not_opted_in
+compare: ordered
+@context
+A campaign must only target users who opted in, and the compliance team wants to know how many users must NOT be e-mailed. `marketing_opt_in` is TRUE, FALSE or NULL (never asked).
+@problem
+Return a single row with:
+- `opted_in`: users with TRUE
+- `opted_out`: users with FALSE
+- `unknown`: users with NULL
+- `naive_not_opted_in`: the count produced by `WHERE marketing_opt_in <> TRUE`
+- `correct_not_opted_in`: users who must not be e-mailed (FALSE **or** NULL)
+@expected
+Exactly one row, five integer columns. `opted_in + opted_out + unknown` equals the number of users. `correct_not_opted_in = opted_out + unknown`.
+@edge_cases
+- `NULL <> TRUE` evaluates to NULL (unknown), and WHERE keeps only TRUE, so NULL rows vanish from the naive count.
+- In MySQL a BOOLEAN is TINYINT(1), so TRUE is 1. The comparison logic is the same.
+@hint1
+Count each category with a CASE expression inside SUM, so everything comes back in one row.
+@hint2
+`CASE WHEN marketing_opt_in IS NULL THEN 1 ELSE 0 END` counts NULLs. Comparisons with `=` never match NULL.
+@hint3
+For the naive count, use `SUM(CASE WHEN marketing_opt_in <> TRUE THEN 1 ELSE 0 END)`. A NULL condition makes CASE fall through to ELSE, which is exactly what WHERE does.
+@solution
+SELECT SUM(CASE WHEN marketing_opt_in = TRUE  THEN 1 ELSE 0 END) AS opted_in,
+       SUM(CASE WHEN marketing_opt_in = FALSE THEN 1 ELSE 0 END) AS opted_out,
+       SUM(CASE WHEN marketing_opt_in IS NULL THEN 1 ELSE 0 END) AS unknown,
+       SUM(CASE WHEN marketing_opt_in <> TRUE THEN 1 ELSE 0 END) AS naive_not_opted_in,
+       SUM(CASE WHEN marketing_opt_in IS NULL OR marketing_opt_in = FALSE
+                THEN 1 ELSE 0 END)                                AS correct_not_opted_in
+FROM users;
+@assert
+num(rows[0][4]) == num(rows[0][1]) + num(rows[0][2])
+num(rows[0][3]) == num(rows[0][1])
+@explanation
+SQL uses three-valued logic: a comparison involving NULL yields UNKNOWN. A WHERE clause, and a `CASE WHEN`, only take the TRUE branch, so rows whose condition is UNKNOWN behave like FALSE. That is why `naive_not_opted_in` equals `opted_out`: the NULL users are silently lost.
+
+The correct condition names the NULL case explicitly. PostgreSQL offers `marketing_opt_in IS NOT TRUE`, which is TRUE for FALSE and NULL. MySQL also supports `IS NOT TRUE`, but the explicit `IS NULL OR = FALSE` form reads clearly in any engine.
+
+Conditional aggregation (`SUM(CASE ...)`) returns all counts in one pass over the table.
+@mistakes
+- Using `NOT marketing_opt_in` has the same NULL problem as `<> TRUE`.
+- `COUNT(marketing_opt_in)` counts only non-NULL values, which is another way the unknown group goes missing.
+- Writing `marketing_opt_in = NULL` matches nothing. Use `IS NULL`.
+@performance
+A single scan with conditional aggregation is better than five separate COUNT queries.
+@interview
+A very common screening question. Strong candidates explain *why* the naive count is wrong (UNKNOWN is filtered out) rather than just fixing it.
+
+### SQL-004
+title: Operator precedence in a revenue filter
+difficulty: Easy
+primary: AND, OR, NOT precedence
+secondary: parentheses, IN, half-open date range
+concepts: boolean_logic, where, in_not_in, date_functions
+roles: DS
+time: 6
+dialect: BOTH
+tables: orders(order_id, status, sales_channel, order_ts)
+columns: buggy_count, correct_count
+compare: ordered
+@context
+An analyst wrote `WHERE status = 'completed' OR status = 'refunded' AND sales_channel = 'web' AND order_ts >= '2025-01-01' AND order_ts < '2025-04-01'` to count Q1-2025 web orders that generated revenue at some point. The number looks far too high.
+@problem
+Return one row with two counts: `buggy_count` evaluates the analyst's filter exactly as written, and `correct_count` counts orders that are (completed or refunded) **and** web **and** placed in Q1 2025.
+@expected
+One row, columns `buggy_count, correct_count`. The buggy count is much larger.
+@edge_cases
+- AND binds tighter than OR, so the buggy filter counts every completed order ever placed, through any channel.
+- Q1 2025 is `[2025-01-01, 2025-04-01)`.
+@hint1
+Rewrite the buggy condition with explicit parentheses to see what the database actually evaluates.
+@hint2
+`a OR b AND c` means `a OR (b AND c)`.
+@hint3
+Put each filter inside a `SUM(CASE WHEN <condition> THEN 1 ELSE 0 END)` and wrap the status test in parentheses (or use IN) for the correct version.
+@solution
+SELECT SUM(CASE WHEN status = 'completed' OR status = 'refunded'
+                     AND sales_channel = 'web'
+                     AND order_ts >= TIMESTAMP '2025-01-01 00:00:00'
+                     AND order_ts <  TIMESTAMP '2025-04-01 00:00:00'
+                THEN 1 ELSE 0 END) AS buggy_count,
+       SUM(CASE WHEN status IN ('completed', 'refunded')
+                     AND sales_channel = 'web'
+                     AND order_ts >= TIMESTAMP '2025-01-01 00:00:00'
+                     AND order_ts <  TIMESTAMP '2025-04-01 00:00:00'
+                THEN 1 ELSE 0 END) AS correct_count
+FROM orders;
+@explanation
+Precedence is NOT, then AND, then OR. The buggy filter is evaluated as
+`status = 'completed' OR (status = 'refunded' AND sales_channel = 'web' AND <Q1>)`,
+so every completed order in the whole history passes. Using `IN ('completed','refunded')`, or wrapping the OR in parentheses, gives the intended logic.
+
+Putting both conditions inside conditional aggregation shows the two numbers side by side, which is a good habit when you debug a filter.
+@mistakes
+- Fixing only the date part, or adding parentheses in the wrong place, such as `(status = 'completed' OR status = 'refunded' AND sales_channel = 'web')`.
+- Assuming the database evaluates conditions left to right.
+@performance
+No difference: both conditions are evaluated in one scan.
+@interview
+Tests careful reading of boolean logic. Mentioning that `IN` avoids the trap altogether is a plus.
+
+### SQL-005
+title: BETWEEN and timestamp boundaries
+difficulty: Easy
+primary: BETWEEN
+secondary: half-open intervals, timestamp literals
+concepts: between, date_functions, where
+roles: DS
+time: 6
+dialect: BOTH
+tables: orders(order_id, order_ts)
+columns: naive_between, between_end_of_day, half_open
+compare: ordered
+@context
+The monthly revenue report for March 2025 uses `order_ts BETWEEN '2025-03-01' AND '2025-03-31'`. Finance noticed that orders placed on 31 March are missing.
+@problem
+Return one row with three counts of orders placed in March 2025:
+1. `naive_between`: `order_ts BETWEEN '2025-03-01' AND '2025-03-31'`
+2. `between_end_of_day`: `order_ts BETWEEN '2025-03-01 00:00:00' AND '2025-03-31 23:59:59'`
+3. `half_open`: `order_ts >= '2025-03-01' AND order_ts < '2025-04-01'`
+@expected
+One row with three integers. Only `half_open` is robust.
+@edge_cases
+- `'2025-03-31'` compared to a timestamp means `2025-03-31 00:00:00`.
+- The end-of-day variant works for whole-second data but breaks once the column stores fractional seconds (e.g. 23:59:59.5).
+@hint1
+BETWEEN is inclusive on both ends. Think about what the upper bound means for a timestamp column.
+@hint2
+Count each variant with `SUM(CASE WHEN ... THEN 1 ELSE 0 END)`.
+@hint3
+The half-open interval `>= first day AND < first day of next month` is correct for any precision.
+@solution
+SELECT SUM(CASE WHEN order_ts BETWEEN TIMESTAMP '2025-03-01 00:00:00'
+                                  AND TIMESTAMP '2025-03-31 00:00:00' THEN 1 ELSE 0 END) AS naive_between,
+       SUM(CASE WHEN order_ts BETWEEN TIMESTAMP '2025-03-01 00:00:00'
+                                  AND TIMESTAMP '2025-03-31 23:59:59' THEN 1 ELSE 0 END) AS between_end_of_day,
+       SUM(CASE WHEN order_ts >= TIMESTAMP '2025-03-01 00:00:00'
+                 AND order_ts <  TIMESTAMP '2025-04-01 00:00:00' THEN 1 ELSE 0 END) AS half_open
+FROM orders;
+@assert
+num(rows[0][0]) < num(rows[0][2])
+num(rows[0][1]) == num(rows[0][2])
+@explanation
+`BETWEEN a AND b` means `>= a AND <= b`. When `b` is a date literal compared with a timestamp, it becomes midnight at the *start* of 31 March, so the last day is lost. The "23:59:59" patch works for this dataset because it stores whole seconds. It fails with fractional seconds, and it is easy to get wrong for months of different lengths. The half-open form needs only the first day of the next period and is precise for any column type.
+@mistakes
+- Using `CAST(order_ts AS DATE) BETWEEN ...`. It is correct, but it disables a plain index on `order_ts`.
+- Assuming BETWEEN is exclusive on the upper bound.
+@performance
+All three predicates are sargable (index friendly) because the column is not wrapped in a function.
+@interview
+Expect follow-up questions on fractional seconds and on time zones, for example whether March means March in UTC or in local time.
+
+### SQL-006
+title: SLA targets with CASE and a custom sort order
+difficulty: Easy
+primary: CASE expressions
+secondary: CASE in ORDER BY, date filter
+concepts: case, order_by, where
+roles: DS
+time: 7
+dialect: BOTH
+tables: support_tickets(ticket_id, priority, status, created_at)
+columns: ticket_id, priority, sla_hours, status_group
+compare: ordered
+@context
+The support dashboard shows the response-time target for every new ticket. Targets: urgent = 1 hour, high = 4, medium = 24, low = 72. Tickets in status `open` or `pending` are "active"; `resolved` and `closed` are "done".
+@problem
+For tickets created in the last 3 days of data (from 2025-06-28 00:00 up to, but excluding, 2025-07-01), return `ticket_id`, `priority`, the target as `sla_hours`, and `status_group` (`'active'` or `'done'`). Sort by priority severity (urgent first, then high, medium, low), then by `ticket_id`.
+@expected
+One row per ticket in the window; columns `ticket_id, priority, sla_hours, status_group`; custom priority order.
+@edge_cases
+- Sorting by `priority` alphabetically would give high, low, medium, urgent, which is wrong.
+- A CASE without ELSE returns NULL for an unexpected value; decide whether that is acceptable.
+@hint1
+Use one CASE to map priority to hours and another to map status to a group.
+@hint2
+ORDER BY accepts any expression, including a CASE that turns a label into a rank number.
+@hint3
+`ORDER BY CASE priority WHEN 'urgent' THEN 1 WHEN 'high' THEN 2 WHEN 'medium' THEN 3 ELSE 4 END, ticket_id`.
+@solution
+SELECT ticket_id,
+       priority,
+       CASE priority
+            WHEN 'urgent' THEN 1
+            WHEN 'high'   THEN 4
+            WHEN 'medium' THEN 24
+            WHEN 'low'    THEN 72
+       END AS sla_hours,
+       CASE WHEN status IN ('open', 'pending') THEN 'active' ELSE 'done' END AS status_group
+FROM support_tickets
+WHERE created_at >= TIMESTAMP '2025-06-28 00:00:00'
+  AND created_at <  TIMESTAMP '2025-07-01 00:00:00'
+ORDER BY CASE priority WHEN 'urgent' THEN 1 WHEN 'high' THEN 2 WHEN 'medium' THEN 3 ELSE 4 END,
+         ticket_id;
+@explanation
+The *simple* CASE form (`CASE priority WHEN 'urgent' THEN ...`) compares one expression against several values. The *searched* form (`CASE WHEN status IN (...) THEN ...`) evaluates arbitrary conditions in order and returns the first match.
+
+The custom sort works because ORDER BY can use an expression that is not in the SELECT list. In production, store a priority rank in a lookup table so that the same mapping is not copy-pasted across reports.
+@mistakes
+- `ORDER BY priority` sorts alphabetically.
+- Forgetting ELSE in the status CASE would return NULL for a future status like `'on_hold'`.
+@performance
+Negligible here. CASE expressions are evaluated per row after filtering.
+@interview
+Simple, but interviewers watch for deterministic tie-breaking and a sensible default (ELSE) branch.
+
+### SQL-007
+title: Effective annual price per plan with COALESCE
+difficulty: Easy
+primary: COALESCE and NULLIF
+secondary: arithmetic, CASE for display labels, ROUND
+concepts: coalesce_nullif, arithmetic, case, null_logic
+roles: DS
+time: 7
+dialect: BOTH
+tables: plans(plan_name, price_per_seat_month, annual_discount_pct, seat_limit, is_active)
+columns: plan_name, price_per_seat_month, annual_price_per_seat_month, seat_limit_label
+compare: ordered
+@context
+The pricing page shows each active plan's monthly price, the effective monthly price when billed annually, and its seat limit. Plans that do not offer annual billing have a NULL discount, and unlimited plans have a NULL seat limit.
+@problem
+For active plans only, return `plan_name`, `price_per_seat_month`, `annual_price_per_seat_month` (monthly price after the annual discount, rounded to 2 decimals; equal to the monthly price when no discount exists), and `seat_limit_label` (`'unlimited'` when NULL, otherwise e.g. `'50 seats'`). Sort by `price_per_seat_month`.
+@expected
+5 rows (the legacy plan is inactive), columns as listed, cheapest first.
+@edge_cases
+- `price * (1 - NULL/100)` is NULL. Arithmetic with NULL yields NULL.
+- String concatenation with NULL differs by engine: `CONCAT` ignores NULL in PostgreSQL but returns NULL in MySQL.
+@hint1
+Replace the missing discount by 0 before doing arithmetic.
+@hint2
+`COALESCE(annual_discount_pct, 0)` turns NULL into 0. Divide by `100.0` to stay in decimal arithmetic.
+@hint3
+Build the label with `CASE WHEN seat_limit IS NULL THEN 'unlimited' ELSE CONCAT(seat_limit, ' seats') END`, which is safe in both engines because CONCAT never sees a NULL.
+@solution
+SELECT plan_name,
+       price_per_seat_month,
+       ROUND(price_per_seat_month * (1 - COALESCE(annual_discount_pct, 0) / 100.0), 2)
+           AS annual_price_per_seat_month,
+       CASE WHEN seat_limit IS NULL THEN 'unlimited'
+            ELSE CONCAT(seat_limit, ' seats')
+       END AS seat_limit_label
+FROM plans
+WHERE is_active = TRUE
+ORDER BY price_per_seat_month, plan_name;
+@explanation
+`COALESCE(x, 0)` returns the first non-NULL argument, so plans without annual billing get no discount instead of a NULL price. Dividing by `100.0` (not `100`) keeps the arithmetic in DECIMAL. PostgreSQL would do integer division if both operands were integers; here the column is DECIMAL, so it is safe either way, but the habit matters.
+
+The label is built inside a CASE so that CONCAT never receives a NULL. That matters because **CONCAT treats NULL differently**: PostgreSQL skips NULL arguments, while MySQL returns NULL. `CONCAT_WS` and PostgreSQL's `||` operator have their own rules too. MySQL's `||` is logical OR unless `PIPES_AS_CONCAT` is enabled.
+
+NULLIF is the mirror image of COALESCE: `NULLIF(a, b)` returns NULL when `a = b`. Its classic use, `x / NULLIF(y, 0)`, appears in many later questions.
+@mistakes
+- `price * (1 - annual_discount_pct / 100)` returns NULL for the Free plan.
+- Using `||` for concatenation in MySQL.
+@performance
+Not relevant for a 6-row lookup table.
+@interview
+Tests NULL propagation in arithmetic and awareness of engine-specific string concatenation.
+
+### SQL-008
+title: Line-level revenue and discount percentage
+difficulty: Easy
+primary: Arithmetic expressions
+secondary: NULLIF to avoid division by zero, decimal precision, ROUND
+concepts: arithmetic, coalesce_nullif, cast
+roles: DS
+time: 8
+dialect: BOTH
+tables: order_items(order_id, line_number, product_id, quantity, unit_price, discount_amount); orders(order_id, order_ts)
+columns: order_id, line_number, product_id, gross_amount, discount_amount, net_amount, discount_pct
+compare: ordered
+@context
+Finance wants to audit discounting on Black Friday 2024 (2024-11-29, UTC). For every order line placed that day, they need the gross and net amounts and the discount as a percentage of gross.
+@problem
+For order lines whose order was placed on 2024-11-29, return `order_id`, `line_number`, `product_id`, `gross_amount` (= quantity x unit_price), `discount_amount`, `net_amount` (gross - discount) and `discount_pct` (discount / gross x 100, rounded to 1 decimal; NULL if gross is 0). Sort by `order_id`, `line_number`.
+@expected
+One row per order line on that date. Monetary columns with 2 decimals, `discount_pct` with 1 decimal.
+@edge_cases
+- A zero gross amount would cause a division-by-zero error in PostgreSQL. MySQL returns NULL (with a warning) in its default mode.
+- Integer x decimal is decimal in both engines. No rounding happens until ROUND.
+@hint1
+Join the lines to their order header only to filter by the order date.
+@hint2
+Protect the division with `NULLIF(gross, 0)`: dividing by NULL returns NULL instead of an error.
+@hint3
+`ROUND(100.0 * discount_amount / NULLIF(quantity * unit_price, 0), 1)`.
+@solution
+SELECT oi.order_id,
+       oi.line_number,
+       oi.product_id,
+       oi.quantity * oi.unit_price                              AS gross_amount,
+       oi.discount_amount,
+       oi.quantity * oi.unit_price - oi.discount_amount         AS net_amount,
+       ROUND(100.0 * oi.discount_amount
+             / NULLIF(oi.quantity * oi.unit_price, 0), 1)       AS discount_pct
+FROM order_items oi
+JOIN orders o ON o.order_id = oi.order_id
+WHERE o.order_ts >= TIMESTAMP '2024-11-29 00:00:00'
+  AND o.order_ts <  TIMESTAMP '2024-11-30 00:00:00'
+ORDER BY oi.order_id, oi.line_number;
+@explanation
+- `quantity * unit_price` multiplies an INT by a DECIMAL(10,2) and keeps 2 decimals in both engines.
+- `NULLIF(x, 0)` returns NULL when x is 0, and any division by NULL yields NULL, so the query cannot fail on a free line.
+- Multiplying by `100.0` before dividing keeps precision. Dividing first and multiplying later also works for decimals, but it can lose digits with integer columns.
+
+The join to `orders` is one-to-many from orders to lines, but we only use it to filter, so no duplication occurs: each line has exactly one parent order.
+@mistakes
+- Computing `discount_amount / quantity * unit_price`. Without parentheses this divides by the quantity only.
+- Filtering on `DATE(order_ts) = '2024-11-29'`. The result is correct, but the column is wrapped in a function, and `DATE()` does not exist in PostgreSQL.
+@performance
+The index on `orders(order_ts)` supports the date filter; `order_items` is reached through its primary key `(order_id, line_number)`.
+@interview
+Tests safe division and precision handling, both of which come up in every metric question.
+
+### SQL-009
+title: Spot e-mails that are not normalized
+difficulty: Medium
+primary: String functions
+secondary: LOWER, TRIM, SUBSTRING, POSITION, case-sensitive comparison, collations
+concepts: string_functions, where, ds_duplicates
+roles: DS, MLE
+time: 12
+dialect: BOTH
+tables: users(user_id, email)
+columns: user_id, raw_email, normalized_email, email_domain
+compare: ordered
+@context
+Duplicate accounts are suspected. Before deduplicating, the data team wants to see every user whose stored e-mail differs from its normalized form (lower case, no surrounding spaces), together with the extracted domain.
+@problem
+Return `user_id`, `raw_email` (as stored), `normalized_email` (`LOWER(TRIM(email))`) and `email_domain` (the part after `@` of the normalized e-mail) for users whose stored e-mail is not already normalized. Sort by `user_id`.
+@expected
+One row per affected user (about two dozen rows). Columns as listed.
+@edge_cases
+- **MySQL's default collation `utf8mb4_0900_ai_ci` is case-insensitive**, so `'Anna@x.com' <> 'anna@x.com'` is FALSE in MySQL and those rows disappear. The comparison must be made case-sensitive explicitly.
+- Trailing spaces: the default `utf8mb4_0900_ai_ci` and `utf8mb4_0900_bin` collations are NO PAD (trailing spaces count), but the legacy `utf8mb4_bin` collation is PAD SPACE and ignores trailing spaces in comparisons.
+@hint1
+Compute the normalized form, then keep rows where it differs from the stored value.
+@hint2
+Domain = substring starting one character after the position of '@'. `POSITION('@' IN s)` and `SUBSTRING(s FROM n)` work in both engines.
+@hint3
+In MySQL, compare with a case-sensitive NO PAD collation: `email COLLATE utf8mb4_0900_bin <> LOWER(TRIM(email)) COLLATE utf8mb4_0900_bin` (or compare `CAST(... AS BINARY)`). PostgreSQL compares case-sensitively by default.
+@solution_pg
+SELECT user_id,
+       email                                    AS raw_email,
+       LOWER(TRIM(email))                       AS normalized_email,
+       SUBSTRING(LOWER(TRIM(email)) FROM POSITION('@' IN LOWER(TRIM(email))) + 1) AS email_domain
+FROM users
+WHERE email <> LOWER(TRIM(email))
+ORDER BY user_id;
+@solution_mysql
+SELECT user_id,
+       email                                    AS raw_email,
+       LOWER(TRIM(email))                       AS normalized_email,
+       SUBSTRING(LOWER(TRIM(email)) FROM POSITION('@' IN LOWER(TRIM(email))) + 1) AS email_domain
+FROM users
+WHERE email COLLATE utf8mb4_0900_bin <> LOWER(TRIM(email)) COLLATE utf8mb4_0900_bin
+ORDER BY user_id;
+@dialect_note
+The SELECT list is identical; only the comparison differs. PostgreSQL compares strings case-sensitively (deterministic collations). MySQL's default `utf8mb4_0900_ai_ci` collation is accent- and case-insensitive, so equality, `<>`, GROUP BY, DISTINCT and UNIQUE indexes all ignore case.
+
+On this dataset the same `<>` test finds 26 rows in PostgreSQL, but in MySQL:
+| comparison | rows | why |
+|---|---:|---|
+| default `utf8mb4_0900_ai_ci` | 11 | case differences are ignored; only space problems are found |
+| `COLLATE utf8mb4_bin` | 22 | case-sensitive, but PAD SPACE ignores *trailing* spaces |
+| `COLLATE utf8mb4_0900_bin` or `CAST(x AS BINARY)` | 26 | case-sensitive and NO PAD, so it matches PostgreSQL |
+@explanation
+1. `TRIM` removes leading/trailing spaces and `LOWER` folds case. Together they produce a canonical key for matching people across accounts.
+2. `POSITION('@' IN s)` returns the 1-based index of '@'; `SUBSTRING(s FROM p + 1)` returns everything after it. PostgreSQL also has `SPLIT_PART(s, '@', 2)` and MySQL has `SUBSTRING_INDEX(s, '@', -1)`, but the POSITION/SUBSTRING form is portable.
+3. The WHERE clause keeps rows whose canonical form differs from the stored form. In MySQL that comparison must be case-sensitive or the upper-case variants are missed. Running the PostgreSQL query unchanged on MySQL silently returns only the whitespace cases.
+@mistakes
+- Running the same `<>` comparison on MySQL and trusting the smaller result.
+- Using `LENGTH` to detect spaces: MySQL `LENGTH` counts bytes, so multi-byte characters like 'ü' break it. Use `CHAR_LENGTH`.
+- Forgetting to normalize before extracting the domain, which gives 'SILVERFINANCE.COM' and 'silverfinance.com' as different domains.
+@performance
+Functions on the column make this a full scan. For repeated lookups, store a normalized column (or a generated column, see SQL-163) with its own index.
+@interview
+A favourite "gotcha" when a company runs MySQL: candidates who know about collations stand out. It is also the first step of entity resolution in ML feature pipelines.
+
+### SQL-010
+title: Daily sign-ups in the last week of data
+difficulty: Easy
+primary: Date and timestamp operations
+secondary: interval arithmetic, CAST to DATE, GROUP BY date
+concepts: date_functions, cast, group_by, date_bucketing
+roles: DS
+time: 6
+dialect: BOTH
+tables: users(user_id, signup_at)
+columns: signup_date, signups
+compare: ordered
+@context
+Growth reviews the most recent week of sign-ups every Monday. "Today" in this workbook is 2025-07-01, so the last 7 full days are 2025-06-24 through 2025-06-30.
+@problem
+Count new users per calendar day (UTC) for the 7 days before 2025-07-01. Express the window start as an interval subtraction from the anchor date. Show only days that have at least one sign-up, sorted by date.
+@expected
+Columns `signup_date, signups`; at most 7 rows; ascending date.
+@edge_cases
+- Days without sign-ups do not appear (filling gaps needs a date spine, see SQL-053).
+- `INTERVAL '7' DAY` is standard SQL syntax that both engines accept; `INTERVAL '7 days'` is PostgreSQL-only.
+@hint1
+Filter a half-open window, then group by the date part of the timestamp.
+@hint2
+`TIMESTAMP '2025-07-01 00:00:00' - INTERVAL '7' DAY` is portable.
+@hint3
+`GROUP BY CAST(signup_at AS DATE)` and select the same expression.
+@solution
+SELECT CAST(signup_at AS DATE) AS signup_date,
+       COUNT(*)                AS signups
+FROM users
+WHERE signup_at >= TIMESTAMP '2025-07-01 00:00:00' - INTERVAL '7' DAY
+  AND signup_at <  TIMESTAMP '2025-07-01 00:00:00'
+GROUP BY CAST(signup_at AS DATE)
+ORDER BY signup_date;
+@explanation
+- `TIMESTAMP '2025-07-01 00:00:00' - INTERVAL '7' DAY` evaluates to 2025-06-24 00:00:00 in both engines. The SQL-standard interval literal (quantity in quotes, unit outside) is the portable spelling.
+- Grouping by `CAST(signup_at AS DATE)` buckets timestamps into UTC calendar days.
+- In real reports you would use `CURRENT_DATE` instead of a fixed anchor. The workbook uses a fixed date so that results are reproducible.
+@mistakes
+- `signup_at > NOW() - INTERVAL ...` makes the report change every time it runs and includes partial days.
+- PostgreSQL-only `signup_at::date` or MySQL-only `DATE(signup_at)` in a query advertised as portable.
+@performance
+The range predicate can use the `users(signup_at)` index. Grouping on an expression requires computing it per row, which is cheap here.
+@interview
+Expect to be asked how the answer changes for a user in another time zone (see SQL-164).
+
+### SQL-011
+title: First-response time in hours for urgent tickets
+difficulty: Medium
+primary: Timestamp differences
+secondary: EXTRACT(EPOCH) vs TIMESTAMPDIFF, NULL handling, CASE
+concepts: date_functions, arithmetic, null_logic, case
+roles: DS
+time: 12
+dialect: BOTH
+tables: support_tickets(ticket_id, priority, created_at, first_response_at)
+columns: ticket_id, created_at, response_hours, sla_status
+compare: ordered
+@context
+Urgent tickets must receive a first response within 1 hour. The support lead wants to review all urgent tickets created in May 2025.
+@problem
+For urgent tickets created in May 2025 return `ticket_id`, `created_at`, `response_hours` (hours between creation and first response, rounded to 2 decimals; NULL when there is no response) and `sla_status`: `'met'` (responded within 1 hour), `'breached'` (responded later), or `'no_response'`. Sort by `ticket_id`.
+@expected
+One row per urgent ticket created in May 2025.
+@edge_cases
+- `first_response_at` is NULL for tickets never answered. The difference is then NULL, and CASE must test it explicitly.
+- Exactly 60 minutes counts as met (`<= 1`).
+@hint1
+Compute the difference in seconds, then divide by 3600.
+@hint2
+PostgreSQL: `EXTRACT(EPOCH FROM (b - a))` returns seconds. MySQL: `TIMESTAMPDIFF(SECOND, a, b)`.
+@hint3
+Test `first_response_at IS NULL` as the first WHEN branch, then compare the hours with 1.
+@solution_pg
+SELECT ticket_id,
+       created_at,
+       ROUND(EXTRACT(EPOCH FROM (first_response_at - created_at)) / 3600, 2) AS response_hours,
+       CASE WHEN first_response_at IS NULL THEN 'no_response'
+            WHEN first_response_at <= created_at + INTERVAL '1' HOUR THEN 'met'
+            ELSE 'breached'
+       END AS sla_status
+FROM support_tickets
+WHERE priority = 'urgent'
+  AND created_at >= TIMESTAMP '2025-05-01 00:00:00'
+  AND created_at <  TIMESTAMP '2025-06-01 00:00:00'
+ORDER BY ticket_id;
+@solution_mysql
+SELECT ticket_id,
+       created_at,
+       ROUND(TIMESTAMPDIFF(SECOND, created_at, first_response_at) / 3600, 2) AS response_hours,
+       CASE WHEN first_response_at IS NULL THEN 'no_response'
+            WHEN first_response_at <= created_at + INTERVAL '1' HOUR THEN 'met'
+            ELSE 'breached'
+       END AS sla_status
+FROM support_tickets
+WHERE priority = 'urgent'
+  AND created_at >= TIMESTAMP '2025-05-01 00:00:00'
+  AND created_at <  TIMESTAMP '2025-06-01 00:00:00'
+ORDER BY ticket_id;
+@dialect_note
+Subtracting two timestamps returns an INTERVAL in PostgreSQL. `EXTRACT(EPOCH FROM interval)` converts it to seconds (a NUMERIC since PostgreSQL 14). MySQL has no interval data type: `TIMESTAMPDIFF(unit, start, end)` returns an integer number of units. Note the reversed argument order compared with the subtraction. Adding a fixed interval (`ts + INTERVAL '1' HOUR`) is portable.
+@explanation
+1. The difference in seconds divided by 3600 gives fractional hours, and ROUND keeps 2 decimals. In MySQL, `/` on integers returns a DECIMAL, so no precision is lost.
+2. The SLA test compares timestamps directly (`first_response_at <= created_at + 1 hour`). This avoids rounding problems that could misclassify a response at 59.999 minutes.
+3. CASE evaluates branches in order, so the NULL case is handled first. Without it, `NULL <= ...` is UNKNOWN and the row would fall into ELSE ('breached'), which is wrong.
+@mistakes
+- Using `TIMESTAMPDIFF(HOUR, ...)` truncates to whole hours, so 1h59m counts as 1 hour.
+- Treating no response as breached without checking. The team may want to see these separately.
+@performance
+Fine at this size. The `support_tickets(org_id, created_at)` index does not start with `created_at`, so the filter scans the table.
+@interview
+Shows command of date arithmetic in both dialects and correct handling of missing timestamps.
+
+### SQL-012
+title: Paginate the document catalogue deterministically
+difficulty: Easy
+primary: LIMIT and OFFSET
+secondary: deterministic ordering, keyset pagination concept
+concepts: limit_offset, order_by, ai_rag_ingestion
+roles: AI
+time: 10
+dialect: BOTH
+tables: documents(document_id, doc_key, version_number, updated_at)
+columns: document_id, doc_key, version_number, updated_at
+compare: ordered
+@context
+An admin UI lists knowledge-base document versions, most recently updated first, 10 per page. Users reported that some versions appear on two pages and others never appear.
+@problem
+Return page 3 (rows 21-30) of the list ordered by `updated_at` descending. Make the order deterministic so that every row appears on exactly one page.
+@expected
+Exactly 10 rows; columns `document_id, doc_key, version_number, updated_at`.
+@edge_cases
+- Many versions share the same `updated_at`. Without a unique tie-breaker the database may return them in any order, and the order can differ between executions.
+- OFFSET still reads and discards the skipped rows; deep pages get slower.
+@hint1
+Why can rows "move" between pages? Think about ties in the sort key.
+@hint2
+Add a unique column as the last ORDER BY key.
+@hint3
+`ORDER BY updated_at DESC, document_id DESC LIMIT 10 OFFSET 20`.
+@solution
+SELECT document_id,
+       doc_key,
+       version_number,
+       updated_at
+FROM documents
+ORDER BY updated_at DESC, document_id DESC
+LIMIT 10 OFFSET 20;
+@explanation
+SQL tables are unordered sets. A sort on a non-unique key leaves the order of tied rows unspecified, so LIMIT/OFFSET pages may overlap or skip rows. Adding the primary key as a final sort key makes the order total and the paging stable.
+
+**Keyset pagination** ("seek method") is the scalable alternative: remember the last `(updated_at, document_id)` of the previous page and request `WHERE (updated_at, document_id) < (:last_ts, :last_id) ORDER BY updated_at DESC, document_id DESC LIMIT 10`. It does not read skipped rows, so every page costs the same, and concurrent inserts don't shift rows between pages. Both engines support row-value comparison, but PostgreSQL uses a composite index for it more reliably.
+
+`LIMIT n OFFSET m` works in both engines. MySQL also accepts `LIMIT m, n`, and PostgreSQL also accepts the standard `OFFSET m ROWS FETCH FIRST n ROWS ONLY`, which MySQL does not.
+@mistakes
+- Ordering only by `updated_at`.
+- Using OFFSET = page x 10 for page numbers starting at 1, which skips the first page.
+@performance
+OFFSET cost grows linearly with depth. An index on `(updated_at, document_id)` makes keyset pagination use an index range scan.
+@interview
+Senior candidates mention keyset pagination and explain why OFFSET is fragile under concurrent writes.
+
+### SQL-013
+title: The NOT IN trap with NULLs
+difficulty: Medium
+primary: NOT IN with NULLs
+secondary: three-valued logic, NOT EXISTS, subquery in WHERE
+concepts: in_not_in, null_logic, not_exists, subquery_where
+roles: DS
+time: 10
+dialect: BOTH
+tables: users(user_id, referred_by_user_id)
+columns: naive_not_in, filtered_not_in, not_exists_count
+compare: ordered
+@context
+The referral team asks: "How many users have never referred anyone?" The first attempt, `WHERE user_id NOT IN (SELECT referred_by_user_id FROM users)`, returned zero, which cannot be right.
+@problem
+Return one row with three counts of users who never referred anyone:
+`naive_not_in` (the query above), `filtered_not_in` (NOT IN with NULLs removed from the subquery), and `not_exists_count` (using NOT EXISTS).
+@expected
+One row; `naive_not_in` is 0, the other two are equal and large.
+@edge_cases
+- Most users have `referred_by_user_id IS NULL`. A single NULL in a NOT IN list makes the predicate UNKNOWN for every row that is not explicitly in the list.
+@hint1
+Write out `x NOT IN (1, 2, NULL)` as a chain of `<>` comparisons joined with AND.
+@hint2
+`x <> NULL` is UNKNOWN, and `TRUE AND UNKNOWN` is UNKNOWN. WHERE drops UNKNOWN.
+@hint3
+Use scalar subqueries in the SELECT list, one per approach: `(SELECT COUNT(*) FROM users u WHERE ...)`.
+@solution
+SELECT (SELECT COUNT(*) FROM users u
+         WHERE u.user_id NOT IN (SELECT r.referred_by_user_id FROM users r))          AS naive_not_in,
+       (SELECT COUNT(*) FROM users u
+         WHERE u.user_id NOT IN (SELECT r.referred_by_user_id FROM users r
+                                  WHERE r.referred_by_user_id IS NOT NULL))           AS filtered_not_in,
+       (SELECT COUNT(*) FROM users u
+         WHERE NOT EXISTS (SELECT 1 FROM users r
+                            WHERE r.referred_by_user_id = u.user_id))                AS not_exists_count;
+@assert
+num(rows[0][0]) == 0
+num(rows[0][1]) == num(rows[0][2]) and num(rows[0][1]) > 1000
+@explanation
+`u.user_id NOT IN (a, b, NULL)` is evaluated as `u.user_id <> a AND u.user_id <> b AND u.user_id <> NULL`. The last comparison is UNKNOWN, so the whole conjunction can never be TRUE. Every row is filtered out, and the count is 0.
+
+Two fixes:
+1. Remove NULLs inside the subquery (`WHERE referred_by_user_id IS NOT NULL`).
+2. Use `NOT EXISTS`. It asks "is there no matching row?" and is unaffected by NULLs in unrelated rows. NOT EXISTS is the idiomatic anti-join and is usually planned as one (see SQL-033).
+
+A SELECT without FROM (only scalar subqueries) is valid in both PostgreSQL and MySQL.
+@mistakes
+- Assuming NOT IN and NOT EXISTS are interchangeable. They are only equivalent when the subquery column cannot be NULL.
+- "Fixing" it with `COALESCE(referred_by_user_id, 0)`. This works only while 0 is never a real id; it is a fragile magic value.
+@performance
+Both engines turn NOT EXISTS into an anti-join. The naive NOT IN is often slower because of its NULL-aware semantics.
+@interview
+One of the most frequently asked SQL gotchas. Explaining the three-valued logic is more important than the fix itself.
+
+### SQL-014
+title: Format feature values with CAST and ROUND
+difficulty: Easy
+primary: Type conversion and casting
+secondary: ROUND on DOUBLE PRECISION in PostgreSQL, DECIMAL casting
+concepts: cast, arithmetic, ml_historical_features
+roles: MLE
+time: 8
+dialect: BOTH
+tables: entity_features(entity_id, as_of_ts, avg_session_minutes, seats_used_pct)
+columns: entity_id, as_of_date, avg_session_minutes, seats_used_pct
+compare: ordered
+@context
+A model-debugging dashboard prints feature snapshots in a compact format. The feature store keeps `avg_session_minutes` and `seats_used_pct` as DOUBLE PRECISION.
+@problem
+For entity 10, list every snapshot with `as_of_date` (date only), `avg_session_minutes` rounded to 1 decimal, and `seats_used_pct` converted to a percentage (x 100) rounded to 1 decimal. Sort by `as_of_date`.
+@expected
+One row per snapshot of entity 10; NULL feature values stay NULL.
+@edge_cases
+- **PostgreSQL has no `ROUND(double precision, integer)`**. `ROUND(avg_session_minutes, 1)` raises "function round(double precision, integer) does not exist". MySQL accepts it.
+- NULL feature values must remain NULL (CAST of NULL is NULL).
+@hint1
+Convert the floating-point value to an exact DECIMAL before rounding to a number of decimals.
+@hint2
+`CAST(x AS DECIMAL(10,1))` rounds to one decimal in both engines.
+@hint3
+`CAST(seats_used_pct * 100 AS DECIMAL(10,1))`.
+@solution
+SELECT entity_id,
+       CAST(as_of_ts AS DATE)                         AS as_of_date,
+       CAST(avg_session_minutes AS DECIMAL(10,1))     AS avg_session_minutes,
+       CAST(seats_used_pct * 100 AS DECIMAL(10,1))    AS seats_used_pct
+FROM entity_features
+WHERE entity_id = 10
+ORDER BY as_of_date;
+@alternative
+SELECT entity_id,
+       CAST(as_of_ts AS DATE)                                       AS as_of_date,
+       ROUND(CAST(avg_session_minutes AS DECIMAL(12,4)), 1)         AS avg_session_minutes,
+       ROUND(CAST(seats_used_pct * 100 AS DECIMAL(12,4)), 1)        AS seats_used_pct
+FROM entity_features
+WHERE entity_id = 10
+ORDER BY as_of_date;
+@alternative_note
+Casting to a wide DECIMAL first and then calling ROUND is equivalent and makes the intent ("round to 1 decimal") explicit.
+@explanation
+Floating-point types (DOUBLE PRECISION) store binary approximations. PostgreSQL deliberately offers `ROUND(numeric, int)` only. For doubles there is just `ROUND(double)` to the nearest integer. Casting to `DECIMAL(p, s)` converts to an exact type and rounds to `s` decimals in both engines.
+
+`CAST(as_of_ts AS DATE)` is the portable way to drop the time part. PostgreSQL's `::` operator and MySQL's `DATE()` function are engine-specific shortcuts.
+@mistakes
+- `ROUND(avg_session_minutes, 1)` works in MySQL but fails in PostgreSQL.
+- Casting to `DECIMAL(3,1)` overflows for values >= 100. Choose a precision that fits the range.
+@performance
+Casting is per-row CPU work on the filtered rows only.
+@interview
+A practical portability check. Candidates who have moved queries between engines know this one.
+
+### SQL-015
+title: Find knowledge-base articles by pattern
+difficulty: Easy
+primary: LIKE and pattern matching
+secondary: case-insensitive matching, wildcards, AND/OR
+concepts: like, string_functions, boolean_logic, ai_rag_ingestion
+roles: AI
+time: 8
+dialect: BOTH
+tables: documents(document_id, doc_key, title, status, source_type)
+columns: document_id, doc_key, title
+compare: ordered
+@context
+The support bot keeps answering refund questions with outdated content. The content team wants every **published** help-center article under the billing area (`doc_key` starting with `help/billing/`) whose title mentions "refund" or "payment" in any letter case.
+@problem
+Return `document_id`, `doc_key` and `title` of matching published documents, sorted by `doc_key`.
+@expected
+One row per matching published document version; columns as listed.
+@edge_cases
+- PostgreSQL `LIKE` is case-sensitive, while MySQL's default collation makes `LIKE` case-insensitive. Normalize case to get the same answer everywhere.
+- `_` and `%` are wildcards. A literal underscore in a pattern must be escaped (`\_`, or with an ESCAPE clause).
+@hint1
+Combine a prefix match on `doc_key` with a "contains" match on the title.
+@hint2
+`LOWER(title) LIKE '%refund%'` is case-insensitive in both engines.
+@hint3
+Parenthesize the OR of the two title conditions before AND-ing it with the other filters.
+@solution
+SELECT document_id,
+       doc_key,
+       title
+FROM documents
+WHERE status = 'published'
+  AND doc_key LIKE 'help/billing/%'
+  AND (LOWER(title) LIKE '%refund%' OR LOWER(title) LIKE '%payment%')
+ORDER BY doc_key;
+@explanation
+- `LIKE 'help/billing/%'` is a prefix match; `%` matches any sequence of characters, `_` exactly one character.
+- Lower-casing the title makes the search case-insensitive in both engines. PostgreSQL's `ILIKE` does the same but is PostgreSQL-only.
+- The OR is parenthesized so that the `status` and prefix filters apply to both alternatives.
+
+Prefix patterns can use a B-tree index (in PostgreSQL only with the C collation or a `text_pattern_ops` index). Leading-wildcard patterns like `'%refund%'` cannot. For real text search use full-text indexes (SQL-166/SQL-167).
+@mistakes
+- `title LIKE '%Refund%'` misses lower-case titles in PostgreSQL but "works" in MySQL, which makes the bug engine-dependent.
+- Missing parentheses around the OR.
+@performance
+`LOWER(title) LIKE '%...%'` forces a scan. That is acceptable for a few hundred documents, but not for millions.
+@interview
+Tests wildcard semantics and awareness of case sensitivity differences between engines.

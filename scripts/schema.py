@@ -1,0 +1,786 @@
+"""
+Single source of truth for the workbook schema.
+
+Everything else is generated from this file:
+  * setup.sql (PostgreSQL) and setup_mysql.sql (MySQL) DDL
+  * dataset_dictionary.md
+  * the column catalogue used by the validator to check question metadata
+
+Type tokens are engine-neutral and mapped per engine in TYPE_MAP below.
+"""
+
+# Engine-neutral type token -> (PostgreSQL type, MySQL type)
+TYPE_MAP = {
+    "TIMESTAMP": ("TIMESTAMP", "DATETIME"),
+    "JSON": ("JSONB", "JSON"),
+}
+
+
+def engine_type(token, engine):
+    """Return the concrete column type for an engine ('pg' or 'mysql')."""
+    base = token.split("(")[0]
+    if base in TYPE_MAP:
+        pg, my = TYPE_MAP[base]
+        return pg if engine == "pg" else my
+    return token
+
+
+def C(name, type_, null=True, desc="", rng="", default=None):
+    """Column definition."""
+    return {"name": name, "type": type_, "null": null, "desc": desc,
+            "range": rng, "default": default}
+
+
+# Each table: domain, grain, description, columns, pk, fks, uniques, checks,
+# indexes, and business rules (documented in the data dictionary).
+TABLES = [
+    # ------------------------------------------------------------------ core
+    {
+        "name": "plans", "domain": "Core business",
+        "grain": "One row per subscription plan.",
+        "desc": "Catalogue of subscription plans. Prices are per seat per month in USD.",
+        "columns": [
+            C("plan_id", "INT", False, "Surrogate key."),
+            C("plan_name", "VARCHAR(30)", False, "Display name of the plan."),
+            C("tier_rank", "SMALLINT", False, "Ordinal tier (0 = Free ... 4 = Enterprise). Legacy plans share the rank of the plan they map to.", "0-4"),
+            C("price_per_seat_month", "DECIMAL(10,2)", False, "List price per seat per month.", "USD, 0-89"),
+            C("annual_discount_pct", "DECIMAL(5,2)", True, "Discount applied to annual billing. NULL = annual billing not offered.", "0-20 (%)"),
+            C("seat_limit", "INT", True, "Maximum seats. NULL = unlimited.", "1-500"),
+            C("is_active", "BOOLEAN", False, "FALSE for legacy plans that can no longer be purchased."),
+            C("launched_on", "DATE", False, "Date the plan became available."),
+        ],
+        "pk": ["plan_id"], "fks": [],
+        "uniques": [["plan_name"]],
+        "checks": ["price_per_seat_month >= 0", "tier_rank BETWEEN 0 AND 4"],
+        "indexes": [],
+        "rules": [
+            "`Pro (Legacy)` is inactive but still referenced by old subscriptions.",
+        ],
+    },
+    {
+        "name": "organizations", "domain": "Core business",
+        "grain": "One row per customer organization (account).",
+        "desc": "Customer organizations. Subsidiaries point to their parent organization.",
+        "columns": [
+            C("org_id", "INT", False, "Surrogate key."),
+            C("org_name", "VARCHAR(120)", False, "Organization name."),
+            C("parent_org_id", "INT", True, "Parent organization for subsidiaries; NULL for top-level orgs. Hierarchies are up to 3 levels deep."),
+            C("industry", "VARCHAR(40)", True, "Industry vertical. NULL = not captured during sign-up."),
+            C("segment", "VARCHAR(20)", False, "Sales segment.", "'SMB','Mid-Market','Enterprise'"),
+            C("employee_band", "VARCHAR(20)", True, "Company size band. NULL = unknown.", "'1-10','11-50','51-200','201-1000','1000+'"),
+            C("country_code", "CHAR(2)", False, "ISO-3166 alpha-2 country of the billing address."),
+            C("timezone", "VARCHAR(40)", False, "IANA time zone of the organization's headquarters."),
+            C("created_at", "TIMESTAMP", False, "Account creation time (UTC)."),
+            C("is_deleted", "BOOLEAN", False, "Soft-delete flag."),
+            C("deleted_at", "TIMESTAMP", True, "Soft-delete time (UTC). Set only when is_deleted is TRUE."),
+        ],
+        "pk": ["org_id"],
+        "fks": [(["parent_org_id"], "organizations", ["org_id"])],
+        "uniques": [],
+        "checks": ["segment IN ('SMB','Mid-Market','Enterprise')",
+                   "deleted_at IS NULL OR is_deleted = TRUE"],
+        "indexes": [["parent_org_id"]],
+        "rules": [
+            "Organization names are not unique; two different companies can share a name.",
+            "Soft-deleted organizations keep their history (users, orders, tickets).",
+        ],
+    },
+    {
+        "name": "users", "domain": "Core business",
+        "grain": "One row per user account (login). A real person may have more than one account.",
+        "desc": "Users belong to exactly one organization. Some people registered twice with differently formatted e-mails.",
+        "columns": [
+            C("user_id", "INT", False, "Surrogate key. Increases with signup_at."),
+            C("org_id", "INT", False, "Organization the user belongs to."),
+            C("email", "VARCHAR(255)", False, "Login e-mail exactly as typed. Not normalized: case and surrounding spaces vary."),
+            C("full_name", "VARCHAR(120)", False, "Display name (may contain non-ASCII characters)."),
+            C("role", "VARCHAR(20)", False, "Role inside the organization.", "'admin','member','viewer'"),
+            C("signup_at", "TIMESTAMP", False, "Registration time (UTC)."),
+            C("last_login_at", "TIMESTAMP", True, "Most recent login (UTC). NULL = never logged in after signup."),
+            C("status", "VARCHAR(20)", False, "Account status.", "'active','inactive','deleted'"),
+            C("acquisition_channel", "VARCHAR(30)", True, "Marketing channel that acquired the user. NULL = unknown/untracked.", "'organic','paid_search','referral','social','partner'"),
+            C("country_code", "CHAR(2)", True, "Country inferred from the signup IP. NULL = could not be resolved."),
+            C("referred_by_user_id", "INT", True, "User who referred this user (self-reference). NULL = not referred."),
+            C("marketing_opt_in", "BOOLEAN", True, "Consent to marketing e-mails. NULL = never asked (three-valued)."),
+        ],
+        "pk": ["user_id"],
+        "fks": [(["org_id"], "organizations", ["org_id"]),
+                (["referred_by_user_id"], "users", ["user_id"])],
+        "uniques": [],
+        "checks": ["role IN ('admin','member','viewer')",
+                   "status IN ('active','inactive','deleted')"],
+        "indexes": [["org_id"], ["signup_at"]],
+        "rules": [
+            "`email` is intentionally NOT unique: about 1.5% of people have a duplicate account whose e-mail differs only in letter case and/or leading/trailing spaces.",
+            "A referrer always signed up before the user they referred.",
+        ],
+    },
+    {
+        "name": "subscriptions", "domain": "Core business",
+        "grain": "One row per subscription period of an organization on one plan.",
+        "desc": "Organization-level subscription history. A plan change ends one row and starts another.",
+        "columns": [
+            C("subscription_id", "INT", False, "Surrogate key."),
+            C("org_id", "INT", False, "Subscribing organization."),
+            C("plan_id", "INT", False, "Plan for this period."),
+            C("status", "VARCHAR(20)", False, "Lifecycle status. 'switched' = ended because the org moved to another plan; 'canceled' = ended because the org churned.", "'trialing','active','past_due','canceled','switched'"),
+            C("billing_cycle", "VARCHAR(10)", False, "Billing frequency.", "'monthly','annual'"),
+            C("seats", "INT", False, "Number of paid seats.", "1-400"),
+            C("mrr", "DECIMAL(10,2)", False, "Monthly recurring revenue for this period (seats x price, after annual discount).", "USD"),
+            C("started_at", "TIMESTAMP", False, "Period start (UTC, inclusive)."),
+            C("ended_at", "TIMESTAMP", True, "Period end (UTC, exclusive). NULL = still open."),
+            C("cancel_reason", "VARCHAR(50)", True, "Reason given on cancellation. Only for status 'canceled'; may still be NULL when the customer gave no reason."),
+        ],
+        "pk": ["subscription_id"],
+        "fks": [(["org_id"], "organizations", ["org_id"]),
+                (["plan_id"], "plans", ["plan_id"])],
+        "uniques": [],
+        "checks": ["seats > 0", "mrr >= 0",
+                   "ended_at IS NULL OR ended_at >= started_at",
+                   "status IN ('trialing','active','past_due','canceled','switched')",
+                   "billing_cycle IN ('monthly','annual')"],
+        "indexes": [["org_id", "started_at"], ["plan_id"]],
+        "rules": [
+            "Open periods (`ended_at IS NULL`) have status 'trialing', 'active' or 'past_due'.",
+            "INTENTIONAL DATA-QUALITY ISSUE: a handful of organizations have overlapping subscription periods caused by a billing-system bug.",
+            "Some organizations churn (canceled) and come back later, leaving a gap between periods.",
+        ],
+    },
+    {
+        "name": "product_categories", "domain": "Core business",
+        "grain": "One row per product category node.",
+        "desc": "Category tree (up to 3 levels).",
+        "columns": [
+            C("category_id", "INT", False, "Surrogate key."),
+            C("category_name", "VARCHAR(60)", False, "Category name."),
+            C("parent_category_id", "INT", True, "Parent node; NULL for root categories."),
+        ],
+        "pk": ["category_id"],
+        "fks": [(["parent_category_id"], "product_categories", ["category_id"])],
+        "uniques": [["category_name"]], "checks": [], "indexes": [],
+        "rules": ["Products are attached to leaf categories."],
+    },
+    {
+        "name": "products", "domain": "Core business",
+        "grain": "One row per sellable product (add-ons, credit packs, services).",
+        "desc": "One-off products sold through orders (subscriptions are billed separately).",
+        "columns": [
+            C("product_id", "INT", False, "Surrogate key."),
+            C("product_name", "VARCHAR(80)", False, "Product name."),
+            C("category_id", "INT", False, "Leaf category."),
+            C("list_price", "DECIMAL(10,2)", False, "Current list price per unit.", "USD"),
+            C("is_active", "BOOLEAN", False, "FALSE = discontinued (still present in historical orders)."),
+            C("launched_on", "DATE", False, "Launch date."),
+        ],
+        "pk": ["product_id"],
+        "fks": [(["category_id"], "product_categories", ["category_id"])],
+        "uniques": [["product_name"]], "checks": ["list_price >= 0"],
+        "indexes": [["category_id"]],
+        "rules": ["Order lines can be sold below list price (negotiated discounts)."],
+    },
+    {
+        "name": "orders", "domain": "Core business",
+        "grain": "One row per order (checkout).",
+        "desc": "Orders for one-off products. `order_total` is a denormalized header amount.",
+        "columns": [
+            C("order_id", "INT", False, "Surrogate key. Increases with order_ts."),
+            C("user_id", "INT", False, "Purchasing user."),
+            C("org_id", "INT", False, "Organization billed (denormalized copy of users.org_id at order time)."),
+            C("order_ts", "TIMESTAMP", False, "Order time (UTC)."),
+            C("status", "VARCHAR(20)", False, "Order status.", "'completed','pending','canceled','refunded'"),
+            C("sales_channel", "VARCHAR(20)", False, "Where the order was placed.", "'web','sales','marketplace'"),
+            C("discount_code", "VARCHAR(20)", True, "Promotion code. NULL = none."),
+            C("order_total", "DECIMAL(12,2)", False, "Header total in USD as recorded by the checkout service.", "USD"),
+        ],
+        "pk": ["order_id"],
+        "fks": [(["user_id"], "users", ["user_id"]),
+                (["org_id"], "organizations", ["org_id"])],
+        "uniques": [],
+        "checks": ["order_total >= 0",
+                   "status IN ('completed','pending','canceled','refunded')"],
+        "indexes": [["user_id", "order_ts"], ["order_ts"], ["org_id"]],
+        "rules": [
+            "Revenue analyses normally use `status = 'completed'` orders only.",
+            "INTENTIONAL DATA-QUALITY ISSUE: about 2% of orders have an `order_total` that differs from the sum of their order lines (a rounding bug in an old checkout version).",
+            "A few orders carry an `org_id` different from the purchasing user's: some are legitimately billed to the parent company, others are INTENTIONAL DATA-QUALITY ISSUES (unrelated organization).",
+            "About half of all users never place an order.",
+        ],
+    },
+    {
+        "name": "order_items", "domain": "Core business",
+        "grain": "One row per order line.",
+        "desc": "Order lines. Composite primary key (order_id, line_number).",
+        "columns": [
+            C("order_id", "INT", False, "Parent order."),
+            C("line_number", "SMALLINT", False, "1-based line number within the order.", "1-4"),
+            C("product_id", "INT", False, "Product sold."),
+            C("quantity", "INT", False, "Units.", "1-50"),
+            C("unit_price", "DECIMAL(10,2)", False, "Price per unit actually charged.", "USD"),
+            C("discount_amount", "DECIMAL(10,2)", False, "Line-level discount in USD (0 when none).", "USD"),
+        ],
+        "pk": ["order_id", "line_number"],
+        "fks": [(["order_id"], "orders", ["order_id"]),
+                (["product_id"], "products", ["product_id"])],
+        "uniques": [], "checks": ["quantity > 0", "unit_price >= 0", "discount_amount >= 0"],
+        "indexes": [["product_id"]],
+        "rules": ["Line revenue = quantity * unit_price - discount_amount."],
+    },
+    {
+        "name": "payments", "domain": "Core business",
+        "grain": "One row per payment attempt.",
+        "desc": "Payment attempts against orders. Failed attempts are retried as new rows.",
+        "columns": [
+            C("payment_id", "INT", False, "Surrogate key."),
+            C("order_id", "INT", False, "Order being paid."),
+            C("attempted_at", "TIMESTAMP", False, "Attempt time (UTC)."),
+            C("amount", "DECIMAL(12,2)", False, "Amount attempted.", "USD"),
+            C("method", "VARCHAR(20)", False, "Payment method.", "'card','bank_transfer','paypal','invoice'"),
+            C("status", "VARCHAR(20)", False, "Attempt outcome. 'refunded' = succeeded and later (partly) refunded.", "'succeeded','failed','pending','refunded'"),
+            C("failure_reason", "VARCHAR(40)", True, "Only for failed attempts."),
+            C("refunded_amount", "DECIMAL(12,2)", True, "Amount refunded; only for status 'refunded'. Can be a partial refund.", "USD"),
+            C("refunded_at", "TIMESTAMP", True, "Refund time (UTC)."),
+        ],
+        "pk": ["payment_id"],
+        "fks": [(["order_id"], "orders", ["order_id"])],
+        "uniques": [],
+        "checks": ["amount >= 0",
+                   "status IN ('succeeded','failed','pending','refunded')"],
+        "indexes": [["order_id"]],
+        "rules": [
+            "A completed order normally has exactly one 'succeeded' payment, possibly preceded by failed attempts.",
+            "INTENTIONAL DATA-QUALITY ISSUE: a small number of completed orders have no payment row at all (invoice not yet recorded).",
+        ],
+    },
+    {
+        "name": "support_tickets", "domain": "Core business",
+        "grain": "One row per support ticket.",
+        "desc": "Customer support tickets.",
+        "columns": [
+            C("ticket_id", "INT", False, "Surrogate key."),
+            C("org_id", "INT", False, "Customer organization."),
+            C("user_id", "INT", True, "Requesting user. NULL = ticket arrived by e-mail from an unknown sender."),
+            C("created_at", "TIMESTAMP", False, "Ticket creation (UTC)."),
+            C("first_response_at", "TIMESTAMP", True, "First agent response (UTC). NULL = not yet answered."),
+            C("resolved_at", "TIMESTAMP", True, "Resolution time (UTC). NULL = unresolved."),
+            C("priority", "VARCHAR(10)", False, "Priority.", "'low','medium','high','urgent'"),
+            C("category", "VARCHAR(30)", False, "Topic.", "'billing','bug','how_to','feature_request','account','ai_quality'"),
+            C("status", "VARCHAR(20)", False, "Current status.", "'open','pending','resolved','closed'"),
+            C("channel", "VARCHAR(20)", False, "Intake channel.", "'email','chat','phone','web_form'"),
+            C("csat_score", "SMALLINT", True, "Customer satisfaction 1-5 from the post-resolution survey. NULL = no survey answer.", "1-5"),
+        ],
+        "pk": ["ticket_id"],
+        "fks": [(["org_id"], "organizations", ["org_id"]),
+                (["user_id"], "users", ["user_id"])],
+        "uniques": [],
+        "checks": ["csat_score IS NULL OR csat_score BETWEEN 1 AND 5"],
+        "indexes": [["org_id", "created_at"], ["user_id"]],
+        "rules": ["`resolved_at` is set for status 'resolved' and 'closed'."],
+    },
+    # ------------------------------------------------------- product analytics
+    {
+        "name": "sessions", "domain": "Product analytics",
+        "grain": "One row per application session.",
+        "desc": "Client sessions in the web/mobile application.",
+        "columns": [
+            C("session_id", "INT", False, "Surrogate key."),
+            C("user_id", "INT", False, "Session owner."),
+            C("started_at", "TIMESTAMP", False, "Session start (UTC)."),
+            C("ended_at", "TIMESTAMP", True, "Session end (UTC). NULL = client never sent an end beacon."),
+            C("device_type", "VARCHAR(10)", False, "Device.", "'desktop','mobile','tablet'"),
+            C("app_version", "VARCHAR(10)", True, "Client version. NULL for very old clients."),
+        ],
+        "pk": ["session_id"],
+        "fks": [(["user_id"], "users", ["user_id"])],
+        "uniques": [], "checks": ["ended_at IS NULL OR ended_at >= started_at"],
+        "indexes": [["user_id", "started_at"]],
+        "rules": ["Every session has at least one event."],
+    },
+    {
+        "name": "events", "domain": "Product analytics",
+        "grain": "One row per tracked product event.",
+        "desc": "Product analytics events. Client events carry a session_id; server-side events (e.g. purchase) do not.",
+        "columns": [
+            C("event_id", "BIGINT", False, "Surrogate key."),
+            C("user_id", "INT", False, "Acting user."),
+            C("session_id", "INT", True, "Session the event belongs to. NULL for server-side events."),
+            C("event_ts", "TIMESTAMP", False, "Event time (UTC)."),
+            C("event_name", "VARCHAR(40)", False, "Event type.", "'login','view_dashboard','create_project','run_query','ai_assist_used','invite_user','export_report','view_pricing','start_checkout','purchase'"),
+            C("properties", "JSON", True, "Event properties (e.g. page, plan, order_id). NULL when the event carries none."),
+        ],
+        "pk": ["event_id"],
+        "fks": [(["user_id"], "users", ["user_id"]),
+                (["session_id"], "sessions", ["session_id"])],
+        "uniques": [], "checks": [],
+        "indexes": [["user_id", "event_ts"], ["event_name", "event_ts"], ["session_id"]],
+        "rules": [
+            "Funnel: view_pricing -> start_checkout -> purchase.",
+            "`purchase` events are emitted server-side for completed and refunded orders and carry `{\"order_id\": ...}` in `properties`.",
+            "INTENTIONAL DATA-QUALITY ISSUE: about 1.5% of client events are exact duplicates (same user, session, name and timestamp, different event_id) caused by client retries.",
+        ],
+    },
+    {
+        "name": "experiments", "domain": "Product analytics",
+        "grain": "One row per A/B experiment.",
+        "desc": "A/B experiments.",
+        "columns": [
+            C("experiment_id", "INT", False, "Surrogate key."),
+            C("experiment_name", "VARCHAR(60)", False, "Unique name."),
+            C("hypothesis", "VARCHAR(255)", False, "What the team expected."),
+            C("primary_metric", "VARCHAR(60)", False, "Pre-registered success metric."),
+            C("start_date", "DATE", False, "First day of assignment."),
+            C("end_date", "DATE", True, "Last day of assignment. NULL = still running."),
+            C("status", "VARCHAR(20)", False, "Status.", "'running','completed','stopped'"),
+        ],
+        "pk": ["experiment_id"], "fks": [],
+        "uniques": [["experiment_name"]], "checks": [], "indexes": [],
+        "rules": ["Conversion for checkout experiments = a `purchase` event within 14 days after assignment."],
+    },
+    {
+        "name": "experiment_assignments", "domain": "Product analytics",
+        "grain": "One row per (experiment, user).",
+        "desc": "Variant assignment. Composite primary key.",
+        "columns": [
+            C("experiment_id", "INT", False, "Experiment."),
+            C("user_id", "INT", False, "Assigned user."),
+            C("variant", "VARCHAR(20)", False, "Assigned arm.", "'control','treatment','treatment_b'"),
+            C("assigned_at", "TIMESTAMP", False, "Assignment time (UTC)."),
+        ],
+        "pk": ["experiment_id", "user_id"],
+        "fks": [(["experiment_id"], "experiments", ["experiment_id"]),
+                (["user_id"], "users", ["user_id"])],
+        "uniques": [], "checks": [], "indexes": [["user_id"]],
+        "rules": ["`onboarding_checklist` has a deliberate sample-ratio mismatch (control is over-assigned)."],
+    },
+    # ------------------------------------------------------- machine learning
+    {
+        "name": "ml_entities", "domain": "Machine learning",
+        "grain": "One row per entity scored by the ML platform (here: a user).",
+        "desc": "Entities registered with the feature store for the churn model.",
+        "columns": [
+            C("entity_id", "INT", False, "Surrogate key used by the ML platform."),
+            C("user_id", "INT", False, "Underlying user (1:1)."),
+            C("org_id", "INT", False, "Organization of the user at registration."),
+            C("registered_at", "TIMESTAMP", False, "When the entity was registered in the feature store (UTC)."),
+            C("is_test_account", "BOOLEAN", False, "Internal QA/test account. Must be excluded from training and evaluation."),
+        ],
+        "pk": ["entity_id"],
+        "fks": [(["user_id"], "users", ["user_id"]), (["org_id"], "organizations", ["org_id"])],
+        "uniques": [["user_id"]], "checks": [], "indexes": [],
+        "rules": [],
+    },
+    {
+        "name": "entity_features", "domain": "Machine learning",
+        "grain": "One row per (entity, feature snapshot time).",
+        "desc": "Point-in-time feature snapshots computed every two weeks (Mondays 00:00 UTC).",
+        "columns": [
+            C("entity_id", "INT", False, "Entity."),
+            C("as_of_ts", "TIMESTAMP", False, "Snapshot time: features describe activity strictly BEFORE this instant (UTC)."),
+            C("sessions_7d", "INT", True, "Sessions in [as_of_ts - 7 days, as_of_ts). NULL = computation failed.", ">= 0"),
+            C("sessions_28d", "INT", True, "Sessions in [as_of_ts - 28 days, as_of_ts).", ">= 0"),
+            C("events_28d", "INT", True, "Events in [as_of_ts - 28 days, as_of_ts).", ">= 0"),
+            C("days_since_last_session", "INT", True, "Days between the last session before as_of_ts and as_of_ts. NULL = no session yet.", ">= 0"),
+            C("open_tickets", "INT", True, "Support tickets of the user's org open at as_of_ts.", ">= 0"),
+            C("avg_session_minutes", "DOUBLE PRECISION", True, "Mean session duration over the last 28 days. NULL when there were no complete sessions.", "minutes"),
+            C("seats_used_pct", "DOUBLE PRECISION", True, "Active users / paid seats of the org.", "0-1.5 (can exceed 1 when over-provisioned)"),
+            C("feature_source", "VARCHAR(20)", False, "How the row was produced.", "'batch','backfill'"),
+            C("ingested_at", "TIMESTAMP", False, "When the row became queryable in the feature store (UTC). A model can only use a row once ingested_at <= prediction time."),
+        ],
+        "pk": ["entity_id", "as_of_ts"],
+        "fks": [(["entity_id"], "ml_entities", ["entity_id"])],
+        "uniques": [], "checks": ["ingested_at >= as_of_ts"],
+        "indexes": [["as_of_ts"]],
+        "rules": [
+            "Normal batch rows are ingested 2-6 hours after `as_of_ts`; about 5% arrive 1-3 days late.",
+            "The pipeline was down for the 2025-02-24 and 2025-03-10 snapshots; those rows were backfilled on 2025-03-20 (`feature_source = 'backfill'`). Using them for predictions made before 2025-03-20 is leakage.",
+            "About 3% of rows have at least one NULL feature value (partial computation failures). Some NULLs are structural: `days_since_last_session` is NULL before the first session and `avg_session_minutes` is NULL without a complete session in the window.",
+            "INTENTIONAL DATA-QUALITY ISSUE: about 1% of (entity, snapshot) rows are missing entirely (partial pipeline runs).",
+        ],
+    },
+    {
+        "name": "training_labels", "domain": "Machine learning",
+        "grain": "One row per (entity, observation date, label) -- but see duplicates below.",
+        "desc": "Binary churn labels. `churned_30d` = 1 when the user had no session in the 30 days starting at observation_date.",
+        "columns": [
+            C("label_id", "INT", False, "Surrogate key."),
+            C("entity_id", "INT", False, "Entity."),
+            C("label_name", "VARCHAR(30)", False, "Label definition name.", "'churned_30d'"),
+            C("observation_date", "DATE", False, "Prediction point. The label looks at [observation_date, observation_date + 30 days)."),
+            C("label_value", "SMALLINT", True, "1 = churned, 0 = retained. NULL = outcome window not finished yet.", "0, 1"),
+            C("label_available_at", "TIMESTAMP", True, "When the label was written (UTC). NULL while label_value is NULL."),
+        ],
+        "pk": ["label_id"],
+        "fks": [(["entity_id"], "ml_entities", ["entity_id"])],
+        "uniques": [], "checks": ["label_value IS NULL OR label_value IN (0, 1)"],
+        "indexes": [["entity_id", "observation_date"]],
+        "rules": [
+            "Observation dates are the first day of each month from 2024-11-01 to 2025-06-01.",
+            "Eligibility: an entity gets a label row for an observation date when it was registered by then and had at least 2 sessions in the 30 days before observation_date.",
+            "Labels for 2025-06-01 are still NULL (window ends 2025-07-01).",
+            "Classes are imbalanced: roughly 1 positive per 4-5 negatives (about 18-19% positive).",
+            "INTENTIONAL DATA-QUALITY ISSUE: about 1% of (entity_id, observation_date) pairs appear twice because the label job was re-run; some re-runs disagree. The row with the latest `label_available_at` is authoritative.",
+        ],
+    },
+    {
+        "name": "model_versions", "domain": "Machine learning",
+        "grain": "One row per trained model version.",
+        "desc": "Model registry. `parent_version_id` records which version a model was fine-tuned/retrained from.",
+        "columns": [
+            C("model_version_id", "INT", False, "Surrogate key."),
+            C("model_name", "VARCHAR(40)", False, "Model family.", "'churn_classifier','upsell_propensity'"),
+            C("version_label", "VARCHAR(10)", False, "Human-readable version, e.g. 'v3'."),
+            C("parent_version_id", "INT", True, "Version this one was retrained from."),
+            C("algorithm", "VARCHAR(40)", False, "Learning algorithm."),
+            C("training_data_end", "DATE", False, "Last observation_date included in training data."),
+            C("trained_at", "TIMESTAMP", False, "Training completion (UTC)."),
+            C("deployed_at", "TIMESTAMP", True, "Promotion to production (UTC). NULL = never in production."),
+            C("retired_at", "TIMESTAMP", True, "Removal from production (UTC). NULL = not retired."),
+            C("stage", "VARCHAR(20)", False, "Registry stage.", "'production','shadow','retired','archived'"),
+            C("default_threshold", "DECIMAL(4,3)", False, "Decision threshold used to derive predicted_label.", "0-1"),
+            C("hyperparameters", "JSON", True, "Training hyperparameters."),
+        ],
+        "pk": ["model_version_id"],
+        "fks": [(["parent_version_id"], "model_versions", ["model_version_id"])],
+        "uniques": [["model_name", "version_label"]],
+        "checks": ["default_threshold BETWEEN 0 AND 1"], "indexes": [],
+        "rules": ["`shadow` models are scored in parallel but their predictions are not acted upon."],
+    },
+    {
+        "name": "model_predictions", "domain": "Machine learning",
+        "grain": "One row per prediction (model version, entity, scoring run).",
+        "desc": "Batch inference output. Monthly runs happen on the first day of each month between 02:00 and 04:00 UTC.",
+        "columns": [
+            C("prediction_id", "BIGINT", False, "Surrogate key."),
+            C("model_version_id", "INT", False, "Model version that produced the score."),
+            C("entity_id", "INT", False, "Scored entity."),
+            C("batch_id", "VARCHAR(30)", False, "Scoring run identifier, e.g. 'churn-2025-03-01-a'."),
+            C("predicted_at", "TIMESTAMP", False, "Scoring time (UTC)."),
+            C("score", "DOUBLE PRECISION", True, "Predicted probability of the positive class. NULL = scoring failed.", "0-1"),
+            C("threshold", "DECIMAL(4,3)", False, "Threshold applied in this run.", "0-1"),
+            C("predicted_label", "SMALLINT", True, "1 if score >= threshold else 0. NULL when score is NULL.", "0, 1"),
+            C("feature_as_of_ts", "TIMESTAMP", True, "as_of_ts of the feature snapshot the scorer used. NULL = scorer did not log it."),
+        ],
+        "pk": ["prediction_id"],
+        "fks": [(["model_version_id"], "model_versions", ["model_version_id"]),
+                (["entity_id"], "ml_entities", ["entity_id"])],
+        "uniques": [],
+        "checks": ["score IS NULL OR (score >= 0 AND score <= 1)",
+                   "predicted_label IS NULL OR predicted_label IN (0, 1)"],
+        "indexes": [["entity_id", "predicted_at"], ["model_version_id", "predicted_at"]],
+        "rules": [
+            "Some runs were re-executed (batch suffix '-b'), producing two predictions for the same entity and day; the later one supersedes the earlier one.",
+            "About 1% of scores are NULL (scorer failure).",
+            "Predictions are matched to labels by `entity_id` and `CAST(predicted_at AS DATE) = observation_date`.",
+        ],
+    },
+    {
+        "name": "model_evaluations", "domain": "Machine learning",
+        "grain": "One row per (model version, split, metric).",
+        "desc": "Offline evaluation metrics logged at training time.",
+        "columns": [
+            C("evaluation_id", "INT", False, "Surrogate key."),
+            C("model_version_id", "INT", False, "Evaluated version."),
+            C("eval_split", "VARCHAR(12)", False, "Dataset split.", "'train','validation','test'"),
+            C("metric_name", "VARCHAR(20)", False, "Metric.", "'auc','precision','recall','f1','log_loss'"),
+            C("metric_value", "DOUBLE PRECISION", False, "Metric value."),
+            C("evaluated_at", "TIMESTAMP", False, "When the metric was computed (UTC)."),
+        ],
+        "pk": ["evaluation_id"],
+        "fks": [(["model_version_id"], "model_versions", ["model_version_id"])],
+        "uniques": [["model_version_id", "eval_split", "metric_name"]],
+        "checks": [], "indexes": [],
+        "rules": ["Lower is better for log_loss; higher is better for the others."],
+    },
+    # ---------------------------------------------------- AI / LLM applications
+    {
+        "name": "documents", "domain": "AI / LLM applications",
+        "grain": "One row per document VERSION.",
+        "desc": "Knowledge-base documents used by the RAG support bot. `doc_key` identifies a document across its versions.",
+        "columns": [
+            C("document_id", "INT", False, "Surrogate key of this version."),
+            C("doc_key", "VARCHAR(100)", False, "Stable document identifier, e.g. 'help/billing/refund-policy'."),
+            C("version_number", "INT", False, "1-based version within doc_key.", "1-5"),
+            C("title", "VARCHAR(200)", False, "Title."),
+            C("source_type", "VARCHAR(20)", False, "Origin.", "'help_center','api_docs','policy','release_notes','internal_wiki'"),
+            C("status", "VARCHAR(20)", False, "Publication status of this version.", "'draft','published','archived'"),
+            C("language", "VARCHAR(5)", True, "ISO language code. NULL = not detected.", "'en','de','fr','es'"),
+            C("access_level", "VARCHAR(20)", False, "Who may see answers grounded in this document.", "'public','customer','internal'"),
+            C("word_count", "INT", False, "Words in the version.", "80-4000"),
+            C("created_at", "TIMESTAMP", False, "Version creation (UTC)."),
+            C("updated_at", "TIMESTAMP", False, "Last edit of this version (UTC)."),
+            C("last_indexed_at", "TIMESTAMP", True, "Last time this version was chunked and embedded (UTC). NULL = never indexed."),
+            C("is_deleted", "BOOLEAN", False, "Soft-delete flag."),
+            C("metadata", "JSON", True, "Free-form metadata: tags (array), product_area, owner_team."),
+        ],
+        "pk": ["document_id"], "fks": [],
+        "uniques": [["doc_key", "version_number"]],
+        "checks": ["status IN ('draft','published','archived')", "version_number >= 1"],
+        "indexes": [["status"]],
+        "rules": [
+            "Older versions are normally 'archived'; the newest version can be a 'draft' that must not be served.",
+            "A version is stale in the index when `last_indexed_at IS NULL OR last_indexed_at < updated_at`.",
+            "Chunks of superseded versions are sometimes still present in the index (a cleanup job is unreliable).",
+        ],
+    },
+    {
+        "name": "document_chunks", "domain": "AI / LLM applications",
+        "grain": "One row per chunk of a document version.",
+        "desc": "Text chunks produced at indexing time. The vector itself lives in a vector database; only metadata is stored here.",
+        "columns": [
+            C("chunk_id", "INT", False, "Surrogate key (also the vector id in the vector DB)."),
+            C("document_id", "INT", False, "Document version the chunk belongs to."),
+            C("chunk_index", "INT", False, "0-based position inside the document version."),
+            C("chunk_text", "TEXT", False, "Chunk text (synthetic, shortened)."),
+            C("token_count", "INT", False, "Tokens in the chunk.", "30-520"),
+            C("content_hash", "VARCHAR(64)", False, "Hex hash of the normalized chunk text. Equal hashes = identical text."),
+            C("embedding_model", "VARCHAR(40)", True, "Embedding model used. NULL = embedding failed."),
+            C("embedded_at", "TIMESTAMP", True, "Embedding time (UTC). NULL = not embedded."),
+        ],
+        "pk": ["chunk_id"],
+        "fks": [(["document_id"], "documents", ["document_id"])],
+        "uniques": [["document_id", "chunk_index"]],
+        "checks": ["token_count > 0"],
+        "indexes": [["content_hash"]],
+        "rules": [
+            "Unchanged paragraphs keep the same content_hash across versions.",
+            "Boilerplate chunks (e.g. the standard support footer) appear in many documents with the same hash.",
+        ],
+    },
+    {
+        "name": "llm_models", "domain": "AI / LLM applications",
+        "grain": "One row per LLM the application can call.",
+        "desc": "LLM catalogue. Model names are fictional.",
+        "columns": [
+            C("model_name", "VARCHAR(40)", False, "Natural key."),
+            C("provider", "VARCHAR(40)", False, "Vendor (fictional) or 'self-hosted'."),
+            C("context_window", "INT", False, "Maximum input tokens.", "8k-200k"),
+            C("is_self_hosted", "BOOLEAN", False, "TRUE for the in-house model."),
+            C("released_on", "DATE", False, "Availability date."),
+        ],
+        "pk": ["model_name"], "fks": [], "uniques": [], "checks": [], "indexes": [],
+        "rules": [],
+    },
+    {
+        "name": "llm_pricing", "domain": "AI / LLM applications",
+        "grain": "One row per (model, price period).",
+        "desc": "Token prices with validity periods. Use the price in effect on the request date.",
+        "columns": [
+            C("model_name", "VARCHAR(40)", False, "Model."),
+            C("effective_from", "DATE", False, "First day the price applies (inclusive)."),
+            C("effective_to", "DATE", True, "Last day the price applies (inclusive). NULL = current price."),
+            C("input_usd_per_1k", "DECIMAL(10,5)", False, "USD per 1,000 input tokens."),
+            C("output_usd_per_1k", "DECIMAL(10,5)", False, "USD per 1,000 output tokens."),
+        ],
+        "pk": ["model_name", "effective_from"],
+        "fks": [(["model_name"], "llm_models", ["model_name"])],
+        "uniques": [], "checks": ["effective_to IS NULL OR effective_to >= effective_from"],
+        "indexes": [],
+        "rules": ["Price periods for a model never overlap and leave no gaps."],
+    },
+    {
+        "name": "prompts", "domain": "AI / LLM applications",
+        "grain": "One row per prompt template version.",
+        "desc": "Versioned prompt templates.",
+        "columns": [
+            C("prompt_version_id", "INT", False, "Surrogate key."),
+            C("prompt_name", "VARCHAR(40)", False, "Template family.", "'support_answer','sql_copilot','doc_summary'"),
+            C("version", "INT", False, "1-based version within prompt_name."),
+            C("template_text", "TEXT", False, "Template (abbreviated)."),
+            C("created_at", "TIMESTAMP", False, "Creation (UTC)."),
+            C("author", "VARCHAR(60)", False, "Author."),
+            C("is_active", "BOOLEAN", False, "TRUE = currently served (exactly one active version per prompt_name)."),
+        ],
+        "pk": ["prompt_version_id"], "fks": [],
+        "uniques": [["prompt_name", "version"]], "checks": [], "indexes": [],
+        "rules": [],
+    },
+    {
+        "name": "retrieval_configs", "domain": "AI / LLM applications",
+        "grain": "One row per retrieval pipeline configuration.",
+        "desc": "Retrieval settings used by the RAG pipeline and the offline evaluation.",
+        "columns": [
+            C("config_id", "INT", False, "Surrogate key."),
+            C("config_name", "VARCHAR(40)", False, "Name."),
+            C("embedding_model", "VARCHAR(40)", False, "Embedding model."),
+            C("chunk_size_tokens", "INT", False, "Target chunk size."),
+            C("chunk_overlap_tokens", "INT", False, "Overlap between chunks."),
+            C("top_k", "INT", False, "Chunks returned per query.", "5 or 10"),
+            C("uses_reranker", "BOOLEAN", False, "TRUE when a cross-encoder reranks candidates."),
+            C("created_at", "TIMESTAMP", False, "Creation (UTC)."),
+        ],
+        "pk": ["config_id"], "fks": [],
+        "uniques": [["config_name"]], "checks": ["top_k > 0"], "indexes": [],
+        "rules": [],
+    },
+    {
+        "name": "llm_requests", "domain": "AI / LLM applications",
+        "grain": "One row per LLM API call made by the application.",
+        "desc": "LLM request log for the AI features (support bot, SQL copilot, document summary).",
+        "columns": [
+            C("request_id", "BIGINT", False, "Surrogate key."),
+            C("trace_id", "VARCHAR(36)", True, "Distributed-tracing id. NULL = tracing middleware failed."),
+            C("org_id", "INT", False, "Calling organization."),
+            C("user_id", "INT", True, "End user. NULL = system/API call without an end user."),
+            C("feature", "VARCHAR(20)", False, "Product feature.", "'support_bot','sql_copilot','doc_summary'"),
+            C("model_name", "VARCHAR(40)", False, "LLM called."),
+            C("prompt_version_id", "INT", True, "Prompt template version. NULL = ad-hoc prompt."),
+            C("retrieval_config_id", "INT", True, "Retrieval config (support_bot only)."),
+            C("requested_at", "TIMESTAMP", False, "Request time (UTC)."),
+            C("status", "VARCHAR(20)", False, "Outcome.", "'success','error','timeout','rate_limited','content_filtered'"),
+            C("error_code", "VARCHAR(30)", True, "Provider error code for non-success outcomes."),
+            C("latency_ms", "INT", True, "End-to-end latency. NULL for rate_limited requests (rejected before sending).", "ms"),
+            C("input_tokens", "INT", False, "Prompt tokens sent (including retrieved context).", ">= 1"),
+            C("output_tokens", "INT", True, "Completion tokens. NULL when no completion was produced.", ">= 0"),
+            C("cache_hit", "BOOLEAN", False, "TRUE when the response came from the semantic cache (no provider cost)."),
+            C("request_metadata", "JSON", True, "Client metadata: temperature, client, region, and sometimes session_ref. About 2.5% of objects lack the region key (old SDK)."),
+        ],
+        "pk": ["request_id"],
+        "fks": [(["org_id"], "organizations", ["org_id"]),
+                (["user_id"], "users", ["user_id"]),
+                (["model_name"], "llm_models", ["model_name"]),
+                (["prompt_version_id"], "prompts", ["prompt_version_id"]),
+                (["retrieval_config_id"], "retrieval_configs", ["config_id"])],
+        "uniques": [],
+        "checks": ["input_tokens > 0", "output_tokens IS NULL OR output_tokens >= 0",
+                   "status IN ('success','error','timeout','rate_limited','content_filtered')"],
+        "indexes": [["requested_at"], ["model_name", "requested_at"], ["user_id"], ["org_id"]],
+        "rules": [
+            "Cost = input_tokens/1000 * input price + COALESCE(output_tokens,0)/1000 * output price, using the price in effect on the request date; cache hits cost 0.",
+            "Incident: on 2025-03-18 `nimbus-pro` returned many errors and timeouts.",
+            "A few requests have extreme token counts (pasted logs) and latency outliers.",
+        ],
+    },
+    {
+        "name": "llm_request_chunks", "domain": "AI / LLM applications",
+        "grain": "One row per (request, retrieved chunk rank).",
+        "desc": "Chunks retrieved and injected into the prompt for RAG requests.",
+        "columns": [
+            C("request_id", "BIGINT", False, "RAG request."),
+            C("rank_position", "SMALLINT", False, "1 = best match.", "1-10"),
+            C("chunk_id", "INT", False, "Retrieved chunk."),
+            C("similarity", "DOUBLE PRECISION", False, "Cosine similarity reported by the vector DB.", "0-1"),
+        ],
+        "pk": ["request_id", "rank_position"],
+        "fks": [(["request_id"], "llm_requests", ["request_id"]),
+                (["chunk_id"], "document_chunks", ["chunk_id"])],
+        "uniques": [], "checks": ["rank_position >= 1"],
+        "indexes": [["chunk_id"]],
+        "rules": ["Some retrieved chunks belong to archived (superseded) document versions -- a freshness bug."],
+    },
+    {
+        "name": "ai_feedback", "domain": "AI / LLM applications",
+        "grain": "One row per feedback click. A user can change their mind, producing several rows per request.",
+        "desc": "End-user feedback on AI answers.",
+        "columns": [
+            C("feedback_id", "INT", False, "Surrogate key."),
+            C("request_id", "BIGINT", False, "Request the feedback refers to."),
+            C("user_id", "INT", True, "User giving feedback (NULL for anonymous widget)."),
+            C("feedback_type", "VARCHAR(20)", False, "Signal.", "'thumbs_up','thumbs_down','flag'"),
+            C("reason_tag", "VARCHAR(30)", True, "Optional reason.", "'helpful','inaccurate','irrelevant','too_slow','unsafe','outdated'"),
+            C("comment_text", "VARCHAR(500)", True, "Optional free text."),
+            C("created_at", "TIMESTAMP", False, "Click time (UTC)."),
+        ],
+        "pk": ["feedback_id"],
+        "fks": [(["request_id"], "llm_requests", ["request_id"]),
+                (["user_id"], "users", ["user_id"])],
+        "uniques": [], "checks": [], "indexes": [["request_id"]],
+        "rules": ["The latest feedback row per request is the user's final verdict."],
+    },
+    {
+        "name": "eval_queries", "domain": "AI / LLM applications",
+        "grain": "One row per offline retrieval-evaluation query.",
+        "desc": "Golden question set for retrieval evaluation.",
+        "columns": [
+            C("query_id", "INT", False, "Surrogate key."),
+            C("query_text", "VARCHAR(300)", False, "User-style question."),
+            C("gold_doc_key", "VARCHAR(100)", False, "doc_key of the document that answers the question."),
+            C("query_type", "VARCHAR(20)", False, "Query class.", "'lookup','how_to','troubleshooting','policy'"),
+            C("created_at", "TIMESTAMP", False, "Creation (UTC)."),
+        ],
+        "pk": ["query_id"], "fks": [], "uniques": [], "checks": [], "indexes": [],
+        "rules": ["gold_doc_key refers to documents.doc_key, which cannot be enforced by a foreign key because doc_key is not unique.",
+                  "INTENTIONAL DATA-QUALITY ISSUE: the golden set dates from January 2025; two gold keys were renamed since (they no longer exist) and three gold documents were deleted."],
+    },
+    {
+        "name": "retrieval_evaluations", "domain": "AI / LLM applications",
+        "grain": "One row per (config, query, rank).",
+        "desc": "Ranked retrieval results of each configuration for each evaluation query, with human relevance judgments.",
+        "columns": [
+            C("config_id", "INT", False, "Retrieval configuration."),
+            C("query_id", "INT", False, "Evaluation query."),
+            C("rank_position", "SMALLINT", False, "1 = top result.", "1-top_k"),
+            C("chunk_id", "INT", False, "Retrieved chunk."),
+            C("similarity", "DOUBLE PRECISION", False, "Retriever score.", "0-1"),
+            C("is_relevant", "BOOLEAN", True, "Human judgment. NULL = not judged."),
+            C("evaluated_at", "TIMESTAMP", False, "Evaluation run time (UTC)."),
+        ],
+        "pk": ["config_id", "query_id", "rank_position"],
+        "fks": [(["config_id"], "retrieval_configs", ["config_id"]),
+                (["query_id"], "eval_queries", ["query_id"]),
+                (["chunk_id"], "document_chunks", ["chunk_id"])],
+        "uniques": [], "checks": ["rank_position >= 1"], "indexes": [["query_id"]],
+        "rules": ["About 3% of rows are unjudged (is_relevant IS NULL); treat them as not relevant unless told otherwise."],
+    },
+    {
+        "name": "pipeline_runs", "domain": "Platform operations",
+        "grain": "One row per pipeline execution attempt.",
+        "desc": "Daily data-pipeline runs (feature builds, document indexing, ingestion). Failed runs are retried.",
+        "columns": [
+            C("run_id", "INT", False, "Surrogate key."),
+            C("pipeline_name", "VARCHAR(40)", False, "Pipeline.", "'events_ingest','feature_build','label_build','doc_indexer'"),
+            C("run_date", "DATE", False, "Logical date processed by the run."),
+            C("attempt", "SMALLINT", False, "1 for the first attempt, 2+ for retries."),
+            C("started_at", "TIMESTAMP", False, "Start (UTC)."),
+            C("finished_at", "TIMESTAMP", True, "End (UTC). NULL while running."),
+            C("status", "VARCHAR(20)", False, "Outcome.", "'success','failed','running'"),
+            C("rows_processed", "INT", True, "Rows written. NULL for failed runs."),
+        ],
+        "pk": ["run_id"], "fks": [],
+        "uniques": [["pipeline_name", "run_date", "attempt"]], "checks": [],
+        "indexes": [],
+        "rules": [
+            "Runs cover 2025-01-01 to 2025-06-30. Some dates have no run at all (scheduler outages).",
+            "label_build runs weekly (Mondays) only.",
+        ],
+    },
+]
+
+TABLE_BY_NAME = {t["name"]: t for t in TABLES}
+
+
+def columns_of(table):
+    return [c["name"] for c in TABLE_BY_NAME[table]["columns"]]
+
+
+def _col_ddl(col, engine):
+    t = engine_type(col["type"], engine)
+    parts = [col["name"], t]
+    if not col["null"]:
+        parts.append("NOT NULL")
+    return " ".join(parts)
+
+
+def _check_sql(expr, engine):
+    return expr
+
+
+def table_ddl(t, engine):
+    lines = [f"  {_col_ddl(c, engine)}" for c in t["columns"]]
+    lines.append(f"  CONSTRAINT pk_{t['name']} PRIMARY KEY ({', '.join(t['pk'])})")
+    for i, u in enumerate(t["uniques"], 1):
+        lines.append(f"  CONSTRAINT uq_{t['name']}_{i} UNIQUE ({', '.join(u)})")
+    for i, chk in enumerate(t["checks"], 1):
+        lines.append(f"  CONSTRAINT ck_{t['name']}_{i} CHECK ({_check_sql(chk, engine)})")
+    for i, (cols, ref, refcols) in enumerate(t["fks"], 1):
+        lines.append(f"  CONSTRAINT fk_{t['name']}_{i} FOREIGN KEY ({', '.join(cols)}) "
+                     f"REFERENCES {ref} ({', '.join(refcols)})")
+    body = ",\n".join(lines)
+    suffix = ";" if engine == "pg" else " ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;"
+    return f"CREATE TABLE {t['name']} (\n{body}\n){suffix}"
+
+
+def index_ddl(t):
+    out = []
+    for cols in t["indexes"]:
+        name = f"ix_{t['name']}_{'_'.join(cols)}"
+        out.append(f"CREATE INDEX {name} ON {t['name']} ({', '.join(cols)});")
+    return out

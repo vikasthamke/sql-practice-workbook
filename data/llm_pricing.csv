@@ -1,0 +1,8 @@
+model_name,effective_from,effective_to,input_usd_per_1k,output_usd_per_1k
+atlas-large,2024-03-01,2025-02-28,0.01,0.03
+atlas-large,2025-03-01,,0.005,0.015
+atlas-mini,2024-07-01,,0.00015,0.0006
+nimbus-pro,2024-09-01,2025-04-30,0.003,0.015
+nimbus-pro,2025-05-01,,0.0035,0.0175
+nimbus-lite,2024-11-01,,0.00025,0.00125
+orbit-8b,2025-01-15,,2e-05,2e-05

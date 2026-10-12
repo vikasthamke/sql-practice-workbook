@@ -1,0 +1,987 @@
+### SQL-030
+title: Admins of enterprise customers
+difficulty: Easy
+primary: INNER JOIN
+secondary: table aliases, filtering on both sides of a join
+concepts: inner_join, where, order_by
+roles: DS
+time: 5
+dialect: BOTH
+tables: users(user_id, org_id, full_name, email, role, status); organizations(org_id, org_name, segment)
+columns: org_id, org_name, user_id, full_name, email
+compare: ordered
+@context
+Account managers want to e-mail the active administrators of every Enterprise organization about an upcoming security feature.
+@problem
+List `org_id`, `org_name`, `user_id`, `full_name` and `email` of users with role `'admin'` and status `'active'` who belong to an organization in the `'Enterprise'` segment. Sort by `org_id`, then `user_id`.
+@expected
+One row per qualifying user.
+@edge_cases
+- `org_name` is not unique, so sort and group by `org_id`, not by name.
+@hint1
+The role and status live on `users`, the segment on `organizations`.
+@hint2
+Join on the foreign key `users.org_id = organizations.org_id`.
+@hint3
+`FROM users u JOIN organizations o ON o.org_id = u.org_id WHERE o.segment = 'Enterprise' AND u.role = 'admin' AND u.status = 'active'`.
+@solution
+SELECT o.org_id,
+       o.org_name,
+       u.user_id,
+       u.full_name,
+       u.email
+FROM users u
+JOIN organizations o ON o.org_id = u.org_id
+WHERE o.segment = 'Enterprise'
+  AND u.role = 'admin'
+  AND u.status = 'active'
+ORDER BY o.org_id, u.user_id;
+@explanation
+An INNER JOIN keeps pairs of rows that satisfy the ON condition. Every user has exactly one organization (NOT NULL foreign key), so the join neither drops nor duplicates users. The WHERE clause then filters on columns from both tables. Table aliases (`u`, `o`) keep the query readable and remove any ambiguity about which table a column comes from.
+@mistakes
+- Joining on `org_name`: names are not unique, so users would be attached to the wrong companies.
+- Selecting `org_id` without a table prefix. It exists in both tables, and both engines raise an "ambiguous column" error.
+@performance
+`users(org_id)` is indexed. The planner typically filters the small `organizations` table first and then looks up users per org.
+@interview
+Warm-up join. Interviewers check for join keys on IDs, not on names.
+
+### SQL-031
+title: Revenue by segment and the join fan-out trap
+difficulty: Medium
+primary: Preventing join fan-out
+secondary: aggregate before joining, grain reasoning
+concepts: fanout, agg_across_joins, multi_join, ds_segments
+roles: DS
+time: 12
+dialect: BOTH
+tables: orders(order_id, org_id, status, order_total, order_ts); order_items(order_id); organizations(org_id, segment)
+columns: segment, naive_revenue, correct_revenue, inflation_pct
+compare: ordered
+@context
+A dashboard computes 2025 revenue by customer segment. Someone joined `order_items` to count products in the same query, and revenue jumped by more than 50%.
+@problem
+For completed orders placed in H1 2025, return per `segment`: `naive_revenue` (SUM of `order_total` after joining orders to organizations **and order_items**), `correct_revenue` (SUM of `order_total` with each order counted once), and `inflation_pct` = (naive / correct - 1) x 100, 1 decimal. Sort by segment.
+@expected
+3 rows. `naive_revenue >= correct_revenue`.
+@edge_cases
+- An order with 3 lines appears 3 times after the join, so its header total is summed 3 times.
+- `SUM(DISTINCT order_total)` is *not* a fix: two different orders with the same total would collapse.
+@hint1
+What is the grain of the result after joining `orders` to `order_items`?
+@hint2
+Measure columns must be summed at their own grain. Aggregate (or deduplicate) before joining a one-to-many child.
+@hint3
+Compute `correct_revenue` from orders joined to organizations only; compute `naive_revenue` from a second derived table that also joins order_items; join the two per segment.
+@solution
+SELECT c.segment,
+       n.naive_revenue,
+       c.correct_revenue,
+       ROUND(100.0 * (n.naive_revenue / c.correct_revenue - 1), 1) AS inflation_pct
+FROM (
+    SELECT og.segment, SUM(o.order_total) AS correct_revenue
+    FROM orders o
+    JOIN organizations og ON og.org_id = o.org_id
+    WHERE o.status = 'completed'
+      AND o.order_ts >= TIMESTAMP '2025-01-01 00:00:00'
+      AND o.order_ts <  TIMESTAMP '2025-07-01 00:00:00'
+    GROUP BY og.segment
+) c
+JOIN (
+    SELECT og.segment, SUM(o.order_total) AS naive_revenue
+    FROM orders o
+    JOIN organizations og ON og.org_id = o.org_id
+    JOIN order_items oi  ON oi.order_id = o.order_id
+    WHERE o.status = 'completed'
+      AND o.order_ts >= TIMESTAMP '2025-01-01 00:00:00'
+      AND o.order_ts <  TIMESTAMP '2025-07-01 00:00:00'
+    GROUP BY og.segment
+) n ON n.segment = c.segment
+ORDER BY c.segment;
+@assert
+all(num(r[1]) >= num(r[2]) for r in rows)
+any(num(r[3]) > 10 for r in rows)
+@explanation
+**Grain** is the key word. `orders` has one row per order. After joining `order_items` the grain becomes one row per order *line*, so every order-level measure (`order_total`) is repeated once per line. Summing it multiplies each order's total by its line count. That is the fan-out.
+
+Rules of thumb:
+1. Decide the grain of the output (here: segment).
+2. Sum each measure at the grain where it lives (`order_total` per order, `quantity` per line).
+3. If you need measures from several grains, **aggregate each to the common key first**, then join the aggregates (see SQL-043).
+
+The many-to-one join to `organizations` is safe because each order matches exactly one organization.
+@mistakes
+- `SUM(DISTINCT o.order_total)`: wrong whenever two orders have the same amount.
+- Fixing it with `COUNT(DISTINCT)` and dividing: fragile and hard to read.
+@performance
+Pre-aggregating also reduces work: the join to the child table is avoided entirely when it is not needed for the measure.
+@interview
+The single most common analytical SQL bug. A good answer names the grain of each table before writing the join.
+
+### SQL-032
+title: Purchase conversion by acquisition channel
+difficulty: Medium
+primary: LEFT JOIN to keep non-buyers
+secondary: pre-aggregation, COALESCE, conversion rate
+concepts: left_join, ratios, coalesce_nullif, ds_conversion, derived_table
+roles: DS
+time: 12
+dialect: BOTH
+tables: users(user_id, acquisition_channel, signup_at); orders(user_id, status)
+columns: channel, users, buyers, conversion_pct, completed_orders_per_buyer
+compare: ordered
+@context
+Marketing wants the share of users from each acquisition channel who ever completed a purchase, plus how many completed orders a buyer places on average.
+@problem
+For users who signed up in 2024 or later, return per channel (`'unknown'` for NULL): number of users, number of buyers (users with at least one completed order), `conversion_pct` (2 decimals) and `completed_orders_per_buyer` (2 decimals). Sort by `conversion_pct` descending.
+@expected
+6 rows.
+@edge_cases
+- An INNER JOIN to orders would remove every non-buyer and make conversion 100%.
+- Joining raw orders would duplicate users with several orders, so count users with DISTINCT or pre-aggregate orders per user.
+@hint1
+Aggregate orders to one row per user first (count of completed orders).
+@hint2
+LEFT JOIN users to that aggregate; non-buyers get NULL.
+@hint3
+`buyers = SUM(CASE WHEN o.completed_orders > 0 THEN 1 ELSE 0 END)`; orders per buyer = `SUM(completed_orders) / buyers`.
+@solution
+SELECT COALESCE(u.acquisition_channel, 'unknown')                       AS channel,
+       COUNT(*)                                                          AS users,
+       SUM(CASE WHEN o.completed_orders > 0 THEN 1 ELSE 0 END)           AS buyers,
+       ROUND(100.0 * SUM(CASE WHEN o.completed_orders > 0 THEN 1 ELSE 0 END) / COUNT(*), 2)
+                                                                         AS conversion_pct,
+       ROUND(1.0 * COALESCE(SUM(o.completed_orders), 0)
+             / NULLIF(SUM(CASE WHEN o.completed_orders > 0 THEN 1 ELSE 0 END), 0), 2)
+                                                                         AS completed_orders_per_buyer
+FROM users u
+LEFT JOIN (
+    SELECT user_id, COUNT(*) AS completed_orders
+    FROM orders
+    WHERE status = 'completed'
+    GROUP BY user_id
+) o ON o.user_id = u.user_id
+WHERE u.signup_at >= TIMESTAMP '2024-01-01 00:00:00'
+GROUP BY COALESCE(u.acquisition_channel, 'unknown')
+ORDER BY conversion_pct DESC, channel;
+@explanation
+1. The derived table `o` has one row per buyer, so joining it cannot duplicate users.
+2. LEFT JOIN keeps every user; users without completed orders get `o.completed_orders = NULL`, and `NULL > 0` is UNKNOWN, so they add 0 to `buyers`.
+3. `COUNT(*)` after the LEFT JOIN counts users (one row each).
+4. Orders per buyer divides the total completed orders by buyers, with NULLIF protecting channels without buyers.
+
+The status filter sits *inside* the derived table. Putting `o.status = 'completed'` in the outer WHERE of a plain LEFT JOIN to `orders` would remove the non-buyers again (see SQL-034).
+@mistakes
+- INNER JOIN, which gives 100% conversion.
+- `COUNT(o.user_id)` on a raw LEFT JOIN to orders counts orders, not buyers.
+@performance
+Pre-aggregation reduces the join input to one row per buyer and supports the `orders(user_id, ...)` index.
+@interview
+Conversion questions test LEFT JOIN semantics and denominator choice: all users, or users exposed to a purchase opportunity?
+
+### SQL-033
+title: Completed orders without a payment record (anti-join)
+difficulty: Easy
+primary: Anti-join with NOT EXISTS
+secondary: LEFT JOIN ... IS NULL alternative, data reconciliation
+concepts: anti_join, not_exists, left_join, ds_duplicates
+roles: DS, MLE
+time: 10
+dialect: BOTH
+tables: orders(order_id, order_ts, status, sales_channel, order_total); payments(order_id)
+columns: order_id, order_ts, sales_channel, order_total
+compare: ordered
+@context
+Finance reconciles the order system with the payment provider. A completed order without any payment row means revenue was recognized without cash, a serious accounting issue.
+@problem
+List completed orders that have no row at all in `payments`. Return `order_id`, `order_ts`, `sales_channel`, `order_total`, sorted by `order_id`.
+@expected
+A short list (about 15 orders).
+@edge_cases
+- Orders with only failed payments are a different problem (they do have payment rows).
+@hint1
+You want rows of `orders` for which no matching row exists in `payments`.
+@hint2
+`NOT EXISTS (SELECT 1 FROM payments p WHERE p.order_id = o.order_id)`.
+@hint3
+Alternative: `LEFT JOIN payments p ON p.order_id = o.order_id WHERE p.order_id IS NULL`. Test a column that is NOT NULL in payments.
+@solution
+SELECT o.order_id,
+       o.order_ts,
+       o.sales_channel,
+       o.order_total
+FROM orders o
+WHERE o.status = 'completed'
+  AND NOT EXISTS (SELECT 1
+                  FROM payments p
+                  WHERE p.order_id = o.order_id)
+ORDER BY o.order_id;
+@alternative
+SELECT o.order_id,
+       o.order_ts,
+       o.sales_channel,
+       o.order_total
+FROM orders o
+LEFT JOIN payments p ON p.order_id = o.order_id
+WHERE o.status = 'completed'
+  AND p.payment_id IS NULL
+ORDER BY o.order_id;
+@alternative_note
+The LEFT JOIN / IS NULL form returns the same rows. Test a column that can never be NULL in a matched row (here the primary key `payment_id`). NOT EXISTS states the intent more directly and cannot produce duplicates.
+@explanation
+An **anti-join** returns rows of the left table that have *no* partner in the right table. `NOT EXISTS` with a correlated subquery is the clearest way to express it, and both PostgreSQL and MySQL 8 plan it as an anti-join (MySQL 8.0.17+). It is also NULL-safe, unlike `NOT IN` (SQL-013).
+@mistakes
+- `WHERE o.order_id NOT IN (SELECT order_id FROM payments)` works here only because `payments.order_id` is NOT NULL. It is a habit that breaks elsewhere.
+- In the LEFT JOIN form, testing a nullable column of `payments` (e.g. `refunded_at IS NULL`) matches real payments too.
+@performance
+The `payments(order_id)` index turns each existence probe into an index lookup.
+@interview
+Expect "show me two ways" and a question about NULL safety.
+
+### SQL-034
+title: LEFT JOIN filter placement (ON versus WHERE)
+difficulty: Medium
+primary: LEFT JOIN conditions versus WHERE conditions
+secondary: counting zero matches, COUNT(column)
+concepts: join_on_vs_where, left_join, count_star_vs_col
+roles: DS
+time: 10
+dialect: BOTH
+tables: organizations(org_id, org_name, segment); support_tickets(ticket_id, org_id, priority, created_at)
+columns: org_id, org_name, urgent_tickets_h1_2025
+compare: ordered
+@context
+For a quarterly business review, every Enterprise customer should appear with its number of urgent tickets in H1 2025, including customers with zero urgent tickets.
+@problem
+Return every Enterprise organization with `urgent_tickets_h1_2025` (0 when none). Sort by the count descending, then `org_id`.
+@expected
+One row per Enterprise organization, including zeros.
+@edge_cases
+- A filter on the right table placed in WHERE removes the NULL-extended rows and turns the LEFT JOIN into an INNER JOIN.
+- `COUNT(*)` would count 1 for an organization without tickets (the NULL-extended row).
+@hint1
+Which filters describe *which tickets to attach*, and which describe *which organizations to show*?
+@hint2
+Ticket filters belong in the ON clause of the LEFT JOIN.
+@hint3
+`LEFT JOIN support_tickets t ON t.org_id = o.org_id AND t.priority = 'urgent' AND t.created_at >= ... AND t.created_at < ...`, then `COUNT(t.ticket_id)`.
+@solution
+SELECT o.org_id,
+       o.org_name,
+       COUNT(t.ticket_id) AS urgent_tickets_h1_2025
+FROM organizations o
+LEFT JOIN support_tickets t
+       ON t.org_id = o.org_id
+      AND t.priority = 'urgent'
+      AND t.created_at >= TIMESTAMP '2025-01-01 00:00:00'
+      AND t.created_at <  TIMESTAMP '2025-07-01 00:00:00'
+WHERE o.segment = 'Enterprise'
+GROUP BY o.org_id, o.org_name
+ORDER BY urgent_tickets_h1_2025 DESC, o.org_id;
+@assert
+any(num(r[2]) == 0 for r in rows)
+@explanation
+With a LEFT JOIN, the ON condition decides which right-hand rows are attached. Left rows without a partner are still kept, padded with NULLs. The WHERE clause runs **after** the join. `WHERE t.priority = 'urgent'` evaluates to UNKNOWN for the NULL-padded rows and removes them, so organizations without urgent tickets disappear.
+
+Rule: filters on the **preserved** (left) table go in WHERE; filters on the **optional** (right) table go in ON.
+
+`COUNT(t.ticket_id)` counts only real matches; `COUNT(*)` would return 1 for an organization with no tickets.
+@mistakes
+- Moving the priority/date filters to WHERE.
+- Using `COUNT(*)`.
+- Grouping by `org_name` only: two organizations share a name.
+@performance
+`support_tickets(org_id, created_at)` serves the join plus the date range.
+@interview
+Probably the most important LEFT JOIN question. Expect the interviewer to ask for the query with the bug and to explain the difference.
+
+### SQL-035
+title: AI feature adoption by segment (semi-join)
+difficulty: Medium
+primary: Semi-join with EXISTS
+secondary: conditional aggregation, adoption rate
+concepts: semi_join, conditional_aggregation, ratios, ai_volume
+roles: AI, DS
+time: 10
+dialect: BOTH
+tables: organizations(org_id, segment, is_deleted); llm_requests(org_id, requested_at, status)
+columns: segment, organizations, adopting_orgs, adoption_pct
+compare: ordered
+@context
+Product leadership asks what share of current (non-deleted) customers in each segment used any AI feature successfully in Q2 2025.
+@problem
+Per `segment`, return the number of non-deleted organizations, the number that made at least one **successful** LLM request in Q2 2025 (`adopting_orgs`), and `adoption_pct` (1 decimal). Sort by segment.
+@expected
+3 rows.
+@edge_cases
+- Joining to `llm_requests` directly would multiply organizations by their request count.
+- Organizations created after Q2 2025 do not exist in this dataset, but in a live system the denominator should be "customers at the time".
+@hint1
+You only need to know *whether* a matching request exists, not how many.
+@hint2
+`EXISTS (SELECT 1 FROM llm_requests r WHERE r.org_id = o.org_id AND ...)` inside a CASE.
+@hint3
+`SUM(CASE WHEN EXISTS (...) THEN 1 ELSE 0 END)`.
+@solution
+SELECT o.segment,
+       COUNT(*) AS organizations,
+       SUM(CASE WHEN EXISTS (SELECT 1
+                             FROM llm_requests r
+                             WHERE r.org_id = o.org_id
+                               AND r.status = 'success'
+                               AND r.requested_at >= TIMESTAMP '2025-04-01 00:00:00'
+                               AND r.requested_at <  TIMESTAMP '2025-07-01 00:00:00')
+                THEN 1 ELSE 0 END) AS adopting_orgs,
+       ROUND(100.0 * SUM(CASE WHEN EXISTS (SELECT 1
+                                           FROM llm_requests r
+                                           WHERE r.org_id = o.org_id
+                                             AND r.status = 'success'
+                                             AND r.requested_at >= TIMESTAMP '2025-04-01 00:00:00'
+                                             AND r.requested_at <  TIMESTAMP '2025-07-01 00:00:00')
+                              THEN 1 ELSE 0 END) / COUNT(*), 1) AS adoption_pct
+FROM organizations o
+WHERE o.is_deleted = FALSE
+GROUP BY o.segment
+ORDER BY o.segment;
+@alternative
+SELECT o.segment,
+       COUNT(*)                                                   AS organizations,
+       COUNT(a.org_id)                                            AS adopting_orgs,
+       ROUND(100.0 * COUNT(a.org_id) / COUNT(*), 1)               AS adoption_pct
+FROM organizations o
+LEFT JOIN (SELECT DISTINCT org_id
+           FROM llm_requests
+           WHERE status = 'success'
+             AND requested_at >= TIMESTAMP '2025-04-01 00:00:00'
+             AND requested_at <  TIMESTAMP '2025-07-01 00:00:00') a
+       ON a.org_id = o.org_id
+WHERE o.is_deleted = FALSE
+GROUP BY o.segment
+ORDER BY o.segment;
+@alternative_note
+The DISTINCT derived table reduces requests to one row per adopting organization, so the LEFT JOIN cannot fan out. It avoids repeating the EXISTS expression and is often easier to extend (e.g. to count requests too).
+@explanation
+A **semi-join** keeps a left row when at least one match exists, and never duplicates it. `EXISTS` stops at the first match. In the main solution it appears inside a CASE so that every organization stays in the denominator. The repeated EXISTS is verbose; the alternative computes the set of adopting organizations once and LEFT JOINs it.
+
+**Why it matters for AI apps:** adoption by segment shows where AI features land. Low Enterprise adoption often points to access-control or data-residency blockers rather than to the quality of the feature.
+@mistakes
+- `JOIN llm_requests` then `COUNT(*)` counts requests, not organizations.
+- Counting all statuses: an organization whose every request was rate-limited did not really adopt the feature.
+@performance
+`llm_requests(org_id)` makes each EXISTS probe an index lookup; the DISTINCT version scans the date range once.
+@interview
+Shows the semi-join pattern and the "count entities, not events" discipline.
+
+### SQL-036
+title: Top referrers and whether referrals stay in the same company
+difficulty: Medium
+primary: Self join
+secondary: aggregate on the self-join, conditional count
+concepts: self_join, conditional_aggregation, having
+roles: DS
+time: 10
+dialect: BOTH
+tables: users(user_id, full_name, org_id, referred_by_user_id)
+columns: referrer_id, referrer_name, referrals, same_org_referrals
+compare: ordered
+@context
+The referral program pays a bonus to users who bring in at least two new users. Finance also wants to know whether referrals are colleagues (same organization) or external.
+@problem
+For users who referred at least 2 users, return `referrer_id`, `referrer_name`, `referrals` and `same_org_referrals`. Sort by `referrals` descending, then `referrer_id`.
+@expected
+One row per qualifying referrer (about two dozen).
+@edge_cases
+- `users` references itself; give the two roles distinct aliases.
+@hint1
+Join `users` to itself: one copy plays the referred user, the other the referrer.
+@hint2
+`FROM users r JOIN users ref ON ref.user_id = r.referred_by_user_id`.
+@hint3
+Group by the referrer columns and filter with `HAVING COUNT(*) >= 2`.
+@solution
+SELECT ref.user_id                                              AS referrer_id,
+       ref.full_name                                            AS referrer_name,
+       COUNT(*)                                                 AS referrals,
+       SUM(CASE WHEN r.org_id = ref.org_id THEN 1 ELSE 0 END)   AS same_org_referrals
+FROM users r
+JOIN users ref ON ref.user_id = r.referred_by_user_id
+GROUP BY ref.user_id, ref.full_name
+HAVING COUNT(*) >= 2
+ORDER BY referrals DESC, referrer_id;
+@explanation
+A self join treats one table as two logical tables. Here `r` is the referred user and `ref` the referrer, linked by `r.referred_by_user_id = ref.user_id`. The inner join automatically drops users without a referrer. Grouping by the referrer counts referred users, and comparing the two `org_id` columns classifies each referral.
+@mistakes
+- Reversing the join direction (`ref.referred_by_user_id = r.user_id`) answers "who referred me" instead of "whom did I refer".
+- Grouping by `full_name` alone: names repeat.
+@performance
+Each referred user looks up its referrer by primary key.
+@interview
+Self joins appear in hierarchy, referral, and "pairs of events" questions. Clear aliases are what interviewers look for.
+
+### SQL-037
+title: Most-retrieved knowledge-base documents (many-to-many)
+difficulty: Medium
+primary: Many-to-many joins through a bridge table
+secondary: COUNT DISTINCT at the right grain, multi-table join
+concepts: many_to_many, multi_join, count_distinct, ai_rag_ingestion
+roles: AI
+time: 12
+dialect: BOTH
+tables: llm_requests(request_id, feature, requested_at); llm_request_chunks(request_id, chunk_id); document_chunks(chunk_id, document_id); documents(document_id, doc_key, status)
+columns: doc_key, requests, chunk_retrievals, distinct_versions
+compare: ordered
+@context
+The content team wants to know which knowledge-base documents the support bot relies on most, so they can prioritise reviews.
+@problem
+For support-bot requests in June 2025, return the 10 `doc_key`s that appear in the most distinct requests. Show `requests` (distinct requests that retrieved at least one chunk of the document), `chunk_retrievals` (total retrieved chunks), and `distinct_versions` (different document versions retrieved). Ties: `doc_key` ascending.
+@expected
+10 rows.
+@edge_cases
+- A request can retrieve several chunks of the same document, so `COUNT(*)` counts chunk retrievals, not requests.
+- Different versions of the same document share a `doc_key`.
+@hint1
+`llm_request_chunks` is the bridge between requests and chunks; chunks belong to document versions.
+@hint2
+Join requests → request_chunks → document_chunks → documents and group by `doc_key`.
+@hint3
+`COUNT(DISTINCT rc.request_id)` for requests, `COUNT(*)` for retrievals, `COUNT(DISTINCT d.document_id)` for versions.
+@solution
+SELECT d.doc_key,
+       COUNT(DISTINCT rc.request_id)  AS requests,
+       COUNT(*)                       AS chunk_retrievals,
+       COUNT(DISTINCT d.document_id)  AS distinct_versions
+FROM llm_requests r
+JOIN llm_request_chunks rc ON rc.request_id = r.request_id
+JOIN document_chunks c     ON c.chunk_id = rc.chunk_id
+JOIN documents d           ON d.document_id = c.document_id
+WHERE r.feature = 'support_bot'
+  AND r.requested_at >= TIMESTAMP '2025-06-01 00:00:00'
+  AND r.requested_at <  TIMESTAMP '2025-07-01 00:00:00'
+GROUP BY d.doc_key
+ORDER BY requests DESC, d.doc_key
+LIMIT 10;
+@explanation
+Requests and chunks have a **many-to-many** relationship: a request retrieves many chunks, and a chunk is retrieved by many requests. The bridge table `llm_request_chunks` stores one row per (request, rank). After the joins, the grain is one row per retrieved chunk. Each count therefore needs to say what it counts: DISTINCT requests, all retrievals, or DISTINCT versions.
+
+`distinct_versions > 1` is a warning sign: answers were grounded in more than one version of the same document, possibly an outdated one (see SQL-127).
+
+**Why it matters for AI apps:** retrieval frequency is a proxy for content importance and a starting point for content QA.
+@mistakes
+- Ranking by `COUNT(*)`, which favours long documents with many chunks.
+- Forgetting ties, so LIMIT returns an arbitrary 10th row.
+@performance
+`llm_request_chunks(chunk_id)` and the primary keys support every join; the date filter on `llm_requests(requested_at)` keeps the input small.
+@interview
+Many-to-many joins are where duplicate counting hides. Saying "after this join the grain is per retrieved chunk" earns trust.
+
+### SQL-038
+title: Attribute orders to the active subscription (range join)
+difficulty: Hard
+primary: Range join on a validity interval
+secondary: detecting zero and multiple matches, LEFT JOIN with range condition
+concepts: range_join, left_join, fanout, grain_mismatch, ds_duplicates
+roles: DS
+time: 15
+dialect: BOTH
+tables: orders(order_id, org_id, status, order_ts); subscriptions(subscription_id, org_id, started_at, ended_at)
+columns: matching_subscriptions, completed_orders
+compare: ordered
+@context
+Revenue analysts want to attribute each completed order to the plan the organization was on when it ordered. Subscriptions are periods `[started_at, ended_at)` with `ended_at IS NULL` for open periods. Before trusting the attribution, check how many subscriptions each order matches.
+@problem
+For every completed order, count the subscriptions of the same organization whose period contains `order_ts`. Return how many orders have 0, 1, 2, ... matches (`matching_subscriptions`, `completed_orders`), sorted by the match count.
+@expected
+A small distribution table. Most orders match exactly one subscription.
+@edge_cases
+- Open periods: `ended_at IS NULL` means "still running"; the comparison `order_ts < ended_at` would be UNKNOWN.
+- Overlapping subscriptions (a known billing bug) produce 2 matches, which means fan-out if you join naively.
+- Orders placed while the organization had no subscription produce 0 matches; an INNER JOIN would drop them silently.
+@hint1
+Join on the organization **and** on a time condition, not on equality of a key.
+@hint2
+`s.started_at <= o.order_ts AND (s.ended_at IS NULL OR o.order_ts < s.ended_at)`.
+@hint3
+LEFT JOIN, count matches per order in a derived table, then group by that count.
+@solution
+SELECT matching_subscriptions,
+       COUNT(*) AS completed_orders
+FROM (
+    SELECT o.order_id,
+           COUNT(s.subscription_id) AS matching_subscriptions
+    FROM orders o
+    LEFT JOIN subscriptions s
+           ON s.org_id = o.org_id
+          AND s.started_at <= o.order_ts
+          AND (s.ended_at IS NULL OR o.order_ts < s.ended_at)
+    WHERE o.status = 'completed'
+    GROUP BY o.order_id
+) m
+GROUP BY matching_subscriptions
+ORDER BY matching_subscriptions;
+@assert
+len(rows) >= 2
+any(r[0] == '0' for r in rows)
+@explanation
+A **range join** (also called an interval or "as-of" join) matches a point in time to the period containing it. Unlike a key join, nothing in the schema guarantees exactly one match:
+- **0 matches**: gaps in subscription history. With an INNER JOIN these orders vanish from the revenue report.
+- **2+ matches**: overlapping periods. A naive join would duplicate the order and double its revenue.
+
+Checking the match distribution before using a range join is a cheap, high-value habit. To resolve multiple matches deterministically, pick one candidate per order with an explicit tie-break rule, such as the latest `started_at` (SQL-056).
+
+Using `COALESCE(s.ended_at, '9999-12-31')` instead of the `IS NULL OR` form is equivalent and common.
+@mistakes
+- `o.order_ts BETWEEN s.started_at AND s.ended_at`: fails for open periods (NULL) and double counts an order placed exactly at a boundary.
+- INNER JOIN, which hides the 0-match orders.
+@performance
+`subscriptions(org_id, started_at)` narrows candidates per organization; range joins over large tables benefit from that equality prefix.
+@interview
+"As-of" joins are central in analytics and in ML feature engineering. Interviewers check boundary handling and the zero/many match cases.
+
+### SQL-039
+title: Complete model-by-feature grid (CROSS JOIN)
+difficulty: Medium
+primary: CROSS JOIN to build a complete grid
+secondary: LEFT JOIN aggregated facts, zero-filling
+concepts: cross_join, left_join, coalesce_nullif, ai_volume
+roles: AI
+time: 10
+dialect: BOTH
+tables: llm_models(model_name); llm_requests(model_name, feature, requested_at)
+columns: model_name, feature, requests
+compare: ordered
+@context
+A heat-map in the AI usage report must show every model x feature combination, including combinations that had no traffic in June 2025 (they show as 0, not as missing cells).
+@problem
+Return every combination of the 5 models in `llm_models` and the 3 features (`support_bot`, `sql_copilot`, `doc_summary`) with the number of requests in June 2025. Sort by model, then feature.
+@expected
+Exactly 15 rows; many requests counts are 0.
+@edge_cases
+- Features are not stored in a table of their own; build the list (derived table or VALUES).
+- `COUNT(*)` on a LEFT JOIN returns 1 for empty combinations; count a column of the right side instead, or zero-fill an aggregate.
+@hint1
+First build all combinations, then attach the facts.
+@hint2
+`llm_models CROSS JOIN (SELECT 'support_bot' AS feature UNION ALL SELECT ...)`.
+@hint3
+Aggregate requests per (model, feature) in a derived table and LEFT JOIN it to the grid with `COALESCE(n, 0)`.
+@solution
+SELECT m.model_name,
+       f.feature,
+       COALESCE(r.requests, 0) AS requests
+FROM llm_models m
+CROSS JOIN (SELECT 'support_bot' AS feature
+            UNION ALL SELECT 'sql_copilot'
+            UNION ALL SELECT 'doc_summary') f
+LEFT JOIN (SELECT model_name, feature, COUNT(*) AS requests
+           FROM llm_requests
+           WHERE requested_at >= TIMESTAMP '2025-06-01 00:00:00'
+             AND requested_at <  TIMESTAMP '2025-07-01 00:00:00'
+           GROUP BY model_name, feature) r
+       ON r.model_name = m.model_name
+      AND r.feature = f.feature
+ORDER BY m.model_name, f.feature;
+@assert
+len(rows) == 15
+@explanation
+`CROSS JOIN` returns the Cartesian product: 5 models x 3 features = 15 cells. Facts are aggregated separately and attached with a LEFT JOIN on both keys; COALESCE turns missing cells into 0. This "spine + facts" pattern is the standard way to get complete grids for charts and for ML datasets, where a missing row and a zero mean different things.
+
+`SELECT 'x' AS feature UNION ALL SELECT ...` builds an inline list in both engines. PostgreSQL also accepts `(VALUES ('support_bot'), ...) AS f(feature)`. MySQL 8 supports `VALUES ROW(...)` with a different syntax.
+@mistakes
+- An accidental CROSS JOIN (missing ON clause) is a classic performance disaster. Here it is intentional and small.
+- Zero-filling with `COUNT(*)` over the LEFT JOIN of raw requests (returns 1 for empty cells).
+@performance
+The grid is tiny; the aggregation scans June's requests once.
+@interview
+Shows the difference between "no rows" and "zero", which matters for dashboards and time series.
+
+### SQL-040
+title: Compare two retrieval configurations on the composite key
+difficulty: Hard
+primary: Joining on a composite key
+secondary: conditional aggregation, NULL-safe boolean comparison
+concepts: composite_key, conditional_aggregation, ai_retrieval_compare
+roles: AI
+time: 12
+dialect: BOTH
+tables: retrieval_evaluations(config_id, query_id, rank_position, chunk_id, is_relevant)
+columns: queries, same_top1_chunk, top1_relevant_cfg2, top1_relevant_cfg3, improved, regressed
+compare: ordered
+@context
+The retrieval team replaced config 2 (`dense_large_384_ov64`) with config 3 (`hybrid_rerank_k10`). For a quick sanity check they compare the **top-1** result of both configurations on each evaluation query.
+@problem
+Pair the rank-1 row of config 2 with the rank-1 row of config 3 for the same `query_id`. Return one row with: number of queries compared, queries where both returned the same chunk, queries whose top-1 was relevant for config 2, for config 3, `improved` (relevant only for config 3) and `regressed` (relevant only for config 2). Treat unjudged (`NULL`) as not relevant.
+@expected
+One row, six integer columns.
+@edge_cases
+- The key of an evaluation row is `(config_id, query_id, rank_position)`. Joining on `query_id` alone would pair every rank with every other rank (100 pairs per query for k = 10).
+- `is_relevant` can be NULL; use `COALESCE(is_relevant, FALSE)`.
+@hint1
+Self-join the table: one alias for config 2, another for config 3.
+@hint2
+Join on `query_id` **and** `rank_position`, and fix rank 1 and the two config IDs.
+@hint3
+`improved = SUM(CASE WHEN COALESCE(b.is_relevant, FALSE) AND NOT COALESCE(a.is_relevant, FALSE) THEN 1 ELSE 0 END)`.
+@solution
+SELECT COUNT(*)                                                                       AS queries,
+       SUM(CASE WHEN a.chunk_id = b.chunk_id THEN 1 ELSE 0 END)                       AS same_top1_chunk,
+       SUM(CASE WHEN COALESCE(a.is_relevant, FALSE) THEN 1 ELSE 0 END)               AS top1_relevant_cfg2,
+       SUM(CASE WHEN COALESCE(b.is_relevant, FALSE) THEN 1 ELSE 0 END)               AS top1_relevant_cfg3,
+       SUM(CASE WHEN COALESCE(b.is_relevant, FALSE) AND NOT COALESCE(a.is_relevant, FALSE)
+                THEN 1 ELSE 0 END)                                                   AS improved,
+       SUM(CASE WHEN COALESCE(a.is_relevant, FALSE) AND NOT COALESCE(b.is_relevant, FALSE)
+                THEN 1 ELSE 0 END)                                                   AS regressed
+FROM retrieval_evaluations a
+JOIN retrieval_evaluations b
+  ON b.query_id = a.query_id
+ AND b.rank_position = a.rank_position
+WHERE a.config_id = 2
+  AND b.config_id = 3
+  AND a.rank_position = 1;
+@assert
+num(rows[0][0]) == 200
+num(rows[0][3]) - num(rows[0][2]) == num(rows[0][4]) - num(rows[0][5])
+@explanation
+When a table's identity is a **composite key**, every key column that should match must be in the join condition; otherwise rows multiply. Here the config IDs are fixed by the WHERE clause, and the join matches `(query_id, rank_position)`.
+
+The `improved`/`regressed` split is more informative than two accuracy numbers: a net gain of +20 could hide 40 wins and 20 losses, which matters if the losses fall on important query types.
+
+**Why it matters for AI apps:** offline retrieval evaluation compares configurations query by query before a rollout. Win/loss counts are also the input for a paired significance test such as McNemar's test.
+@mistakes
+- Joining on `query_id` only.
+- Ignoring NULL judgments: `a.is_relevant AND NOT b.is_relevant` is UNKNOWN when either side is NULL, so those queries are silently dropped from both counts.
+@performance
+The primary key `(config_id, query_id, rank_position)` serves both sides of the join.
+@interview
+Tests composite-key discipline and how to compare two models on paired data.
+
+### SQL-041
+title: Reconcile event data with ingestion runs (FULL OUTER JOIN)
+difficulty: Hard
+primary: FULL OUTER JOIN and its MySQL emulation
+secondary: RIGHT/LEFT anti-join union, date-level reconciliation
+concepts: right_join, anti_join, union_all, ml_pipeline_validation, compare_datasets
+roles: MLE
+time: 18
+dialect: BOTH
+tables: events(event_ts); pipeline_runs(pipeline_name, run_date, status)
+columns: activity_date, events, successful_runs, issue
+compare: ordered
+@context
+The ML platform team audits the `events_ingest` pipeline for Q2 2025. Every date that has events should have a successful ingestion run, and every successful run should correspond to a date with events.
+@problem
+Compare, per date in Q2 2025, the number of events (by `event_ts` date) with the number of successful `events_ingest` runs (by `run_date`). Return only dates where something is wrong: `activity_date`, `events` (0 if none), `successful_runs` (0 if none) and `issue` (`'no successful run'` or `'run without events'`). Sort by date.
+@expected
+A handful of problem dates.
+@edge_cases
+- A date can be missing on either side, so you need a FULL OUTER JOIN of two daily aggregates.
+- **MySQL has no FULL OUTER JOIN.** Emulate it with a LEFT JOIN plus the unmatched rows of the other side.
+- A date can have failed runs only; it then has a row in `pipeline_runs`, but zero successful runs.
+@hint1
+Aggregate both sources to one row per date first (two derived tables).
+@hint2
+PostgreSQL: `FULL OUTER JOIN ... ON e.d = r.d` and `COALESCE(e.d, r.d)` for the date.
+@hint3
+MySQL: `(e LEFT JOIN r) UNION ALL (r rows with NOT EXISTS in e)`, then filter the problem rows.
+@solution_pg
+SELECT COALESCE(e.activity_date, r.run_date)                 AS activity_date,
+       COALESCE(e.events, 0)                                 AS events,
+       COALESCE(r.successful_runs, 0)                        AS successful_runs,
+       CASE WHEN COALESCE(r.successful_runs, 0) = 0 THEN 'no successful run'
+            ELSE 'run without events' END                    AS issue
+FROM (SELECT CAST(event_ts AS DATE) AS activity_date, COUNT(*) AS events
+      FROM events
+      WHERE event_ts >= TIMESTAMP '2025-04-01 00:00:00'
+        AND event_ts <  TIMESTAMP '2025-07-01 00:00:00'
+      GROUP BY CAST(event_ts AS DATE)) e
+FULL OUTER JOIN
+     (SELECT run_date,
+             SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) AS successful_runs
+      FROM pipeline_runs
+      WHERE pipeline_name = 'events_ingest'
+        AND run_date >= DATE '2025-04-01'
+        AND run_date <  DATE '2025-07-01'
+      GROUP BY run_date) r
+  ON r.run_date = e.activity_date
+WHERE COALESCE(e.events, 0) = 0
+   OR COALESCE(r.successful_runs, 0) = 0
+ORDER BY activity_date;
+@solution_mysql
+WITH e AS (
+    SELECT CAST(event_ts AS DATE) AS activity_date, COUNT(*) AS events
+    FROM events
+    WHERE event_ts >= TIMESTAMP '2025-04-01 00:00:00'
+      AND event_ts <  TIMESTAMP '2025-07-01 00:00:00'
+    GROUP BY CAST(event_ts AS DATE)
+), r AS (
+    SELECT run_date,
+           SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) AS successful_runs
+    FROM pipeline_runs
+    WHERE pipeline_name = 'events_ingest'
+      AND run_date >= DATE '2025-04-01'
+      AND run_date <  DATE '2025-07-01'
+    GROUP BY run_date
+), full_outer AS (
+    SELECT e.activity_date, e.events, r.successful_runs
+    FROM e LEFT JOIN r ON r.run_date = e.activity_date
+    UNION ALL
+    SELECT r.run_date, NULL, r.successful_runs
+    FROM r
+    WHERE NOT EXISTS (SELECT 1 FROM e WHERE e.activity_date = r.run_date)
+)
+SELECT activity_date,
+       COALESCE(events, 0)          AS events,
+       COALESCE(successful_runs, 0) AS successful_runs,
+       CASE WHEN COALESCE(successful_runs, 0) = 0 THEN 'no successful run'
+            ELSE 'run without events' END AS issue
+FROM full_outer
+WHERE COALESCE(events, 0) = 0
+   OR COALESCE(successful_runs, 0) = 0
+ORDER BY activity_date;
+@dialect_note
+PostgreSQL supports `FULL [OUTER] JOIN`. MySQL does not. The standard emulation is `A LEFT JOIN B` **UNION ALL** the rows of B with no partner in A (anti-join). Do not use `A LEFT JOIN B UNION A RIGHT JOIN B`: plain UNION also removes legitimate duplicate rows, and it costs an extra sort. The MySQL version uses CTEs (MySQL 8.0+) so that each aggregate is written once.
+@explanation
+1. Each side is aggregated to the same grain, one row per date, before joining. That makes the outer join one-to-one and avoids fan-out.
+2. A FULL OUTER JOIN keeps unmatched rows from **both** sides, which is what a reconciliation needs.
+3. `COALESCE(e.activity_date, r.run_date)` produces a single date column whichever side exists.
+4. The final filter keeps the problem dates only. In this dataset these are dates whose run is missing because of scheduler outages, and the last day, whose run only starts the following morning.
+
+In MySQL, the anti-join branch adds the run-only dates that a LEFT JOIN from events would miss.
+@mistakes
+- Joining raw tables (events x runs) before aggregating: every event row is multiplied by the number of runs on that day.
+- Emulating FULL JOIN with UNION (not ALL) between a LEFT and a RIGHT JOIN, which silently deduplicates rows.
+@performance
+Both sides are reduced to ≤ 91 rows before the join; the expensive part is the events aggregation over the date range.
+@interview
+Reconciliation between two systems is a common data-engineering and MLE interview task; knowing the MySQL emulation is a practical plus.
+
+### SQL-042
+title: Open subscriptions per plan with RIGHT JOIN
+difficulty: Easy
+primary: RIGHT JOIN
+secondary: equivalence with LEFT JOIN, filter in ON
+concepts: right_join, join_on_vs_where, aggregates
+roles: DS
+time: 7
+dialect: BOTH
+tables: subscriptions(subscription_id, plan_id, mrr, ended_at); plans(plan_id, plan_name, tier_rank)
+columns: plan_name, open_subscriptions, open_mrr
+compare: ordered
+@context
+The pricing team wants the current number of open subscriptions and their MRR for **every** plan, including plans nobody is on.
+@problem
+Using a RIGHT JOIN from `subscriptions` to `plans`, return `plan_name`, `open_subscriptions` (periods with `ended_at IS NULL`) and `open_mrr` (0 when none). Sort by `tier_rank`, then `plan_name`.
+@expected
+6 rows; the legacy plan has 0 open subscriptions.
+@edge_cases
+- The "open" condition must be in the ON clause, otherwise plans without open subscriptions disappear.
+@hint1
+`A RIGHT JOIN B` keeps every row of B.
+@hint2
+Put `s.ended_at IS NULL` in the ON clause.
+@hint3
+`COUNT(s.subscription_id)` and `COALESCE(SUM(s.mrr), 0)`.
+@solution
+SELECT p.plan_name,
+       COUNT(s.subscription_id)   AS open_subscriptions,
+       COALESCE(SUM(s.mrr), 0)    AS open_mrr
+FROM subscriptions s
+RIGHT JOIN plans p
+        ON p.plan_id = s.plan_id
+       AND s.ended_at IS NULL
+GROUP BY p.plan_id, p.plan_name, p.tier_rank
+ORDER BY p.tier_rank, p.plan_name;
+@alternative
+SELECT p.plan_name,
+       COUNT(s.subscription_id)   AS open_subscriptions,
+       COALESCE(SUM(s.mrr), 0)    AS open_mrr
+FROM plans p
+LEFT JOIN subscriptions s
+       ON s.plan_id = p.plan_id
+      AND s.ended_at IS NULL
+GROUP BY p.plan_id, p.plan_name, p.tier_rank
+ORDER BY p.tier_rank, p.plan_name;
+@alternative_note
+Swapping the table order turns the RIGHT JOIN into the more common LEFT JOIN. Most style guides prefer LEFT JOIN so that the "preserved" table always comes first.
+@explanation
+`A RIGHT JOIN B` is exactly `B LEFT JOIN A`. It is rarely necessary, but you will meet it in legacy queries and interviews. As with LEFT JOIN, filters on the optional side (`subscriptions`) must live in the ON clause.
+@mistakes
+- `WHERE s.ended_at IS NULL` (with only the key in ON) looks right, because the NULL-extended row of a plan *without any* subscriptions also has a NULL `ended_at`. But a plan whose subscriptions have **all ended**, like the legacy plan, keeps only its ended rows, they are all filtered out, and the plan disappears from the result.
+- `SUM(s.mrr)` without COALESCE returns NULL for plans without subscriptions.
+@performance
+`subscriptions(plan_id)` index supports the join.
+@interview
+Expect "rewrite this as a LEFT JOIN". Mixing LEFT and RIGHT joins in one query is a readability smell.
+
+### SQL-043
+title: Two one-to-many children: lines and payment attempts per order
+difficulty: Hard
+primary: Fan-out from joining two child tables
+secondary: pre-aggregation per child, COUNT(DISTINCT) limits
+concepts: fanout, agg_across_joins, derived_table, multi_join
+roles: DS
+time: 15
+dialect: BOTH
+tables: orders(order_id, status, order_ts); order_items(order_id, quantity, unit_price, discount_amount); payments(order_id, payment_id, amount, status)
+columns: order_id, line_count, line_net_amount, payment_attempts, failed_attempts, naive_line_net_amount
+compare: ordered
+@context
+The checkout team investigates orders that needed several payment attempts in May 2025. For each such order they want the number of lines, the net amount of the lines, and the payment attempts. A first draft joined both child tables to `orders` and reported inflated amounts.
+@problem
+For completed orders placed in May 2025 with **at least 2 payment attempts**, return `order_id`, `line_count`, `line_net_amount`, `payment_attempts`, `failed_attempts`, and `naive_line_net_amount` (the line amount computed after joining both children directly). Sort by `order_id`.
+@expected
+One row per qualifying order. `naive_line_net_amount = line_net_amount x payment_attempts`.
+@edge_cases
+- Joining lines (L rows) and payments (P rows) to the same order produces L x P rows.
+- `COUNT(DISTINCT ...)` can rescue counts but **not** sums.
+@hint1
+Each child table must be reduced to one row per order before the two are combined.
+@hint2
+Two derived tables: lines per order and payments per order, both grouped by `order_id`.
+@hint3
+For the naive column, a third derived table joins `orders`, `order_items` and `payments` together and sums the line amounts.
+@solution
+SELECT o.order_id,
+       li.line_count,
+       li.line_net_amount,
+       pa.payment_attempts,
+       pa.failed_attempts,
+       nv.naive_line_net_amount
+FROM orders o
+JOIN (SELECT order_id,
+             COUNT(*)                                          AS line_count,
+             SUM(quantity * unit_price - discount_amount)      AS line_net_amount
+      FROM order_items
+      GROUP BY order_id) li ON li.order_id = o.order_id
+JOIN (SELECT order_id,
+             COUNT(*)                                          AS payment_attempts,
+             SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed_attempts
+      FROM payments
+      GROUP BY order_id) pa ON pa.order_id = o.order_id
+JOIN (SELECT o2.order_id,
+             SUM(oi.quantity * oi.unit_price - oi.discount_amount) AS naive_line_net_amount
+      FROM orders o2
+      JOIN order_items oi ON oi.order_id = o2.order_id
+      JOIN payments p     ON p.order_id = o2.order_id
+      GROUP BY o2.order_id) nv ON nv.order_id = o.order_id
+WHERE o.status = 'completed'
+  AND o.order_ts >= TIMESTAMP '2025-05-01 00:00:00'
+  AND o.order_ts <  TIMESTAMP '2025-06-01 00:00:00'
+  AND pa.payment_attempts >= 2
+ORDER BY o.order_id;
+@assert
+all(abs(num(r[5]) - num(r[2]) * num(r[3])) < 0.01 for r in rows)
+@explanation
+`order_items` and `payments` are both one-to-many children of `orders` but are unrelated to each other. Joining both to the same order pairs every line with every payment, a mini Cartesian product per order. `COUNT(DISTINCT payment_id)` would repair the attempt count, but nothing repairs `SUM(line amount)`: it is multiplied by the number of payments.
+
+The fix is to reduce each child to one row per order (derived tables `li` and `pa`) and join those. All joins are then one-to-one. The `nv` derived table reproduces the bug for comparison only.
+@mistakes
+- Using `SUM(DISTINCT line_amount)`, which merges different lines with equal amounts.
+- Filtering `payments.status = 'failed'` in WHERE, which removes the successful attempt and changes `payment_attempts`.
+- Naming a column `lines`: it is a **reserved word in MySQL** (`LOAD DATA ... LINES TERMINATED BY`) and causes a syntax error there, while PostgreSQL accepts it. Prefer descriptive, non-reserved aliases such as `line_count`.
+@performance
+Pre-aggregation scans each child once; in production, push the date filter into the derived tables (via a join to filtered orders) to avoid aggregating the whole history.
+@interview
+"Two one-to-many joins" is the advanced version of fan-out. Explaining why DISTINCT is not a general fix is the key insight.
+
+### SQL-044
+title: Pair duplicate user accounts (self join on a normalized key)
+difficulty: Medium
+primary: Self join on an expression
+secondary: avoiding mirrored pairs, entity resolution
+concepts: self_join, string_functions, ds_duplicates, ml_duplicate_examples
+roles: DS, MLE
+time: 12
+dialect: BOTH
+tables: users(user_id, org_id, email, signup_at)
+columns: original_user_id, duplicate_user_id, normalized_email, same_org, original_signup_at, duplicate_signup_at
+compare: ordered
+@context
+Identity resolution: a person who registered twice should be merged. Two accounts are considered the same person when their e-mails match after `LOWER(TRIM(...))`.
+@problem
+Return one row per pair of matching accounts, with the earlier account as `original_user_id` and the later one as `duplicate_user_id`, the shared `normalized_email`, whether both belong to the same organization (`same_org` 1/0), and both sign-up times. Sort by `original_user_id`, `duplicate_user_id`.
+@expected
+About two dozen pairs.
+@edge_cases
+- A self join without an ordering condition returns each pair twice (A,B) and (B,A), plus every row matched with itself.
+- Three accounts of one person would produce three pairs. That is acceptable for a pair list; clustering needs more work (SQL-142).
+@hint1
+Join `users` to itself on the normalized e-mail.
+@hint2
+`a.user_id < b.user_id` keeps each pair once and removes self-matches.
+@hint3
+`CASE WHEN a.org_id = b.org_id THEN 1 ELSE 0 END AS same_org`.
+@solution
+SELECT a.user_id                                  AS original_user_id,
+       b.user_id                                  AS duplicate_user_id,
+       LOWER(TRIM(a.email))                       AS normalized_email,
+       CASE WHEN a.org_id = b.org_id THEN 1 ELSE 0 END AS same_org,
+       a.signup_at                                AS original_signup_at,
+       b.signup_at                                AS duplicate_signup_at
+FROM users a
+JOIN users b
+  ON LOWER(TRIM(b.email)) = LOWER(TRIM(a.email))
+ AND a.user_id < b.user_id
+ORDER BY original_user_id, duplicate_user_id;
+@explanation
+The join condition is an expression on both sides, so each account is compared with all accounts sharing its canonical e-mail. `a.user_id < b.user_id` (user IDs increase with sign-up time) orients each pair from the original to the duplicate and eliminates mirrored and self pairs.
+
+Because both sides are normalized explicitly, the result is the same in PostgreSQL and MySQL. Contrast with SQL-009, where a raw comparison behaved differently because of MySQL's collation.
+
+**ML angle:** duplicate entities leak information between training and test splits (the same person on both sides). Pairs like these feed entity-resolution tables used before splitting.
+@mistakes
+- Using `<>` instead of `<`, which returns every pair twice.
+- Comparing raw e-mails, which misses case and whitespace variants.
+@performance
+Joining on a function of the column cannot use the plain index; an expression index (PostgreSQL) or a generated column with an index (MySQL, SQL-163) fixes that for large tables.
+@interview
+Self-join pair generation with `<` is a pattern interviewers expect to see written without hesitation.
+
+### SQL-045
+title: Experiment overlap matrix (composite keys)
+difficulty: Medium
+primary: Joining assignments on composite primary keys
+secondary: cross-tab of two categorical variables, interaction risk
+concepts: composite_key, self_join, conditional_aggregation, ds_experiment
+roles: DS
+time: 12
+dialect: BOTH
+tables: experiment_assignments(experiment_id, user_id, variant); experiments(experiment_id, experiment_name)
+columns: ai_assist_variant, onboarding_variant, users
+compare: ordered
+@context
+`ai_assist_default_on` (Nov–Dec 2024) and `onboarding_checklist` (Dec 2024–Feb 2025) overlapped in time. If many users were in both, one experiment's treatment could contaminate the other's results.
+@problem
+For users assigned to **both** experiments, count users per combination of variants. Look the experiment IDs up by name instead of hard-coding them. Return `ai_assist_variant`, `onboarding_variant`, `users`, sorted by both variants.
+@expected
+Up to 4 rows (2x2).
+@edge_cases
+- The assignments table's key is `(experiment_id, user_id)`; each user appears at most once per experiment.
+@hint1
+Self-join `experiment_assignments` on `user_id`, with each side restricted to one experiment.
+@hint2
+Join each side to `experiments` to filter by `experiment_name`.
+@hint3
+Group by the two variant columns.
+@solution
+SELECT a.variant  AS ai_assist_variant,
+       b.variant  AS onboarding_variant,
+       COUNT(*)   AS users
+FROM experiment_assignments a
+JOIN experiments ea ON ea.experiment_id = a.experiment_id
+JOIN experiment_assignments b ON b.user_id = a.user_id
+JOIN experiments eb ON eb.experiment_id = b.experiment_id
+WHERE ea.experiment_name = 'ai_assist_default_on'
+  AND eb.experiment_name = 'onboarding_checklist'
+GROUP BY a.variant, b.variant
+ORDER BY ai_assist_variant, onboarding_variant;
+@explanation
+Joining the assignment table to itself on `user_id`, with each side pinned to one experiment, gives one row per user who is in both experiments. The 2x2 table shows whether assignment to one experiment is independent of the other. In a healthy setup the four cells are roughly proportional to the variant splits. A skew would suggest that one experiment's assignment logic depended on the other.
+
+Looking IDs up by name makes the query robust if IDs differ between environments.
+@mistakes
+- Joining on `experiment_id` as well, which makes the two sides refer to the same experiment and returns nothing.
+- Hard-coding IDs copied from a staging database.
+@performance
+The primary key `(experiment_id, user_id)` serves side `a`; the `experiment_assignments(user_id)` index serves side `b`.
+@interview
+Shows practical A/B-testing hygiene (interaction effects) expressed with simple joins.

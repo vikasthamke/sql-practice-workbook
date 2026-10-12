@@ -1,0 +1,1430 @@
+### SQL-116
+title: Daily LLM request volume by feature
+difficulty: Easy
+primary: Daily volume per AI feature
+secondary: conditional aggregation pivot, date bucketing
+concepts: ai_volume, conditional_aggregation, date_bucketing
+roles: AI
+time: 6
+dialect: BOTH
+tables: llm_requests(feature, requested_at)
+columns: request_date, support_bot, sql_copilot, doc_summary, total
+compare: ordered
+@context
+The AI platform on-call dashboard starts with a simple chart: requests per day and feature for the last two weeks of June 2025.
+@problem
+For each day from 2025-06-17 to 2025-06-30, return the number of requests per feature as columns plus the total. Sort by date.
+@expected
+14 rows (every day had traffic).
+@edge_cases
+- Weekends have much less traffic. That is normal seasonality, not an incident.
+@hint1
+Group by the request date.
+@hint2
+One `SUM(CASE WHEN feature = '...' THEN 1 ELSE 0 END)` per feature.
+@hint3
+`COUNT(*)` for the total.
+@solution
+SELECT CAST(requested_at AS DATE)                                  AS request_date,
+       SUM(CASE WHEN feature = 'support_bot' THEN 1 ELSE 0 END)    AS support_bot,
+       SUM(CASE WHEN feature = 'sql_copilot' THEN 1 ELSE 0 END)    AS sql_copilot,
+       SUM(CASE WHEN feature = 'doc_summary' THEN 1 ELSE 0 END)    AS doc_summary,
+       COUNT(*)                                                    AS total
+FROM llm_requests
+WHERE requested_at >= TIMESTAMP '2025-06-17 00:00:00'
+  AND requested_at <  TIMESTAMP '2025-07-01 00:00:00'
+GROUP BY CAST(requested_at AS DATE)
+ORDER BY request_date;
+@explanation
+Volume is the first signal of every AI service: it drives cost, rate-limit headroom and capacity. Pivoting features into columns makes a stacked chart trivial. Days without traffic would be missing rows; use a date spine (SQL-053) when that matters.
+
+**Why it matters for AI apps:** a sudden volume spike from one feature (e.g. a client retry loop) is the most common cause of surprise LLM bills.
+@mistakes
+- Grouping by the raw timestamp (one row per request).
+@performance
+`llm_requests(requested_at)` index serves the range.
+@interview
+Warm-up; expect "now add cost per day" (SQL-118).
+
+### SQL-117
+title: p50 / p95 / p99 latency per model
+difficulty: Hard
+primary: Percentile latency
+secondary: nearest-rank percentiles with window functions, PERCENTILE_DISC in PostgreSQL
+concepts: ai_latency_pct, percentile, row_number, window_agg, dialect_functions
+roles: AI
+time: 18
+dialect: BOTH
+tables: llm_requests(model_name, latency_ms, status, cache_hit, requested_at)
+columns: model_name, requests, p50_ms, p95_ms, p99_ms
+compare: ordered
+@context
+The latency SLO is defined on percentiles: p95 < 6 s for chat features. Means hide the long tail that users actually feel.
+@problem
+For successful, non-cached requests in Q2 2025, return per model the number of requests and the **nearest-rank** p50, p95 and p99 latency (the smallest value such that at least p% of requests are ≤ it). Sort by p95.
+@expected
+5 rows.
+@edge_cases
+- MySQL has no percentile function; implement nearest-rank with ROW_NUMBER and COUNT.
+- Nearest-rank (discrete) percentiles return an observed value; interpolated (continuous) percentiles may not.
+@hint1
+Rank each model's latencies ascending and count them.
+@hint2
+The nearest-rank p-th percentile is the value at position `CEIL(p x n)`.
+@hint3
+`MIN(CASE WHEN rn >= CEIL(0.95 * n) THEN latency_ms END)` returns that value.
+@solution
+WITH ranked AS (
+    SELECT model_name,
+           latency_ms,
+           ROW_NUMBER() OVER (PARTITION BY model_name ORDER BY latency_ms) AS rn,
+           COUNT(*)     OVER (PARTITION BY model_name)                     AS n
+    FROM llm_requests
+    WHERE status = 'success'
+      AND cache_hit = FALSE
+      AND requested_at >= TIMESTAMP '2025-04-01 00:00:00'
+      AND requested_at <  TIMESTAMP '2025-07-01 00:00:00'
+)
+SELECT model_name,
+       MAX(n)                                                AS requests,
+       MIN(CASE WHEN rn >= CEIL(0.50 * n) THEN latency_ms END) AS p50_ms,
+       MIN(CASE WHEN rn >= CEIL(0.95 * n) THEN latency_ms END) AS p95_ms,
+       MIN(CASE WHEN rn >= CEIL(0.99 * n) THEN latency_ms END) AS p99_ms
+FROM ranked
+GROUP BY model_name
+ORDER BY p95_ms, model_name;
+@alternative_pg
+SELECT model_name,
+       COUNT(*)                                                    AS requests,
+       PERCENTILE_DISC(0.50) WITHIN GROUP (ORDER BY latency_ms)    AS p50_ms,
+       PERCENTILE_DISC(0.95) WITHIN GROUP (ORDER BY latency_ms)    AS p95_ms,
+       PERCENTILE_DISC(0.99) WITHIN GROUP (ORDER BY latency_ms)    AS p99_ms
+FROM llm_requests
+WHERE status = 'success'
+  AND cache_hit = FALSE
+  AND requested_at >= TIMESTAMP '2025-04-01 00:00:00'
+  AND requested_at <  TIMESTAMP '2025-07-01 00:00:00'
+GROUP BY model_name
+ORDER BY p95_ms, model_name;
+@alternative_note
+`PERCENTILE_DISC(p)` is PostgreSQL's native nearest-rank percentile; it returns exactly the same values as the window-function version. `PERCENTILE_CONT(p)` interpolates and may return values that never occurred.
+@explanation
+After sorting a model's latencies, the nearest-rank p-th percentile sits at position ⌈p·n⌉. Since rows are sorted ascending, `MIN(latency)` over positions ≥ ⌈p·n⌉ is exactly the value at that position. One window pass gives every percentile.
+
+Excluding cache hits measures the model, not the cache. Excluding failures is a definition choice: timeouts are the worst latency users experience, so an SLO report should also show the timeout rate (SQL-021) next to the percentiles.
+
+**Why it matters for AI apps:** LLM latency is heavy-tailed (long generations, provider hiccups). p95/p99 drive user-perceived quality and timeout settings; the mean is almost irrelevant.
+@mistakes
+- Reporting AVG latency as "typical".
+- `rn = ROUND(0.95 * n)`, which uses a different (inconsistent) definition and can miss on small n.
+@performance
+One sort per model; for big tables, percentile sketches (t-digest) are used in monitoring systems.
+@interview
+Percentiles without a percentile function is a frequent portability question for AI and SRE-flavoured roles.
+
+### SQL-118
+title: Monthly token cost with time-varying prices
+difficulty: Hard
+primary: Token cost estimation with a pricing table
+secondary: range join on validity periods, cache hits cost nothing, per-dialect month
+concepts: ai_token_cost, range_join, date_bucketing, arithmetic, coalesce_nullif
+roles: AI
+time: 20
+dialect: BOTH
+tables: llm_requests(model_name, requested_at, input_tokens, output_tokens, cache_hit); llm_pricing(model_name, effective_from, effective_to, input_usd_per_1k, output_usd_per_1k)
+columns: month_start, model_name, requests, cost_usd
+compare: ordered
+@context
+Finance needs the LLM bill per model and month for H1 2025. Prices change over time (`atlas-large` got cheaper on 2025-03-01, `nimbus-pro` more expensive on 2025-05-01), so each request must use the price valid on its date. Cache hits are free.
+@problem
+Return per month and model: `requests` and `cost_usd` (2 decimals), with cost = input_tokens/1000 x input price + output_tokens/1000 x output price (NULL output = 0), and 0 for cache hits. Sort by month, model.
+@expected
+One row per (month, model) with traffic.
+@edge_cases
+- `effective_to` is NULL for current prices and inclusive otherwise.
+- A request without a matching price row would silently disappear with an INNER JOIN; validate coverage (should be 100%).
+@hint1
+Join each request to the price row whose validity period contains the request's date.
+@hint2
+`CAST(r.requested_at AS DATE) BETWEEN p.effective_from AND COALESCE(p.effective_to, DATE '9999-12-31')`.
+@hint3
+Cost expression inside SUM with a CASE for cache hits; month truncation per dialect.
+@solution_pg
+SELECT CAST(DATE_TRUNC('month', r.requested_at) AS DATE) AS month_start,
+       r.model_name,
+       COUNT(*) AS requests,
+       ROUND(SUM(CASE WHEN r.cache_hit THEN 0
+                      ELSE r.input_tokens / 1000.0 * p.input_usd_per_1k
+                         + COALESCE(r.output_tokens, 0) / 1000.0 * p.output_usd_per_1k
+                 END), 2) AS cost_usd
+FROM llm_requests r
+JOIN llm_pricing p
+  ON p.model_name = r.model_name
+ AND CAST(r.requested_at AS DATE) BETWEEN p.effective_from AND COALESCE(p.effective_to, DATE '9999-12-31')
+WHERE r.requested_at >= TIMESTAMP '2025-01-01 00:00:00'
+  AND r.requested_at <  TIMESTAMP '2025-07-01 00:00:00'
+GROUP BY DATE_TRUNC('month', r.requested_at), r.model_name
+ORDER BY month_start, r.model_name;
+@solution_mysql
+SELECT CAST(DATE_FORMAT(r.requested_at, '%Y-%m-01') AS DATE) AS month_start,
+       r.model_name,
+       COUNT(*) AS requests,
+       ROUND(SUM(CASE WHEN r.cache_hit THEN 0
+                      ELSE r.input_tokens / 1000.0 * p.input_usd_per_1k
+                         + COALESCE(r.output_tokens, 0) / 1000.0 * p.output_usd_per_1k
+                 END), 2) AS cost_usd
+FROM llm_requests r
+JOIN llm_pricing p
+  ON p.model_name = r.model_name
+ AND CAST(r.requested_at AS DATE) BETWEEN p.effective_from AND COALESCE(p.effective_to, DATE '9999-12-31')
+WHERE r.requested_at >= TIMESTAMP '2025-01-01 00:00:00'
+  AND r.requested_at <  TIMESTAMP '2025-07-01 00:00:00'
+GROUP BY CAST(DATE_FORMAT(r.requested_at, '%Y-%m-01') AS DATE), r.model_name
+ORDER BY month_start, r.model_name;
+@explanation
+Prices are **slowly changing** reference data. The range join picks, for each request, the price row whose `[effective_from, effective_to]` contains the request date. Because periods never overlap and leave no gaps (documented), each request matches exactly one row. Here BETWEEN is correct: the columns are DATEs with an inclusive end.
+
+Coverage check (do it once): `SELECT COUNT(*) FROM llm_requests r WHERE NOT EXISTS (<matching price>)` should be 0. Otherwise the INNER JOIN under-reports cost.
+
+**Why it matters for AI apps:** using today's price for history misstates past spend and makes cost-per-feature trends meaningless after every price change.
+@mistakes
+- Joining on `model_name` only, which multiplies each request by the number of price periods.
+- Charging cache hits.
+- Integer division `input_tokens / 1000` in PostgreSQL, which truncates small requests to 0.
+@performance
+The pricing table is tiny; the join is effectively a lookup per request.
+@interview
+Point-in-time joins appear in AI cost analysis too. Mentioning the coverage check is a plus.
+
+### SQL-119
+title: Most expensive prompt versions
+difficulty: Hard
+primary: Ranking prompt versions by spend
+secondary: cost expression, LEFT JOIN for ad-hoc prompts, unit economics
+concepts: ai_expensive, ai_token_cost, left_join, range_join
+roles: AI
+time: 15
+dialect: BOTH
+tables: llm_requests(prompt_version_id, model_name, requested_at, input_tokens, output_tokens, cache_hit, status); llm_pricing(model_name, effective_from, effective_to, input_usd_per_1k, output_usd_per_1k); prompts(prompt_version_id, prompt_name, version)
+columns: prompt, requests, total_cost_usd, cost_per_request_usd, cost_per_success_usd
+compare: ordered
+@context
+Prompt engineers want to know which prompt versions drive spend in Q2 2025, including requests sent without a registered prompt ("ad-hoc").
+@problem
+Per prompt version (label like `'support_answer v4'`, or `'ad-hoc'` when `prompt_version_id` is NULL), return `requests`, `total_cost_usd` (2 decimals), `cost_per_request_usd` and `cost_per_success_usd` (4 decimals). Sort by total cost descending.
+@expected
+One row per prompt version used in Q2 2025, plus `ad-hoc`.
+@edge_cases
+- Failed requests still cost input tokens; cost per *success* captures that waste.
+@hint1
+Reuse the cost expression and price range join from SQL-118.
+@hint2
+LEFT JOIN `prompts`; build the label with CASE + CONCAT.
+@hint3
+`cost_per_success = total_cost / NULLIF(successful requests, 0)`.
+@solution
+SELECT CASE WHEN pr.prompt_version_id IS NULL THEN 'ad-hoc'
+            ELSE CONCAT(pr.prompt_name, ' v', pr.version) END                 AS prompt,
+       COUNT(*)                                                               AS requests,
+       ROUND(SUM(CASE WHEN r.cache_hit THEN 0
+                      ELSE r.input_tokens / 1000.0 * p.input_usd_per_1k
+                         + COALESCE(r.output_tokens, 0) / 1000.0 * p.output_usd_per_1k END), 2) AS total_cost_usd,
+       ROUND(SUM(CASE WHEN r.cache_hit THEN 0
+                      ELSE r.input_tokens / 1000.0 * p.input_usd_per_1k
+                         + COALESCE(r.output_tokens, 0) / 1000.0 * p.output_usd_per_1k END) / COUNT(*), 4) AS cost_per_request_usd,
+       ROUND(SUM(CASE WHEN r.cache_hit THEN 0
+                      ELSE r.input_tokens / 1000.0 * p.input_usd_per_1k
+                         + COALESCE(r.output_tokens, 0) / 1000.0 * p.output_usd_per_1k END)
+             / NULLIF(SUM(CASE WHEN r.status = 'success' THEN 1 ELSE 0 END), 0), 4) AS cost_per_success_usd
+FROM llm_requests r
+JOIN llm_pricing p
+  ON p.model_name = r.model_name
+ AND CAST(r.requested_at AS DATE) BETWEEN p.effective_from AND COALESCE(p.effective_to, DATE '9999-12-31')
+LEFT JOIN prompts pr ON pr.prompt_version_id = r.prompt_version_id
+WHERE r.requested_at >= TIMESTAMP '2025-04-01 00:00:00'
+  AND r.requested_at <  TIMESTAMP '2025-07-01 00:00:00'
+GROUP BY CASE WHEN pr.prompt_version_id IS NULL THEN 'ad-hoc'
+              ELSE CONCAT(pr.prompt_name, ' v', pr.version) END
+ORDER BY total_cost_usd DESC, prompt;
+@explanation
+Grouping by a derived label (CASE + CONCAT) keeps ad-hoc requests visible instead of losing them in an INNER JOIN. Three cost views answer different questions: total spend (budget), cost per request (efficiency of the prompt/model choice), and cost per success (efficiency including failures and retries).
+
+Both engines accept CONCAT with an integer argument (`version`) and convert it to text.
+
+**Why it matters for AI apps:** prompt versions change token counts a lot (longer instructions, more retrieved context). Tracking cost per version catches expensive regressions before they reach the monthly bill.
+@mistakes
+- INNER JOIN to prompts, which hides ad-hoc traffic (often the most expensive: unbounded prompts).
+- Comparing prompt versions that used different models without noting it.
+@performance
+Same scan as SQL-118 plus a primary-key lookup.
+@interview
+Unit economics of AI features (cost per successful answer) is a strong AI-engineering talking point.
+
+### SQL-120
+title: Detect a failure-rate spike against a trailing baseline
+difficulty: Hard
+primary: Detecting increases in failure rates
+secondary: daily rates, trailing window excluding the current day, alert rule
+concepts: ai_regression, ai_success_rate, window_frame, moving_avg, case
+roles: AI
+time: 18
+dialect: BOTH
+tables: llm_requests(model_name, requested_at, status)
+columns: request_date, requests, failures, failure_rate_pct, baseline_pct, alert
+compare: ordered
+@context
+On-call wants an alert when a model's daily failure rate exceeds 3x its trailing 7-day average (with at least 10 requests that day). Evaluate the rule on `nimbus-pro` from its launch in production (2025-03-10) to 2025-04-10.
+@problem
+Per active day, return `requests`, `failures` (non-success), `failure_rate_pct` (1 decimal), `baseline_pct` (average daily failure rate over the previous 7 active days, excluding today; 1 decimal) and `alert` (1/0). Sort by date.
+@expected
+One row per active day; the 2025-03-18 incident triggers the alert.
+@edge_cases
+- The baseline must exclude the current day, otherwise the spike dilutes its own baseline.
+- The first day has no baseline (NULL): no alert.
+@hint1
+Aggregate daily counts first.
+@hint2
+`AVG(rate) OVER (ORDER BY day ROWS BETWEEN 7 PRECEDING AND 1 PRECEDING)`.
+@hint3
+`CASE WHEN requests >= 10 AND rate > 3 * baseline THEN 1 ELSE 0 END`.
+@solution
+WITH daily AS (
+    SELECT CAST(requested_at AS DATE)                                         AS request_date,
+           COUNT(*)                                                           AS requests,
+           SUM(CASE WHEN status <> 'success' THEN 1 ELSE 0 END)               AS failures,
+           100.0 * SUM(CASE WHEN status <> 'success' THEN 1 ELSE 0 END) / COUNT(*) AS rate
+    FROM llm_requests
+    WHERE model_name = 'nimbus-pro'
+      AND requested_at >= TIMESTAMP '2025-03-10 00:00:00'
+      AND requested_at <  TIMESTAMP '2025-04-11 00:00:00'
+    GROUP BY CAST(requested_at AS DATE)
+),
+with_base AS (
+    SELECT request_date, requests, failures, rate,
+           AVG(rate) OVER (ORDER BY request_date ROWS BETWEEN 7 PRECEDING AND 1 PRECEDING) AS baseline
+    FROM daily
+)
+SELECT request_date,
+       requests,
+       failures,
+       ROUND(rate, 1)     AS failure_rate_pct,
+       ROUND(baseline, 1) AS baseline_pct,
+       CASE WHEN requests >= 10 AND rate > 3 * baseline THEN 1 ELSE 0 END AS alert
+FROM with_base
+ORDER BY request_date;
+@assert
+[r[5] for r in rows if r[0] == '2025-03-18'] == ['1']
+@explanation
+A trailing baseline that **excludes** the current row (`7 PRECEDING AND 1 PRECEDING`) compares today with recent normal behaviour. The minimum-volume rule suppresses alerts on quiet days where one failure is already a high rate.
+
+Limitations worth stating: a baseline of 0% makes "3x" meaningless (any failure alerts, and `rate > 0` is true). Production systems add an absolute floor (e.g. rate > 5%) and use statistical tests or SLO burn rates.
+
+**Why it matters for AI apps:** provider incidents are frequent; detecting them per model quickly enables automatic fallback to another model.
+@mistakes
+- Including today in the baseline.
+- Averaging per-request instead of per-day rates without saying so (both are valid but different).
+@performance
+One small aggregation; the window runs over ≤ 32 rows.
+@interview
+Anomaly detection with window frames on operational metrics is common in AI platform interviews.
+
+### SQL-121
+title: Requests with abnormal input token counts
+difficulty: Hard
+primary: Detecting unusually high token consumption
+secondary: robust baseline (median per feature), ratio threshold, cost impact
+concepts: ai_high_tokens, percentile, row_number, window_agg, multiple_ctes
+roles: AI
+time: 18
+dialect: BOTH
+tables: llm_requests(request_id, feature, model_name, input_tokens, requested_at)
+columns: request_id, feature, model_name, input_tokens, feature_median, ratio_to_median
+compare: ordered
+@context
+Some users paste entire log files or schemas into the AI features (it happens in all three). These requests are slow, expensive and often fail. Flag requests whose input exceeds 10x the **median** input size of their feature (the median is robust to the outliers themselves).
+@problem
+Return `request_id`, `feature`, `model_name`, `input_tokens`, `feature_median` (median input tokens of that feature over all requests, averaging the two middle values for even counts) and `ratio_to_median` (1 decimal) for flagged requests. Sort by ratio descending, then `request_id`.
+@expected
+A short list (about 10 requests).
+@edge_cases
+- A mean-based threshold would be pulled up by the outliers it should detect.
+@hint1
+Compute the median per feature with the portable ROW_NUMBER/COUNT method (SQL-089).
+@hint2
+Join each request to its feature's median.
+@hint3
+Filter `input_tokens > 10 * feature_median`.
+@solution
+WITH ranked AS (
+    SELECT feature, input_tokens,
+           ROW_NUMBER() OVER (PARTITION BY feature ORDER BY input_tokens) AS rn,
+           COUNT(*)     OVER (PARTITION BY feature)                       AS n
+    FROM llm_requests
+),
+medians AS (
+    SELECT feature,
+           AVG(CASE WHEN rn IN (FLOOR((n + 1) / 2.0), FLOOR((n + 2) / 2.0)) THEN input_tokens END) AS feature_median
+    FROM ranked
+    GROUP BY feature
+)
+SELECT r.request_id,
+       r.feature,
+       r.model_name,
+       r.input_tokens,
+       ROUND(m.feature_median, 1)                       AS feature_median,
+       ROUND(r.input_tokens / m.feature_median, 1)      AS ratio_to_median
+FROM llm_requests r
+JOIN medians m ON m.feature = r.feature
+WHERE r.input_tokens > 10 * m.feature_median
+ORDER BY ratio_to_median DESC, r.request_id;
+@explanation
+A robust baseline (median, or MAD-based thresholds) keeps the detector stable when outliers are present. The mean and standard deviation are inflated by the very events you want to find. The median is computed once per feature and joined back to individual requests.
+
+Follow-ups for a real system: cap input size per feature (truncate or summarize long context), route oversized requests to a long-context model, and alert on the share of oversized requests.
+
+**Why it matters for AI apps:** a handful of 100k-token requests can cost more than thousands of normal ones and exhaust rate limits for everyone.
+@mistakes
+- Mean + 3σ thresholds dominated by the outliers.
+- A global median across features (doc summaries are naturally much longer than copilot prompts).
+@performance
+One partitioned sort for medians plus a join; fine for millions of rows in a warehouse.
+@interview
+Shows robust-statistics thinking applied to AI operations.
+
+### SQL-122
+title: Users experiencing repeated failures
+difficulty: Hard
+primary: Identifying users with repeated failures
+secondary: failure rate per user, most common failure status (mode with ROW_NUMBER)
+concepts: ai_repeated_failures, ai_success_rate, row_number, having, multiple_ctes
+roles: AI
+time: 15
+dialect: BOTH
+tables: llm_requests(user_id, org_id, status, requested_at)
+columns: user_id, org_id, requests, failures, failure_rate_pct, most_common_failure
+compare: ordered
+@context
+Support wants to proactively contact users who hit errors repeatedly in Q2 2025, together with the type of failure they see most.
+@problem
+For users (non-NULL `user_id`) with at least 3 non-success requests in Q2 2025, return `user_id`, `org_id`, `requests`, `failures`, `failure_rate_pct` (1 decimal) and `most_common_failure` (the most frequent non-success status; ties broken alphabetically). Sort by failures descending, then `user_id`.
+@expected
+A handful of users, mostly from organizations that hit rate limits.
+@edge_cases
+- `org_id` is constant per user here (a user belongs to one org), so it can be grouped with the user.
+- The mode needs a deterministic tie-breaker.
+@hint1
+CTE 1: per-user totals. CTE 2: per-user, per-failure-status counts.
+@hint2
+Rank statuses per user: `ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY cnt DESC, status)`.
+@hint3
+Join totals with the rank-1 status and apply the failure threshold.
+@solution
+WITH q2 AS (
+    SELECT user_id, org_id, status
+    FROM llm_requests
+    WHERE user_id IS NOT NULL
+      AND requested_at >= TIMESTAMP '2025-04-01 00:00:00'
+      AND requested_at <  TIMESTAMP '2025-07-01 00:00:00'
+),
+totals AS (
+    SELECT user_id, org_id,
+           COUNT(*)                                            AS requests,
+           SUM(CASE WHEN status <> 'success' THEN 1 ELSE 0 END) AS failures
+    FROM q2
+    GROUP BY user_id, org_id
+),
+modes AS (
+    SELECT user_id, status,
+           ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY COUNT(*) DESC, status) AS rn
+    FROM q2
+    WHERE status <> 'success'
+    GROUP BY user_id, status
+)
+SELECT t.user_id,
+       t.org_id,
+       t.requests,
+       t.failures,
+       ROUND(100.0 * t.failures / t.requests, 1) AS failure_rate_pct,
+       m.status                                  AS most_common_failure
+FROM totals t
+JOIN modes m ON m.user_id = t.user_id AND m.rn = 1
+WHERE t.failures >= 3
+ORDER BY t.failures DESC, t.user_id;
+@explanation
+The **mode** (most frequent value) has no portable aggregate. ROW_NUMBER over grouped counts implements it, and the window can rank the GROUP BY result directly (`ORDER BY COUNT(*) DESC`). Joining totals with the rank-1 status yields one row per user.
+
+Most users never see a failure, so a small group with several failures stands out. Look at the mode: rate limiting points to quotas and client backoff, provider errors and timeouts to model or prompt-size issues.
+
+**Why it matters for AI apps:** failure experience is unevenly distributed. Global error rates of 2% can hide a customer who sees 30% failures.
+@mistakes
+- Using `MAX(status)` as "most common" (alphabetically last, not most frequent).
+- Mixing NULL-user (system) traffic into per-user statistics.
+@performance
+Two small aggregations over one quarter.
+@interview
+Per-entity error analysis and the mode-with-ROW_NUMBER trick are both commonly tested.
+
+### SQL-123
+title: Missing trace IDs and incomplete request metadata
+difficulty: Medium
+primary: Finding requests with missing trace IDs or incomplete metadata
+secondary: JSON key existence per dialect, daily data-quality rates
+concepts: ai_missing_metadata, json, null_logic, conditional_aggregation
+roles: AI
+time: 15
+dialect: BOTH
+tables: llm_requests(requested_at, trace_id, request_metadata)
+columns: request_date, requests, missing_trace_pct, missing_metadata_pct, missing_region_pct
+compare: ordered
+@context
+Observability depends on every request carrying a `trace_id` and metadata with a `region`. A deploy in early April 2025 broke the tracing middleware for a few days.
+@problem
+For each day in April 2025, return `requests`, `missing_trace_pct`, `missing_metadata_pct` (NULL `request_metadata`) and `missing_region_pct` (metadata present but without a `region` key), all 1 decimal. Return only days where any of the three percentages exceeds 10%. Sort by date.
+@expected
+The tracing regression of 2025-04-07 to 2025-04-09 (40-50% missing trace IDs), plus a few low-volume days where a couple of bad requests already exceed 10%. That second group is a reason to add a minimum-volume rule to the alert.
+@edge_cases
+- JSON key tests differ by engine: PostgreSQL `jsonb ? 'region'`, MySQL `JSON_CONTAINS_PATH(doc, 'one', '$.region')`.
+- A NULL metadata document is a different defect from a document without the key; count them separately.
+@hint1
+Compute all three counts per day with conditional aggregation.
+@hint2
+PostgreSQL: `request_metadata IS NOT NULL AND NOT (request_metadata ? 'region')`.
+@hint3
+Filter days in HAVING with the three percentage expressions.
+@solution_pg
+SELECT CAST(requested_at AS DATE) AS request_date,
+       COUNT(*) AS requests,
+       ROUND(100.0 * SUM(CASE WHEN trace_id IS NULL THEN 1 ELSE 0 END) / COUNT(*), 1) AS missing_trace_pct,
+       ROUND(100.0 * SUM(CASE WHEN request_metadata IS NULL THEN 1 ELSE 0 END) / COUNT(*), 1) AS missing_metadata_pct,
+       ROUND(100.0 * SUM(CASE WHEN request_metadata IS NOT NULL AND NOT (request_metadata ? 'region')
+                              THEN 1 ELSE 0 END) / COUNT(*), 1) AS missing_region_pct
+FROM llm_requests
+WHERE requested_at >= TIMESTAMP '2025-04-01 00:00:00'
+  AND requested_at <  TIMESTAMP '2025-05-01 00:00:00'
+GROUP BY CAST(requested_at AS DATE)
+HAVING SUM(CASE WHEN trace_id IS NULL THEN 1 ELSE 0 END) > 0.10 * COUNT(*)
+    OR SUM(CASE WHEN request_metadata IS NULL THEN 1 ELSE 0 END) > 0.10 * COUNT(*)
+    OR SUM(CASE WHEN request_metadata IS NOT NULL AND NOT (request_metadata ? 'region') THEN 1 ELSE 0 END) > 0.10 * COUNT(*)
+ORDER BY request_date;
+@solution_mysql
+SELECT CAST(requested_at AS DATE) AS request_date,
+       COUNT(*) AS requests,
+       ROUND(100.0 * SUM(CASE WHEN trace_id IS NULL THEN 1 ELSE 0 END) / COUNT(*), 1) AS missing_trace_pct,
+       ROUND(100.0 * SUM(CASE WHEN request_metadata IS NULL THEN 1 ELSE 0 END) / COUNT(*), 1) AS missing_metadata_pct,
+       ROUND(100.0 * SUM(CASE WHEN request_metadata IS NOT NULL
+                               AND NOT JSON_CONTAINS_PATH(request_metadata, 'one', '$.region')
+                              THEN 1 ELSE 0 END) / COUNT(*), 1) AS missing_region_pct
+FROM llm_requests
+WHERE requested_at >= TIMESTAMP '2025-04-01 00:00:00'
+  AND requested_at <  TIMESTAMP '2025-05-01 00:00:00'
+GROUP BY CAST(requested_at AS DATE)
+HAVING SUM(CASE WHEN trace_id IS NULL THEN 1 ELSE 0 END) > 0.10 * COUNT(*)
+    OR SUM(CASE WHEN request_metadata IS NULL THEN 1 ELSE 0 END) > 0.10 * COUNT(*)
+    OR SUM(CASE WHEN request_metadata IS NOT NULL
+                 AND NOT JSON_CONTAINS_PATH(request_metadata, 'one', '$.region') THEN 1 ELSE 0 END) > 0.10 * COUNT(*)
+ORDER BY request_date;
+@dialect_note
+Key existence: PostgreSQL's `jsonb ? 'key'` operator (top-level keys), and MySQL's `JSON_CONTAINS_PATH(doc, 'one', '$.key')`. A portable approximation is to test whether the extracted value is NULL. That works here but cannot distinguish a missing key from an explicit JSON `null` value. Note that `?` conflicts with placeholder syntax in some drivers (JDBC, psycopg with parameters), where `jsonb_exists(doc, 'key')` is the escape hatch.
+@explanation
+Each completeness defect gets its own rate so that the cause can be found: NULL `trace_id` (middleware bug), NULL metadata (client did not send it), missing key (old client SDK). HAVING keeps only problem days, using `> 0.10 * COUNT(*)` to avoid repeating the percentage arithmetic.
+
+**Why it matters for AI apps:** without trace IDs you cannot connect an LLM call to the user request, the retrieved chunks and the feedback. Incident analysis and evaluation datasets both depend on that join.
+@mistakes
+- Treating NULL metadata and missing keys as one problem.
+- Using `->>` key extraction syntax from one engine in the other (`'region'` vs `'$.region'`).
+@performance
+One scan over April; JSON checks are per-row CPU.
+@interview
+Shows practical JSON handling and observability awareness.
+
+### SQL-124
+title: Chunks of the latest published document versions
+difficulty: Medium
+primary: Retrieving chunks belonging to the latest document version
+secondary: latest version per key with ROW_NUMBER, excluding drafts and deleted docs
+concepts: ai_latest_version_chunks, row_number, left_join, ai_rag_ingestion
+roles: AI
+time: 15
+dialect: BOTH
+tables: documents(document_id, doc_key, version_number, status, is_deleted, source_type); document_chunks(chunk_id, document_id, token_count, embedding_model)
+columns: source_type, documents, documents_with_chunks, embedded_chunks, avg_tokens_per_chunk
+compare: ordered
+@context
+The retriever must only search chunks of each document's **latest published** version. Drafts must never be served, and deleted documents not at all. Summarize the servable index per source type.
+@problem
+For each non-deleted `doc_key`, pick the published version with the highest `version_number`. Return per `source_type`: `documents`, `documents_with_chunks` (latest version has at least one embedded chunk), `embedded_chunks` and `avg_tokens_per_chunk` (1 decimal). Sort by source type.
+@expected
+5 rows.
+@edge_cases
+- The newest version can be a draft; the latest *published* version is then an older one.
+- Published versions that were never indexed have no chunks; LEFT JOIN keeps them in `documents`.
+@hint1
+Rank versions per `doc_key` among published, non-deleted rows.
+@hint2
+`ROW_NUMBER() OVER (PARTITION BY doc_key ORDER BY version_number DESC)`.
+@hint3
+LEFT JOIN embedded chunks (`embedding_model IS NOT NULL`) to the rank-1 versions.
+@solution
+WITH latest AS (
+    SELECT document_id, doc_key, source_type
+    FROM (
+        SELECT document_id, doc_key, source_type,
+               ROW_NUMBER() OVER (PARTITION BY doc_key ORDER BY version_number DESC) AS rn
+        FROM documents
+        WHERE status = 'published'
+          AND is_deleted = FALSE
+    ) x
+    WHERE rn = 1
+)
+SELECT l.source_type,
+       COUNT(DISTINCT l.document_id)                      AS documents,
+       COUNT(DISTINCT c.document_id)                      AS documents_with_chunks,
+       COUNT(c.chunk_id)                                  AS embedded_chunks,
+       ROUND(AVG(c.token_count), 1)                       AS avg_tokens_per_chunk
+FROM latest l
+LEFT JOIN document_chunks c
+       ON c.document_id = l.document_id
+      AND c.embedding_model IS NOT NULL
+GROUP BY l.source_type
+ORDER BY l.source_type;
+@explanation
+"Latest version" must be defined with the business filter applied **before** ranking: rank among published, non-deleted rows. Ranking all versions and filtering `status = 'published'` afterwards would drop documents whose newest version is a draft.
+
+Counting `DISTINCT c.document_id` after the LEFT JOIN counts documents that have chunks; NULLs from unmatched rows are ignored.
+
+**Why it matters for AI apps:** serving superseded or draft content causes confidently wrong answers. A "servable set" query like this is what an index-cleanup or retriever filter should implement (e.g. as a metadata filter in the vector DB).
+@mistakes
+- `MAX(version_number)` per `doc_key` without the status filter (picks drafts).
+- Filtering after ranking.
+@performance
+One window sort over documents (~550 rows); `document_chunks(document_id, chunk_index)` unique index supports the join.
+@interview
+Versioned-document handling is a core RAG data-engineering question.
+
+### SQL-125
+title: What is in the index that should not be?
+difficulty: Easy
+primary: Finding stale or superseded document versions in the index
+secondary: CASE classification with precedence, distinct counts per class
+concepts: ai_stale_docs, case, count_distinct, inner_join
+roles: AI
+time: 12
+dialect: BOTH
+tables: document_chunks(chunk_id, document_id, embedding_model); documents(document_id, status, is_deleted)
+columns: chunk_status, documents, chunks
+compare: ordered
+@context
+The index-cleanup job is unreliable. Classify every chunk in `document_chunks` by whether it should be servable.
+@problem
+Classify each chunk with this precedence: `'deleted_document'` (version `is_deleted`), `'unpublished_draft'` (status draft), `'superseded_version'` (status archived), `'embedding_failed'` (`embedding_model IS NULL`), else `'servable'`. Return per class the distinct `documents` and the number of `chunks`. Sort by class.
+@expected
+5 rows.
+@edge_cases
+- The order of CASE branches defines precedence: a deleted draft counts as deleted.
+@hint1
+Join chunks to their document version.
+@hint2
+One searched CASE with the branches in the given order.
+@hint3
+Group by the CASE expression.
+@solution
+SELECT CASE WHEN d.is_deleted = TRUE        THEN 'deleted_document'
+            WHEN d.status = 'draft'         THEN 'unpublished_draft'
+            WHEN d.status = 'archived'      THEN 'superseded_version'
+            WHEN c.embedding_model IS NULL  THEN 'embedding_failed'
+            ELSE 'servable' END              AS chunk_status,
+       COUNT(DISTINCT c.document_id)         AS documents,
+       COUNT(*)                              AS chunks
+FROM document_chunks c
+JOIN documents d ON d.document_id = c.document_id
+GROUP BY CASE WHEN d.is_deleted = TRUE        THEN 'deleted_document'
+              WHEN d.status = 'draft'         THEN 'unpublished_draft'
+              WHEN d.status = 'archived'      THEN 'superseded_version'
+              WHEN c.embedding_model IS NULL  THEN 'embedding_failed'
+              ELSE 'servable' END
+ORDER BY chunk_status;
+@assert
+len(rows) == 5
+@explanation
+A single classification CASE turns several data-quality rules into one report, and the branch order resolves overlaps explicitly. Grouping by the same expression is required in PostgreSQL. MySQL would also accept `GROUP BY chunk_status` (alias), and PostgreSQL accepts output-column names in GROUP BY too, but repeating the expression is the most portable form.
+
+**Why it matters for AI apps:** superseded and draft chunks are the root cause of "the bot quoted the old refund policy". Deleted-document chunks can be a compliance problem (content that must no longer be served).
+@mistakes
+- Checking only `status`, which misses deleted documents whose status is still 'published'.
+- Counting documents with `COUNT(*)`.
+@performance
+Join over ~3,000 chunks; trivial.
+@interview
+Turning ambiguous "index hygiene" into explicit, prioritized rules is a good engineering signal.
+
+### SQL-126
+title: Documents not re-indexed after their last update
+difficulty: Easy
+primary: Finding documents that need re-indexing
+secondary: NULL-aware timestamp comparison, issue labels
+concepts: ai_not_reindexed, null_logic, case, ai_stale_docs
+roles: AI
+time: 8
+dialect: BOTH
+tables: documents(document_id, doc_key, version_number, status, is_deleted, updated_at, last_indexed_at)
+columns: document_id, doc_key, version_number, updated_at, last_indexed_at, issue
+compare: ordered
+@context
+The indexer sometimes misses edits. A published document version whose `updated_at` is later than its `last_indexed_at`, or which was never indexed, serves stale or no content.
+@problem
+List published, non-deleted versions that were never indexed (`'never_indexed'`) or were edited after their last indexing (`'stale_index'`). Return `document_id`, `doc_key`, `version_number`, `updated_at`, `last_indexed_at`, `issue`. Sort by `issue`, then `updated_at` descending, then `document_id`.
+@expected
+A few dozen versions.
+@edge_cases
+- `last_indexed_at < updated_at` is UNKNOWN when `last_indexed_at` is NULL; handle NULL explicitly.
+@hint1
+Two conditions joined with OR, one of them an IS NULL test.
+@hint2
+Label them with CASE, testing IS NULL first.
+@hint3
+`WHERE status = 'published' AND is_deleted = FALSE AND (last_indexed_at IS NULL OR last_indexed_at < updated_at)`.
+@solution
+SELECT document_id,
+       doc_key,
+       version_number,
+       updated_at,
+       last_indexed_at,
+       CASE WHEN last_indexed_at IS NULL THEN 'never_indexed' ELSE 'stale_index' END AS issue
+FROM documents
+WHERE status = 'published'
+  AND is_deleted = FALSE
+  AND (last_indexed_at IS NULL OR last_indexed_at < updated_at)
+ORDER BY issue, updated_at DESC, document_id;
+@explanation
+Comparisons with NULL are UNKNOWN, so "never indexed" needs its own `IS NULL` branch. Without it, those documents would be silently excluded, and they are the most severe case.
+
+**Why it matters for AI apps:** this list is the work queue of a re-indexing job. Ordering by most recent update puts the freshest edits first, which are usually the ones users are asking about.
+@mistakes
+- `WHERE last_indexed_at < updated_at` alone.
+- Including drafts and archived versions, which should not be (re-)indexed at all.
+@performance
+Small table scan; an index on `status` helps when most documents are archived.
+@interview
+Simple, but it is exactly the kind of query behind RAG freshness monitors.
+
+### SQL-127
+title: Answers grounded in content that was already superseded
+difficulty: Advanced
+primary: Detecting retrieval of superseded document versions at request time
+secondary: EXISTS with a time-relative condition, monthly rates, documented assumptions
+concepts: ai_stale_docs, semi_join, correlated_subquery, multi_join, date_bucketing
+roles: AI
+time: 25
+dialect: BOTH
+tables: llm_requests(request_id, feature, requested_at); llm_request_chunks(request_id, chunk_id); document_chunks(chunk_id, document_id); documents(document_id, doc_key, version_number, status, created_at)
+columns: month_start, rag_requests, requests_with_superseded_chunk, pct
+compare: ordered
+@context
+A chunk is "superseded at request time" if, when the request was made, a **newer non-draft version** of the same `doc_key` already existed (created before the request). Because status history is not stored, assume a version that is now `published` or `archived` was published from its `created_at` on.
+@problem
+For support-bot requests in H1 2025 that retrieved chunks, return per month: `rag_requests`, `requests_with_superseded_chunk` and `pct` (1 decimal). Sort by month.
+@expected
+6 rows.
+@edge_cases
+- Compare with the request time, not with today: a version superseded later was fine when retrieved.
+- Count requests, not chunks: one bad chunk is enough to taint an answer.
+@hint1
+For each retrieved chunk, look up its document version (`doc_key`, `version_number`).
+@hint2
+EXISTS a version of the same `doc_key` with a higher version number, status not draft, and `created_at <= requested_at`.
+@hint3
+Aggregate per request (MAX of a 0/1 flag), then per month.
+@solution_pg
+WITH per_request AS (
+    SELECT r.request_id,
+           r.requested_at,
+           MAX(CASE WHEN EXISTS (SELECT 1 FROM documents newer
+                                 WHERE newer.doc_key = d.doc_key
+                                   AND newer.version_number > d.version_number
+                                   AND newer.status <> 'draft'
+                                   AND newer.created_at <= r.requested_at)
+                    THEN 1 ELSE 0 END) AS has_superseded
+    FROM llm_requests r
+    JOIN llm_request_chunks rc ON rc.request_id = r.request_id
+    JOIN document_chunks c     ON c.chunk_id = rc.chunk_id
+    JOIN documents d           ON d.document_id = c.document_id
+    WHERE r.feature = 'support_bot'
+      AND r.requested_at >= TIMESTAMP '2025-01-01 00:00:00'
+      AND r.requested_at <  TIMESTAMP '2025-07-01 00:00:00'
+    GROUP BY r.request_id, r.requested_at
+)
+SELECT CAST(DATE_TRUNC('month', requested_at) AS DATE) AS month_start,
+       COUNT(*)                                         AS rag_requests,
+       SUM(has_superseded)                              AS requests_with_superseded_chunk,
+       ROUND(100.0 * SUM(has_superseded) / COUNT(*), 1) AS pct
+FROM per_request
+GROUP BY DATE_TRUNC('month', requested_at)
+ORDER BY month_start;
+@solution_mysql
+WITH per_request AS (
+    SELECT r.request_id,
+           r.requested_at,
+           MAX(CASE WHEN EXISTS (SELECT 1 FROM documents newer
+                                 WHERE newer.doc_key = d.doc_key
+                                   AND newer.version_number > d.version_number
+                                   AND newer.status <> 'draft'
+                                   AND newer.created_at <= r.requested_at)
+                    THEN 1 ELSE 0 END) AS has_superseded
+    FROM llm_requests r
+    JOIN llm_request_chunks rc ON rc.request_id = r.request_id
+    JOIN document_chunks c     ON c.chunk_id = rc.chunk_id
+    JOIN documents d           ON d.document_id = c.document_id
+    WHERE r.feature = 'support_bot'
+      AND r.requested_at >= TIMESTAMP '2025-01-01 00:00:00'
+      AND r.requested_at <  TIMESTAMP '2025-07-01 00:00:00'
+    GROUP BY r.request_id, r.requested_at
+)
+SELECT CAST(DATE_FORMAT(requested_at, '%Y-%m-01') AS DATE) AS month_start,
+       COUNT(*)                                             AS rag_requests,
+       SUM(has_superseded)                                  AS requests_with_superseded_chunk,
+       ROUND(100.0 * SUM(has_superseded) / COUNT(*), 1)     AS pct
+FROM per_request
+GROUP BY CAST(DATE_FORMAT(requested_at, '%Y-%m-01') AS DATE)
+ORDER BY month_start;
+@explanation
+The check is **time-relative**: each retrieved chunk's version is compared with the versions that existed when that request ran. The correlated EXISTS references both the chunk's document (`d`) and the request time (`r.requested_at`). The MAX over a request's chunks yields one flag per request, which is then rolled up to months.
+
+The assumption about status history is written into the problem. Without a status-history table, "not draft now" approximates "was published then". In production, store document state transitions (valid_from/valid_to) so the question can be answered exactly.
+
+**Why it matters for AI apps:** the share of answers grounded in superseded content is a direct, measurable proxy for "outdated answer" complaints (compare with `reason_tag = 'outdated'` feedback).
+@mistakes
+- Comparing with current status only (`status = 'archived'`), which flags chunks that were current at request time.
+- Counting chunk rows instead of requests.
+@performance
+One EXISTS probe per retrieved chunk (~10k) on `documents(doc_key, version_number)` unique index.
+@interview
+Time-aware correctness in RAG data is an advanced but increasingly common AI-engineering question.
+
+### SQL-128
+title: Duplicate chunks: within documents, across versions, across documents
+difficulty: Hard
+primary: Identifying duplicate document chunks
+secondary: content-hash grouping at three scopes, UNION ALL report
+concepts: ai_duplicate_chunks, count_distinct, having, union_all, multiple_ctes
+roles: AI
+time: 15
+dialect: BOTH
+tables: document_chunks(chunk_id, document_id, content_hash); documents(document_id, doc_key)
+columns: duplicate_scope, duplicate_hashes, chunks_involved
+compare: ordered
+@context
+Duplicate chunks waste index space and crowd out diverse results (the top-5 can contain the same paragraph twice). Duplicates come from three sources with different fixes.
+@problem
+Using `content_hash`, report three scopes: `'within_version'` (same hash ≥ 2 times in one document version), `'across_versions_same_doc'` (same hash in ≥ 2 versions of one `doc_key`), `'across_documents'` (same hash in ≥ 2 different `doc_key`s). Return `duplicate_scope`, `duplicate_hashes` and `chunks_involved`. Sort by scope.
+@expected
+3 rows.
+@edge_cases
+- A boilerplate footer appears in many documents: one hash, many chunks.
+@hint1
+Each scope is a GROUP BY on a different key with a HAVING condition.
+@hint2
+Across versions: group by `(doc_key, content_hash)` having `COUNT(DISTINCT document_id) > 1`.
+@hint3
+Across documents: group by `content_hash` having `COUNT(DISTINCT doc_key) > 1`.
+@solution
+WITH c AS (
+    SELECT ch.chunk_id, ch.document_id, ch.content_hash, d.doc_key
+    FROM document_chunks ch
+    JOIN documents d ON d.document_id = ch.document_id
+),
+within_version AS (
+    SELECT document_id, content_hash, COUNT(*) AS n
+    FROM c GROUP BY document_id, content_hash HAVING COUNT(*) > 1
+),
+across_versions AS (
+    SELECT doc_key, content_hash, COUNT(*) AS n
+    FROM c GROUP BY doc_key, content_hash HAVING COUNT(DISTINCT document_id) > 1
+),
+across_docs AS (
+    SELECT content_hash, COUNT(*) AS n
+    FROM c GROUP BY content_hash HAVING COUNT(DISTINCT doc_key) > 1
+)
+SELECT 'across_documents' AS duplicate_scope, COUNT(*) AS duplicate_hashes, SUM(n) AS chunks_involved FROM across_docs
+UNION ALL
+SELECT 'across_versions_same_doc', COUNT(*), SUM(n) FROM across_versions
+UNION ALL
+SELECT 'within_version', COUNT(*), SUM(n) FROM within_version
+ORDER BY duplicate_scope;
+@explanation
+The same `content_hash` means identical normalized text, so duplicate detection is a GROUP BY on the hash at the appropriate scope:
+- **within a version**: a chunking bug, so fix the chunker;
+- **across versions of one document**: expected carry-over of unchanged paragraphs. It is only a problem if old versions stay in the index (SQL-125);
+- **across documents**: boilerplate (headers, footers, legal text). Strip it before chunking, or keep one canonical copy.
+
+Exact hashes do not find near-duplicates (one word changed); those need MinHash/embeddings outside SQL.
+@mistakes
+- Grouping by `chunk_text` (slow, and sensitive to whitespace) instead of the hash.
+- Deleting duplicates across versions while old versions are still being served.
+@performance
+`document_chunks(content_hash)` is indexed; all three aggregations scan the chunk table.
+@interview
+Shows that the candidate understands *why* duplicates exist before removing them.
+
+### SQL-129
+title: Retrieval hit rate at K and MRR per configuration
+difficulty: Hard
+primary: Retrieval hit rate at K
+secondary: first relevant rank per query, MRR, NULL judgments as not relevant
+concepts: ai_hit_rate, ai_retrieval_compare, conditional_aggregation, multiple_ctes, null_aware_agg
+roles: AI
+time: 20
+dialect: BOTH
+tables: retrieval_evaluations(config_id, query_id, rank_position, is_relevant); retrieval_configs(config_id, config_name, top_k)
+columns: config_name, queries, hit_at_1_pct, hit_at_3_pct, hit_at_5_pct, mrr_at_5
+compare: ordered
+@context
+The offline evaluation set has 200 golden questions. For each configuration, the retrieved chunks were judged for relevance. Compare configurations on the same cut-off (k ≤ 5), since config 3 returns 10 results.
+@problem
+Per configuration, compute for k = 1, 3, 5 the share of queries with at least one relevant result in the top k (1 decimal), and MRR@5: the mean of 1 / (rank of the first relevant result), 0 if none in the top 5 (4 decimals). Treat unjudged results (`is_relevant IS NULL`) as not relevant. Sort by config name.
+@expected
+3 rows; the reranking config should be best.
+@edge_cases
+- Every query must be in the denominator, including those with no relevant result.
+- `top_k` differs between configs; evaluating hit@10 would favour config 3 unfairly.
+@hint1
+Reduce to one row per (config, query) with the rank of the first relevant result.
+@hint2
+`MIN(CASE WHEN is_relevant = TRUE THEN rank_position END)`; NULL when none.
+@hint3
+hit@k = share of queries with `first_rank <= k`; MRR@5 = `AVG(CASE WHEN first_rank <= 5 THEN 1.0 / first_rank ELSE 0 END)`.
+@solution
+WITH first_hit AS (
+    SELECT config_id,
+           query_id,
+           MIN(CASE WHEN is_relevant = TRUE THEN rank_position END) AS first_rank
+    FROM retrieval_evaluations
+    GROUP BY config_id, query_id
+)
+SELECT c.config_name,
+       COUNT(*)                                                                     AS queries,
+       ROUND(100.0 * SUM(CASE WHEN f.first_rank <= 1 THEN 1 ELSE 0 END) / COUNT(*), 1) AS hit_at_1_pct,
+       ROUND(100.0 * SUM(CASE WHEN f.first_rank <= 3 THEN 1 ELSE 0 END) / COUNT(*), 1) AS hit_at_3_pct,
+       ROUND(100.0 * SUM(CASE WHEN f.first_rank <= 5 THEN 1 ELSE 0 END) / COUNT(*), 1) AS hit_at_5_pct,
+       ROUND(AVG(CASE WHEN f.first_rank <= 5 THEN 1.0 / f.first_rank ELSE 0 END), 4)   AS mrr_at_5
+FROM first_hit f
+JOIN retrieval_configs c ON c.config_id = f.config_id
+GROUP BY c.config_name
+ORDER BY c.config_name;
+@assert
+len(rows) == 3 and all(r[1] == '200' for r in rows)
+@explanation
+**Definitions** (state them in every report):
+- Hit@k (a.k.a. success@k): fraction of queries with ≥ 1 relevant result in the top k.
+- MRR@k: mean over queries of 1/rank of the first relevant result within k, else 0.
+
+The `first_hit` CTE reduces each query's ranked list to a single number. `first_rank <= k` is UNKNOWN for queries without a relevant result (NULL) and falls into ELSE 0, so they stay in the denominator. `is_relevant = TRUE` treats NULL judgments as not relevant, which is a conservative choice that should be stated.
+
+**Why it matters for AI apps:** retrieval quality caps answer quality. If the right chunk is not in the context, the LLM cannot answer correctly. Hit@k with k = the number of chunks you actually put into the prompt is the most decision-relevant number.
+@mistakes
+- Averaging over queries that have a relevant result only (inflates the metric).
+- Comparing hit@10 of one config with hit@5 of another.
+@performance
+4,000 rows; trivial.
+@interview
+Expect to define hit rate, MRR, and (as a follow-up) nDCG and recall@k.
+
+### SQL-130
+title: Retrieval quality by query type
+difficulty: Medium
+primary: Comparing retrieval quality across configurations
+secondary: pivot configurations into columns, per-segment evaluation
+concepts: ai_retrieval_compare, ai_hit_rate, conditional_aggregation, multiple_ctes
+roles: AI
+time: 15
+dialect: BOTH
+tables: retrieval_evaluations(config_id, query_id, rank_position, is_relevant); eval_queries(query_id, query_type)
+columns: query_type, queries, cfg1_hit5_pct, cfg2_hit5_pct, cfg3_hit5_pct
+compare: ordered
+@context
+An aggregate improvement can hide a regression on one kind of question. Break hit@5 down by query type with the configurations side by side.
+@problem
+Return per `query_type`: number of queries and hit@5 (1 decimal) for configs 1, 2 and 3 as columns. Sort by query type.
+@expected
+One row per query type.
+@edge_cases
+- Each query appears once per configuration; the query count is per type, not per (type, config).
+@hint1
+Compute a 0/1 hit@5 flag per (config, query).
+@hint2
+Join query types and pivot with `AVG(CASE WHEN config_id = 1 THEN hit END)`.
+@hint3
+`COUNT(DISTINCT query_id)` for the number of queries.
+@solution
+WITH hits AS (
+    SELECT config_id,
+           query_id,
+           MAX(CASE WHEN is_relevant = TRUE AND rank_position <= 5 THEN 1 ELSE 0 END) AS hit5
+    FROM retrieval_evaluations
+    GROUP BY config_id, query_id
+)
+SELECT q.query_type,
+       COUNT(DISTINCT h.query_id)                                            AS queries,
+       ROUND(100.0 * AVG(CASE WHEN h.config_id = 1 THEN h.hit5 END), 1)       AS cfg1_hit5_pct,
+       ROUND(100.0 * AVG(CASE WHEN h.config_id = 2 THEN h.hit5 END), 1)       AS cfg2_hit5_pct,
+       ROUND(100.0 * AVG(CASE WHEN h.config_id = 3 THEN h.hit5 END), 1)       AS cfg3_hit5_pct
+FROM hits h
+JOIN eval_queries q ON q.query_id = h.query_id
+GROUP BY q.query_type
+ORDER BY q.query_type;
+@explanation
+`AVG(CASE WHEN config_id = 1 THEN hit5 END)` averages the 0/1 flags of config 1 only (other rows yield NULL and are ignored), which gives a per-config hit rate in a single pass. This conditional-AVG pivot is shorter than three separate queries.
+
+Small query types (a few dozen queries) have wide confidence intervals; treat differences of a few points as noise unless confirmed with paired tests.
+
+**Why it matters for AI apps:** policy questions or troubleshooting queries often need different retrieval strategies (keyword vs semantic). Per-type evaluation guides routing and hybrid search tuning.
+@mistakes
+- `COUNT(*)` as queries (counts each query three times).
+- Averaging `is_relevant` over all ranks (that is precision@k, a different metric).
+@performance
+Small aggregation over 4,000 rows.
+@interview
+Shows evaluation rigour: slicing metrics to find hidden regressions.
+
+### SQL-131
+title: Answer acceptance rate from final user feedback
+difficulty: Medium
+primary: Calculating answer acceptance rates from feedback
+secondary: latest feedback per request, coverage vs acceptance, LEFT JOIN
+concepts: ai_acceptance, dedup_window, row_number, left_join, ratios
+roles: AI
+time: 15
+dialect: BOTH
+tables: llm_requests(request_id, feature, model_name, status, requested_at); ai_feedback(feedback_id, request_id, feedback_type, created_at)
+columns: feature, model_name, answers, with_feedback, feedback_coverage_pct, acceptance_pct, flagged
+compare: ordered
+@context
+Users can click thumbs up/down (and change their mind) or flag an answer. Product reports two numbers: how many answers receive feedback at all (coverage), and how many of those are finally accepted (thumbs up).
+@problem
+For successful requests in Q2 2025, return per `feature` and `model_name`: `answers`, `with_feedback`, `feedback_coverage_pct`, `acceptance_pct` (final feedback = thumbs_up among requests with feedback) and `flagged` (final feedback = flag). Percentages with 1 decimal. Keep groups with at least 50 answers. Sort by feature, model.
+@expected
+A few (feature, model) rows.
+@edge_cases
+- A request can have several feedback rows; only the latest counts (`created_at`, then `feedback_id`).
+- Acceptance is computed over requests **with** feedback; state the denominator.
+@hint1
+Reduce feedback to one final row per request with ROW_NUMBER.
+@hint2
+LEFT JOIN the final feedback to successful requests.
+@hint3
+`acceptance = SUM(thumbs_up) / NULLIF(COUNT(final feedback), 0)`.
+@solution
+WITH final_fb AS (
+    SELECT request_id, feedback_type
+    FROM (
+        SELECT request_id, feedback_type,
+               ROW_NUMBER() OVER (PARTITION BY request_id ORDER BY created_at DESC, feedback_id DESC) AS rn
+        FROM ai_feedback
+    ) x
+    WHERE rn = 1
+)
+SELECT r.feature,
+       r.model_name,
+       COUNT(*)                                                                      AS answers,
+       COUNT(f.request_id)                                                           AS with_feedback,
+       ROUND(100.0 * COUNT(f.request_id) / COUNT(*), 1)                              AS feedback_coverage_pct,
+       ROUND(100.0 * SUM(CASE WHEN f.feedback_type = 'thumbs_up' THEN 1 ELSE 0 END)
+             / NULLIF(COUNT(f.request_id), 0), 1)                                    AS acceptance_pct,
+       SUM(CASE WHEN f.feedback_type = 'flag' THEN 1 ELSE 0 END)                     AS flagged
+FROM llm_requests r
+LEFT JOIN final_fb f ON f.request_id = r.request_id
+WHERE r.status = 'success'
+  AND r.requested_at >= TIMESTAMP '2025-04-01 00:00:00'
+  AND r.requested_at <  TIMESTAMP '2025-07-01 00:00:00'
+GROUP BY r.feature, r.model_name
+HAVING COUNT(*) >= 50
+ORDER BY r.feature, r.model_name;
+@explanation
+Feedback is an event log, but the metric is per answer, so feedback must be reduced to one final verdict per request before joining. Joining raw feedback would count a changed-mind request twice (once up, once down).
+
+Two denominators, two metrics: coverage (feedback / answers) tells you how representative acceptance is; acceptance (thumbs up / feedback) is the quality signal. Feedback is voluntary and biased toward strong reactions, so pair it with sampled human or LLM-judge evaluation.
+
+**Why it matters for AI apps:** acceptance by model and feature is the main online quality metric for LLM features, and the outcome metric for prompt and model experiments.
+@mistakes
+- Using all feedback rows.
+- Computing acceptance over all answers (treating no feedback as rejection).
+@performance
+`ai_feedback(request_id)` index supports the join; the window sorts ~1,500 feedback rows.
+@interview
+Expect to discuss feedback bias and how to complement it (LLM-as-judge, human review samples).
+
+### SQL-132
+title: Compare prompt versions during their rollout overlap
+difficulty: Hard
+primary: Comparing prompt versions using evaluation outcomes
+secondary: fair comparison window from metadata, joins to prompts and feedback
+concepts: ai_prompt_compare, ai_acceptance, multiple_ctes, range_join, dedup_window
+roles: AI
+time: 25
+dialect: BOTH
+tables: prompts(prompt_version_id, prompt_name, version, created_at); llm_requests(request_id, prompt_version_id, status, output_tokens, requested_at); ai_feedback(feedback_id, request_id, feedback_type, created_at)
+columns: prompt_version, requests, success_pct, avg_output_tokens, feedback_requests, thumbs_up_pct
+compare: ordered
+@context
+New prompt versions are rolled out 50/50 against the previous version for 14 days. Comparing versions over their whole lifetimes would mix different months, models and traffic; the rollout window is the fair comparison.
+@problem
+For the latest `support_answer` version, define its rollout window as `[created_at, created_at + 14 days)`. For requests in that window served by the latest or the previous version, return per version: `requests`, `success_pct`, `avg_output_tokens` (successful requests, 1 decimal), `feedback_requests` (requests with final feedback) and `thumbs_up_pct` (1 decimal). Look the versions up from `prompts`, without hard-coded IDs. Sort by version.
+@expected
+2 rows (the previous and the latest version).
+@edge_cases
+- The two arms must share the same time window; any other window confounds the prompt effect with time.
+@hint1
+Find the latest version and its predecessor from `prompts` (ROW_NUMBER by version DESC).
+@hint2
+Filter requests to the latest version's rollout window and the two prompt IDs.
+@hint3
+Join the final feedback per request (SQL-131) and aggregate per version.
+@solution
+WITH versions AS (
+    SELECT prompt_version_id, version, created_at,
+           ROW_NUMBER() OVER (ORDER BY version DESC) AS recency
+    FROM prompts
+    WHERE prompt_name = 'support_answer'
+),
+win AS (
+    SELECT created_at AS win_start, created_at + INTERVAL '14' DAY AS win_end
+    FROM versions WHERE recency = 1
+),
+final_fb AS (
+    SELECT request_id, feedback_type
+    FROM (
+        SELECT request_id, feedback_type,
+               ROW_NUMBER() OVER (PARTITION BY request_id ORDER BY created_at DESC, feedback_id DESC) AS rn
+        FROM ai_feedback
+    ) x
+    WHERE rn = 1
+)
+SELECT CONCAT('support_answer v', v.version)                                         AS prompt_version,
+       COUNT(*)                                                                      AS requests,
+       ROUND(100.0 * SUM(CASE WHEN r.status = 'success' THEN 1 ELSE 0 END) / COUNT(*), 1) AS success_pct,
+       ROUND(AVG(CASE WHEN r.status = 'success' THEN r.output_tokens END), 1)         AS avg_output_tokens,
+       COUNT(f.request_id)                                                           AS feedback_requests,
+       ROUND(100.0 * SUM(CASE WHEN f.feedback_type = 'thumbs_up' THEN 1 ELSE 0 END)
+             / NULLIF(COUNT(f.request_id), 0), 1)                                    AS thumbs_up_pct
+FROM llm_requests r
+JOIN versions v ON v.prompt_version_id = r.prompt_version_id AND v.recency <= 2
+CROSS JOIN win
+LEFT JOIN final_fb f ON f.request_id = r.request_id
+WHERE r.requested_at >= win.win_start
+  AND r.requested_at <  win.win_end
+GROUP BY v.version
+ORDER BY prompt_version;
+@assert
+len(rows) == 2
+@explanation
+The comparison window is derived from the prompt registry itself (`created_at` of the latest version), so the query stays valid when the next version ships. Restricting both versions to the same 14-day rollout window makes the comparison an approximate A/B test: same period, same models and same traffic mix, with the prompt as the main difference.
+
+Small feedback counts make thumbs-up differences noisy. Apply a two-proportion test (SQL-084/SQL-135) before declaring a winner, and look at cost (`avg_output_tokens`) as well as quality.
+
+**Why it matters for AI apps:** prompt changes are deployments. Comparing them under controlled conditions is how prompt engineering becomes engineering.
+@mistakes
+- Comparing lifetime averages of each version (different months, models and features).
+- Hard-coding prompt IDs that differ between environments.
+@performance
+Small; requests are filtered by time first, and prompt lookups are primary-key joins.
+@interview
+Shows experimental thinking applied to LLM operations.
+
+### SQL-133
+title: Week-over-week cost regressions per model
+difficulty: Advanced
+primary: Detecting increases in token costs
+secondary: per-dialect week truncation, cost per successful request, LAG per model, alert threshold
+concepts: ai_regression, ai_token_cost, period_over_period, lag_lead, range_join, date_bucketing
+roles: AI
+time: 25
+dialect: BOTH
+tables: llm_requests(model_name, requested_at, status, input_tokens, output_tokens, cache_hit); llm_pricing(model_name, effective_from, effective_to, input_usd_per_1k, output_usd_per_1k)
+columns: week_start, model_name, successful_requests, cost_usd, cost_per_success, prev_cost_per_success, change_pct
+compare: ordered
+@context
+FinOps reviews weekly cost per **successful** request per model and wants alerts when it rises by more than 20% week-over-week (weeks start on Monday). Price changes, longer prompts and higher failure rates all show up in this metric.
+@problem
+For H1 2025, compute per ISO week and model: successful requests, total cost (all requests), cost per success (4 decimals), the previous week's value and the change in percent (1 decimal). Return only rows with `change_pct > 20` and at least 20 successful requests in both weeks. Sort by week, model.
+@expected
+About a dozen flagged (week, model) rows. Two stories stand out. The nimbus-pro incident week (2025-03-17) is flagged because failed calls still consume input tokens. The week of 2025-04-14 is flagged because the new top-10 retrieval config (from 2025-04-15) roughly doubled the context sent per request. The nimbus-pro price increase in May (+17%) stays below the 20% threshold. Cheap models (orbit-8b, atlas-mini) produce noisy percentage changes on tiny absolute costs; real alert rules add an absolute floor.
+@edge_cases
+- Week truncation differs by engine. PostgreSQL `DATE_TRUNC('week', ...)` starts on Monday; MySQL needs `DATE_SUB(d, INTERVAL WEEKDAY(d) DAY)`.
+- Partial weeks at the start and end of the range produce noisy values.
+@hint1
+Aggregate cost and successes per (week, model) with the price range join.
+@hint2
+`LAG(cost_per_success) OVER (PARTITION BY model_name ORDER BY week_start)` and the previous week's success count.
+@hint3
+Filter in an outer query on the change and on both weeks' volume.
+@solution_pg
+WITH weekly AS (
+    SELECT CAST(DATE_TRUNC('week', r.requested_at) AS DATE) AS week_start,
+           r.model_name,
+           SUM(CASE WHEN r.status = 'success' THEN 1 ELSE 0 END) AS successful_requests,
+           SUM(CASE WHEN r.cache_hit THEN 0
+                    ELSE r.input_tokens / 1000.0 * p.input_usd_per_1k
+                       + COALESCE(r.output_tokens, 0) / 1000.0 * p.output_usd_per_1k END) AS cost_usd
+    FROM llm_requests r
+    JOIN llm_pricing p
+      ON p.model_name = r.model_name
+     AND CAST(r.requested_at AS DATE) BETWEEN p.effective_from AND COALESCE(p.effective_to, DATE '9999-12-31')
+    WHERE r.requested_at >= TIMESTAMP '2025-01-06 00:00:00'
+      AND r.requested_at <  TIMESTAMP '2025-06-30 00:00:00'
+    GROUP BY DATE_TRUNC('week', r.requested_at), r.model_name
+),
+with_prev AS (
+    SELECT week_start, model_name, successful_requests, cost_usd,
+           cost_usd / NULLIF(successful_requests, 0) AS cps,
+           LAG(cost_usd / NULLIF(successful_requests, 0)) OVER (PARTITION BY model_name ORDER BY week_start) AS prev_cps,
+           LAG(successful_requests) OVER (PARTITION BY model_name ORDER BY week_start) AS prev_success
+    FROM weekly
+)
+SELECT week_start, model_name, successful_requests,
+       ROUND(cost_usd, 2)                        AS cost_usd,
+       ROUND(cps, 4)                             AS cost_per_success,
+       ROUND(prev_cps, 4)                        AS prev_cost_per_success,
+       ROUND(100.0 * (cps / prev_cps - 1), 1)    AS change_pct
+FROM with_prev
+WHERE successful_requests >= 20
+  AND prev_success >= 20
+  AND cps > 1.2 * prev_cps
+ORDER BY week_start, model_name;
+@solution_mysql
+WITH weekly AS (
+    SELECT DATE_SUB(CAST(r.requested_at AS DATE), INTERVAL WEEKDAY(r.requested_at) DAY) AS week_start,
+           r.model_name,
+           SUM(CASE WHEN r.status = 'success' THEN 1 ELSE 0 END) AS successful_requests,
+           SUM(CASE WHEN r.cache_hit THEN 0
+                    ELSE r.input_tokens / 1000.0 * p.input_usd_per_1k
+                       + COALESCE(r.output_tokens, 0) / 1000.0 * p.output_usd_per_1k END) AS cost_usd
+    FROM llm_requests r
+    JOIN llm_pricing p
+      ON p.model_name = r.model_name
+     AND CAST(r.requested_at AS DATE) BETWEEN p.effective_from AND COALESCE(p.effective_to, DATE '9999-12-31')
+    WHERE r.requested_at >= TIMESTAMP '2025-01-06 00:00:00'
+      AND r.requested_at <  TIMESTAMP '2025-06-30 00:00:00'
+    GROUP BY DATE_SUB(CAST(r.requested_at AS DATE), INTERVAL WEEKDAY(r.requested_at) DAY), r.model_name
+),
+with_prev AS (
+    SELECT week_start, model_name, successful_requests, cost_usd,
+           cost_usd / NULLIF(successful_requests, 0) AS cps,
+           LAG(cost_usd / NULLIF(successful_requests, 0)) OVER (PARTITION BY model_name ORDER BY week_start) AS prev_cps,
+           LAG(successful_requests) OVER (PARTITION BY model_name ORDER BY week_start) AS prev_success
+    FROM weekly
+)
+SELECT week_start, model_name, successful_requests,
+       ROUND(cost_usd, 2)                        AS cost_usd,
+       ROUND(cps, 4)                             AS cost_per_success,
+       ROUND(prev_cps, 4)                        AS prev_cost_per_success,
+       ROUND(100.0 * (cps / prev_cps - 1), 1)    AS change_pct
+FROM with_prev
+WHERE successful_requests >= 20
+  AND prev_success >= 20
+  AND cps > 1.2 * prev_cps
+ORDER BY week_start, model_name;
+@dialect_note
+PostgreSQL `DATE_TRUNC('week', ts)` follows ISO weeks (Monday start). MySQL has no week truncation; `DATE_SUB(d, INTERVAL WEEKDAY(d) DAY)` moves a date back to its Monday (`WEEKDAY`: Monday = 0). Avoid MySQL `WEEK()`/`YEARWEEK()` for this purpose: their week numbering depends on a mode argument and `default_week_format`.
+@assert
+any(r[0] == '2025-04-14' and r[1] == 'nimbus-pro' for r in rows)
+@explanation
+1. Weekly aggregation with point-in-time prices (SQL-118).
+2. Cost per **success** penalizes both price increases and failures (failed calls still cost input tokens).
+3. LAG per model compares each week with the previous one; the volume guard avoids alerts on tiny weeks. The date range starts and ends on full weeks (Monday 2025-01-06 to Sunday 2025-06-29).
+
+The DECIMAL arithmetic matches in both engines because all price columns are DECIMAL and token counts are integers divided by `1000.0`.
+
+**Why it matters for AI apps:** LLM cost regressions are rarely caused by one event. A provider price change, a longer prompt, a retrieval config returning more chunks, or a failure spike all move this single metric, so it is the right first alarm.
+@mistakes
+- Using MySQL `WEEK()` without a mode (weeks start on Sunday by default).
+- Comparing total cost week over week, which is dominated by traffic growth.
+@performance
+One aggregation over H1 requests; the window runs over ~25 weeks x models.
+@interview
+Advanced FinOps-for-AI scenario combining point-in-time joins, period-over-period windows and alert design.
+
+### SQL-134
+title: Build a RAG ingestion manifest from document metadata
+difficulty: Medium
+primary: Preparing metadata records for a RAG ingestion pipeline
+secondary: JSON extraction per dialect, COALESCE defaults, estimated chunk counts
+concepts: ai_rag_ingestion, json, coalesce_nullif, ai_not_reindexed, arithmetic
+roles: AI
+time: 18
+dialect: BOTH
+tables: documents(document_id, doc_key, version_number, status, is_deleted, language, access_level, word_count, metadata, updated_at, last_indexed_at)
+columns: document_id, doc_key, version_number, language, access_level, product_area, tags, word_count, estimated_chunks, reason
+compare: ordered
+@context
+The ingestion pipeline (chunk → embed → upsert into the vector DB) consumes a manifest. Each record carries the metadata the retriever will filter on (language, access level, product area, tags).
+@problem
+For published, non-deleted versions that need (re)indexing (never indexed or edited after indexing), return the manifest: `document_id`, `doc_key`, `version_number`, `language` (`'unknown'` if NULL), `access_level`, `product_area` (from `metadata`, `'unknown'` if missing), `tags` (the JSON array as text, NULL if missing), `word_count`, `estimated_chunks` (= ceiling of word_count / 90) and `reason`. Sort by `document_id`.
+@expected
+One row per document version needing ingestion.
+@edge_cases
+- `metadata` can be NULL: every extracted field must fall back to a default.
+- JSON path syntax differs: PostgreSQL `metadata->>'product_area'`, MySQL `metadata->>'$.product_area'`.
+@hint1
+Filter like SQL-126.
+@hint2
+Extract text with `->>` (both engines support it, with different path syntax).
+@hint3
+`CEIL(word_count / 90.0)` for the estimate.
+@solution_pg
+SELECT document_id,
+       doc_key,
+       version_number,
+       COALESCE(language, 'unknown')                         AS language,
+       access_level,
+       COALESCE(metadata->>'product_area', 'unknown')        AS product_area,
+       metadata->>'tags'                                     AS tags,
+       word_count,
+       CEIL(word_count / 90.0)                               AS estimated_chunks,
+       CASE WHEN last_indexed_at IS NULL THEN 'never_indexed' ELSE 'stale_index' END AS reason
+FROM documents
+WHERE status = 'published'
+  AND is_deleted = FALSE
+  AND (last_indexed_at IS NULL OR last_indexed_at < updated_at)
+ORDER BY document_id;
+@solution_mysql
+SELECT document_id,
+       doc_key,
+       version_number,
+       COALESCE(language, 'unknown')                         AS language,
+       access_level,
+       COALESCE(metadata->>'$.product_area', 'unknown')      AS product_area,
+       metadata->>'$.tags'                                   AS tags,
+       word_count,
+       CEIL(word_count / 90.0)                               AS estimated_chunks,
+       CASE WHEN last_indexed_at IS NULL THEN 'never_indexed' ELSE 'stale_index' END AS reason
+FROM documents
+WHERE status = 'published'
+  AND is_deleted = FALSE
+  AND (last_indexed_at IS NULL OR last_indexed_at < updated_at)
+ORDER BY document_id;
+@dialect_note
+Both engines have a `->>` operator that returns text, but the right-hand side differs: a key name in PostgreSQL (`'product_area'`) and a JSON path in MySQL (`'$.product_area'`). For an array, `->>` returns its JSON text (`["a", "b"]`) in both. PostgreSQL's `jsonb_array_elements_text` (or MySQL's `JSON_TABLE`, SQL-168) would unnest the tags into rows instead.
+@explanation
+A manifest is a projection of the document table into the exact shape the ingestion job needs. Defaults (COALESCE) are applied in SQL so the pipeline never receives NULL filter attributes: a vector-DB filter on `language = 'en'` would silently skip documents with a NULL language.
+
+`CEIL(word_count / 90.0)` mirrors the chunker's sizing (≈ 90 words per chunk) and lets the pipeline estimate embedding cost before running.
+
+**Why it matters for AI apps:** metadata quality decides whether access control and filtered retrieval work. An `internal` document without its access level is a data-leak risk.
+@mistakes
+- Passing NULL metadata straight through.
+- Using MySQL path syntax in PostgreSQL or vice versa.
+@performance
+Same filter as SQL-126; JSON extraction is per-row CPU.
+@interview
+Practical JSON + data-contract question for AI data pipelines.
+
+### SQL-135
+title: Did citations improve answer acceptance? (AI experiment readout)
+difficulty: Advanced
+primary: Experiment analysis on AI feedback
+secondary: exposure filter, final feedback per request, two-proportion z-test
+concepts: ai_acceptance, ds_experiment, ai_prompt_compare, multiple_ctes, stats_summary, dedup_window
+roles: AI, DS
+time: 25
+dialect: BOTH
+tables: experiments(experiment_id, experiment_name); experiment_assignments(experiment_id, user_id, variant, assigned_at); llm_requests(request_id, user_id, feature, status, requested_at); ai_feedback(feedback_id, request_id, feedback_type, created_at)
+columns: variant, users, answers, rated_answers, thumbs_up, thumbs_up_pct, z_vs_control
+compare: ordered
+@context
+`rag_answer_citations` shows source citations under support-bot answers for the treatment group. The pre-registered metric is the thumbs-up rate of rated support-bot answers given **after** the user's assignment.
+@problem
+Per variant, return `users` (assigned), `answers` (successful support-bot requests of assigned users after their `assigned_at`), `rated_answers` (with final feedback), `thumbs_up`, `thumbs_up_pct` (1 decimal) and `z_vs_control` (pooled two-proportion z over rated answers, 2 decimals; NULL for control). Sort by variant.
+@expected
+2 rows.
+@edge_cases
+- Answers before assignment are not exposed to the treatment.
+- The unit of analysis is the rated answer, but answers from the same user are correlated, so the naive z overstates significance. Say so.
+@hint1
+Join assignments to the user's support-bot requests with `requested_at >= assigned_at`.
+@hint2
+Attach the final feedback per request, then aggregate per variant.
+@hint3
+Attach control's counts with a one-row CTE and compute z like SQL-084.
+@solution
+WITH exp AS (
+    SELECT a.user_id, a.variant, a.assigned_at
+    FROM experiment_assignments a
+    JOIN experiments x ON x.experiment_id = a.experiment_id
+    WHERE x.experiment_name = 'rag_answer_citations'
+),
+final_fb AS (
+    SELECT request_id, feedback_type
+    FROM (
+        SELECT request_id, feedback_type,
+               ROW_NUMBER() OVER (PARTITION BY request_id ORDER BY created_at DESC, feedback_id DESC) AS rn
+        FROM ai_feedback
+    ) x
+    WHERE rn = 1
+),
+answers AS (
+    SELECT e.variant, r.request_id, f.feedback_type
+    FROM exp e
+    JOIN llm_requests r ON r.user_id = e.user_id
+                       AND r.feature = 'support_bot'
+                       AND r.status = 'success'
+                       AND r.requested_at >= e.assigned_at
+    LEFT JOIN final_fb f ON f.request_id = r.request_id
+),
+users_per_variant AS (
+    SELECT variant, COUNT(*) AS users
+    FROM exp
+    GROUP BY variant
+),
+answer_stats AS (
+    SELECT variant,
+           COUNT(*)                                               AS answers,
+           COUNT(feedback_type)                                   AS rated,
+           SUM(CASE WHEN feedback_type = 'thumbs_up' THEN 1 ELSE 0 END) AS ups
+    FROM answers
+    GROUP BY variant
+),
+agg AS (
+    SELECT u.variant, u.users,
+           COALESCE(s.answers, 0) AS answers,
+           COALESCE(s.rated, 0)   AS rated,
+           COALESCE(s.ups, 0)     AS ups
+    FROM users_per_variant u
+    LEFT JOIN answer_stats s ON s.variant = u.variant
+),
+ctrl AS (
+    SELECT rated AS n_c, ups AS x_c FROM agg WHERE variant = 'control'
+)
+SELECT g.variant,
+       g.users,
+       g.answers,
+       g.rated AS rated_answers,
+       g.ups   AS thumbs_up,
+       ROUND(100.0 * g.ups / NULLIF(g.rated, 0), 1) AS thumbs_up_pct,
+       CASE WHEN g.variant <> 'control' THEN
+            ROUND((1.0 * g.ups / g.rated - 1.0 * c.x_c / c.n_c)
+                  / SQRT((1.0 * (g.ups + c.x_c) / (g.rated + c.n_c))
+                         * (1 - 1.0 * (g.ups + c.x_c) / (g.rated + c.n_c))
+                         * (1.0 / g.rated + 1.0 / c.n_c)), 2) END AS z_vs_control
+FROM agg g
+CROSS JOIN ctrl c
+ORDER BY g.variant;
+@assert
+len(rows) == 2 and rows[0][6] is None
+@explanation
+1. **Exposure**: only answers given after the user's assignment can have been affected.
+2. **Outcome**: the final feedback verdict per answer (SQL-131).
+3. **Readout**: thumbs-up rate among rated answers per variant, and a pooled z statistic versus control.
+
+User counts and answer counts live at different grains (assigned user vs answer), so they are aggregated in two separate CTEs and joined per variant. Joining answers to users before counting users would require `COUNT(DISTINCT ...)` everywhere. `COUNT(feedback_type)` counts answers with a final verdict, because unrated answers carry NULL from the LEFT JOIN.
+
+Statistical caveats that a strong readout states:
+- **Unit mismatch**: randomization was by *user*, the metric is per *answer*. Heavy users contribute many correlated answers, so the naive z is too optimistic. Use a user-level metric, cluster-robust standard errors or the delta method.
+- Feedback is voluntary; check that the feedback *rate* did not differ between arms (it could itself be affected by citations).
+
+**Why it matters for AI apps:** UI changes around LLM answers (citations, confidence hints) are tested like any product change, but the per-answer metrics make the unit-of-analysis trap very common.
+@mistakes
+- Counting answers before assignment.
+- Using raw feedback rows (changed minds double count).
+@performance
+Small; the join from assignments to requests uses `llm_requests(user_id)`.
+@interview
+Advanced: combining experiment design knowledge with LLM feedback data and identifying the unit-of-analysis problem.

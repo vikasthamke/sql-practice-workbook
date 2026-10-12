@@ -1,0 +1,571 @@
+### SQL-154
+title: Read your first execution plan: index versus full scan
+difficulty: Medium
+primary: EXPLAIN
+secondary: sequential/table scan vs index lookup, statistics with ANALYZE
+concepts: explain, index_basics, scan_types, ai_missing_metadata
+roles: AI, MLE
+time: 15
+dialect: BOTH
+tables: llm_requests(request_id, trace_id, error_code, model_name, requested_at)
+columns: plan
+compare: none
+@context
+Incident responders look up LLM requests by `trace_id` and by `error_code`. On a sandbox copy of the request log, `trace_id` gets an index and `error_code` does not. One plan can show both access paths if you EXPLAIN a UNION ALL of the two lookups.
+@problem
+Create `sb_req_perf` from `llm_requests`, index `trace_id`, refresh statistics, and EXPLAIN a query that counts rows for one trace ID and, separately (UNION ALL), for one error code. Identify which branch uses the index.
+@expected
+A plan whose trace branch uses the index (PostgreSQL "Index Only Scan"/"Index Scan"/"Bitmap Index Scan", MySQL "Index lookup"/"Covering index lookup") and whose error-code branch scans the whole table ("Seq Scan" / "Table scan").
+@edge_cases
+- On very small tables the planner may prefer a full scan even when an index exists, because reading a few pages sequentially is cheaper.
+- Plans depend on statistics: always ANALYZE after bulk loads.
+@hint1
+`EXPLAIN` shows the plan without running the query.
+@hint2
+PostgreSQL: `EXPLAIN (COSTS OFF) ...` for compact output. MySQL: `EXPLAIN FORMAT=TREE ...`.
+@hint3
+Statistics: PostgreSQL `ANALYZE sb_req_perf;`, MySQL `ANALYZE TABLE sb_req_perf;`.
+@solution_pg
+DROP TABLE IF EXISTS sb_req_perf;
+CREATE TABLE sb_req_perf AS SELECT * FROM llm_requests;
+CREATE INDEX ix_sb_req_perf_trace ON sb_req_perf (trace_id);
+ANALYZE sb_req_perf;
+EXPLAIN (COSTS OFF)
+SELECT COUNT(*) FROM sb_req_perf WHERE trace_id = '00000000-0000-4000-a000-000000000000'
+UNION ALL
+SELECT COUNT(*) FROM sb_req_perf WHERE error_code = 'gateway_timeout';
+@solution_mysql
+DROP TABLE IF EXISTS sb_req_perf;
+CREATE TABLE sb_req_perf AS SELECT * FROM llm_requests;
+CREATE INDEX ix_sb_req_perf_trace ON sb_req_perf (trace_id);
+ANALYZE TABLE sb_req_perf;
+EXPLAIN FORMAT=TREE
+SELECT COUNT(*) FROM sb_req_perf WHERE trace_id = '00000000-0000-4000-a000-000000000000'
+UNION ALL
+SELECT COUNT(*) FROM sb_req_perf WHERE error_code = 'gateway_timeout';
+@cleanup
+DROP TABLE IF EXISTS sb_req_perf
+@assert
+any('Index' in r[0] for r in rows) and any('Seq Scan' in r[0] for r in rows)
+@explanation
+An execution plan is a tree of operators; read it from the innermost (most indented) nodes upwards:
+- **Seq Scan** (PostgreSQL) / **Table scan** (MySQL) reads every row and applies the filter.
+- **Index Scan / Index Only Scan / Bitmap Index Scan** (PostgreSQL) / **Index lookup** (MySQL) navigates the B-tree to the matching keys.
+
+For an equality lookup that returns a handful of rows out of thousands, the index wins by orders of magnitude on big tables. EXPLAIN shows the *chosen* plan and estimated costs. EXPLAIN ANALYZE (SQL-159) also runs the query and shows actual row counts and time.
+
+The UNION ALL trick puts two access paths into one plan for comparison; in practice you would EXPLAIN each query separately.
+@mistakes
+- Reading costs as milliseconds (they are planner units).
+- Concluding "the index is not used, so it is useless" from one plan on a tiny table.
+@performance
+The trace index turns an O(n) scan into an O(log n) lookup; the cost is extra storage and slower inserts.
+@interview
+Expect to be handed a plan and asked "what is slow here and why?".
+
+### SQL-155
+title: SELECT * versus a covering index
+difficulty: Medium
+primary: Avoiding unnecessary SELECT *
+secondary: covering (index-only) scans, heap/table lookups, VACUUM and the visibility map
+concepts: select_star, composite_index, explain, scan_types
+roles: AI
+time: 15
+dialect: BOTH
+tables: llm_requests(model_name, requested_at, latency_ms)
+columns: plan
+compare: none
+@context
+A latency dashboard needs only `requested_at` and `latency_ms` for one model and month. The first version used `SELECT *`.
+@problem
+On `sb_req_perf`, create an index on `(model_name, requested_at, latency_ms)`, refresh statistics (and in PostgreSQL the visibility map with VACUUM), then EXPLAIN the column-specific query and the `SELECT *` version together (UNION ALL of two counts over derived tables). Which branch is answered from the index alone?
+@expected
+The column-specific branch is an index-only/covering scan; the `SELECT *` branch must also read the table rows.
+@edge_cases
+- PostgreSQL can only skip the table (heap) for pages marked all-visible; run `VACUUM ANALYZE` after bulk loads.
+- MySQL InnoDB secondary indexes contain the primary key, and covering scans show "Covering index range scan".
+@hint1
+An index *covers* a query when every column the query reads is in the index.
+@hint2
+`CREATE INDEX ... ON sb_req_perf (model_name, requested_at, latency_ms)`.
+@hint3
+Wrap each variant in `SELECT COUNT(*) FROM (<variant>) x` so they can be combined with UNION ALL.
+@solution_pg
+DROP TABLE IF EXISTS sb_req_perf;
+CREATE TABLE sb_req_perf AS SELECT * FROM llm_requests;
+CREATE INDEX ix_sb_req_perf_cover ON sb_req_perf (model_name, requested_at, latency_ms);
+VACUUM ANALYZE sb_req_perf;
+EXPLAIN (COSTS OFF)
+SELECT COUNT(*) FROM (SELECT requested_at, latency_ms FROM sb_req_perf
+                      WHERE model_name = 'nimbus-pro'
+                        AND requested_at >= TIMESTAMP '2025-06-01 00:00:00'
+                        AND requested_at <  TIMESTAMP '2025-07-01 00:00:00') narrow
+UNION ALL
+SELECT COUNT(*) FROM (SELECT * FROM sb_req_perf
+                      WHERE model_name = 'nimbus-pro'
+                        AND requested_at >= TIMESTAMP '2025-06-01 00:00:00'
+                        AND requested_at <  TIMESTAMP '2025-07-01 00:00:00'
+                        AND input_tokens > 0) wide;
+@solution_mysql
+DROP TABLE IF EXISTS sb_req_perf;
+CREATE TABLE sb_req_perf AS SELECT * FROM llm_requests;
+CREATE INDEX ix_sb_req_perf_cover ON sb_req_perf (model_name, requested_at, latency_ms);
+ANALYZE TABLE sb_req_perf;
+EXPLAIN FORMAT=TREE
+SELECT COUNT(*) FROM (SELECT requested_at, latency_ms FROM sb_req_perf
+                      WHERE model_name = 'nimbus-pro'
+                        AND requested_at >= TIMESTAMP '2025-06-01 00:00:00'
+                        AND requested_at <  TIMESTAMP '2025-07-01 00:00:00') narrow
+UNION ALL
+SELECT COUNT(*) FROM (SELECT * FROM sb_req_perf
+                      WHERE model_name = 'nimbus-pro'
+                        AND requested_at >= TIMESTAMP '2025-06-01 00:00:00'
+                        AND requested_at <  TIMESTAMP '2025-07-01 00:00:00'
+                        AND input_tokens > 0) wide;
+@cleanup
+DROP TABLE IF EXISTS sb_req_perf
+@assert
+any('Index Only Scan' in r[0] for r in rows)
+@explanation
+When all needed columns are in the index, the engine answers from the index alone: an **index-only scan** (PostgreSQL) or **covering index** (MySQL). That avoids one random table lookup per row. `SELECT *` (here: needing `input_tokens` too, which is not in the index) forces those lookups.
+
+Note that a bare `COUNT(*)` over `SELECT *` could be optimized away, because the optimizer prunes unused columns of a derived table. The extra predicate on `input_tokens` makes the wide branch genuinely need table columns, which mirrors what happens when an application really fetches all columns.
+
+Beyond performance, explicit column lists protect consumers from schema changes and reduce network transfer, which matters a lot for wide tables with JSON or TEXT columns.
+@mistakes
+- Adding every column to an index to make it "covering": huge indexes, slow writes.
+- Expecting index-only scans in PostgreSQL right after a bulk load without VACUUM.
+@performance
+Covering indexes are a precise tool for hot, narrow queries such as dashboards and lookups.
+@interview
+"Why is SELECT * bad?" A good answer covers I/O, covering indexes, network and schema coupling.
+
+### SQL-156
+title: Sargable versus non-sargable date filters
+difficulty: Hard
+primary: Index-friendly (sargable) predicates
+secondary: functions on indexed columns, equivalent range rewrite, EXPLAIN comparison
+concepts: sargable, explain, index_basics, date_functions
+roles: DS
+time: 15
+dialect: BOTH
+tables: events(event_id, event_ts, event_name)
+columns: plan
+compare: none
+@context
+A daily report filters events with `CAST(event_ts AS DATE) = DATE '2025-06-15'`. An index on `event_ts` exists but the query still scans the whole table.
+@problem
+On `sb_events_perf` (a copy of `events` with an index on `event_ts`), EXPLAIN the function-wrapped filter and the equivalent half-open range together (UNION ALL of two counts). Explain the difference.
+@expected
+The range branch is an index range scan over about 70 index entries. The CAST branch reads everything: PostgreSQL does a Seq Scan of the table, and MySQL a full *covering index scan* that reads all ~33,000 index entries and evaluates the CAST on each. Compare the estimated rows of the two branches.
+@edge_cases
+- Both predicates select exactly the same rows; only their index-friendliness differs.
+- An expression index on `CAST(event_ts AS DATE)` (PostgreSQL) or a functional index (MySQL 8.0.13+) would make the first form indexable too.
+@hint1
+An index on `event_ts` stores `event_ts` values in order, not `CAST(event_ts AS DATE)` values.
+@hint2
+Rewrite the date equality as `event_ts >= DATE AND event_ts < DATE + 1 day`.
+@hint3
+EXPLAIN a UNION ALL of both counts to compare access paths.
+@solution_pg
+DROP TABLE IF EXISTS sb_events_perf;
+CREATE TABLE sb_events_perf AS SELECT event_id, user_id, event_ts, event_name FROM events;
+CREATE INDEX ix_sb_events_perf_ts ON sb_events_perf (event_ts);
+VACUUM ANALYZE sb_events_perf;
+EXPLAIN (COSTS OFF)
+SELECT COUNT(*) FROM sb_events_perf WHERE CAST(event_ts AS DATE) = DATE '2025-06-15'
+UNION ALL
+SELECT COUNT(*) FROM sb_events_perf
+WHERE event_ts >= TIMESTAMP '2025-06-15 00:00:00' AND event_ts < TIMESTAMP '2025-06-16 00:00:00';
+@solution_mysql
+DROP TABLE IF EXISTS sb_events_perf;
+CREATE TABLE sb_events_perf AS SELECT event_id, user_id, event_ts, event_name FROM events;
+CREATE INDEX ix_sb_events_perf_ts ON sb_events_perf (event_ts);
+ANALYZE TABLE sb_events_perf;
+EXPLAIN FORMAT=TREE
+SELECT COUNT(*) FROM sb_events_perf WHERE CAST(event_ts AS DATE) = DATE '2025-06-15'
+UNION ALL
+SELECT COUNT(*) FROM sb_events_perf
+WHERE event_ts >= TIMESTAMP '2025-06-15 00:00:00' AND event_ts < TIMESTAMP '2025-06-16 00:00:00';
+@cleanup
+DROP TABLE IF EXISTS sb_events_perf
+@assert
+any('Seq Scan' in r[0] for r in rows) and any('Index' in r[0] for r in rows)
+@explanation
+A predicate is **sargable** (Search ARGument ABLE) when the engine can turn it into an index range: `column op constant`. Wrapping the column in a function (`CAST`, `DATE()`, `LOWER()`, arithmetic like `event_ts + INTERVAL ...`) hides the indexed value, so every row must be computed and tested.
+
+Rewrite rules:
+- `CAST(ts AS DATE) = d` → `ts >= d AND ts < d + 1 day`
+- `EXTRACT(YEAR FROM ts) = 2025` → `ts >= '2025-01-01' AND ts < '2026-01-01'`
+- `col + 10 > 100` → `col > 90`
+
+When the function form is unavoidable (e.g. case-insensitive lookups), index the expression itself.
+
+Note the MySQL plan: it still "uses" the index for the CAST branch, but as a **full index scan** (the index is narrower than the table), not a range. "Uses an index" in a plan is not the same as "uses the index efficiently". Look for range or lookup access and the row estimates.
+@mistakes
+- Assuming the optimizer rewrites function predicates automatically. It does not in general.
+- Using `BETWEEN d AND d + 1` (inclusive end, see SQL-005).
+@performance
+On 35k rows the difference is small in absolute time; on hundreds of millions of rows it decides between milliseconds and minutes.
+@interview
+One of the most common SQL performance questions; candidates should rewrite the predicate without being prompted.
+
+### SQL-157
+title: Composite index column order
+difficulty: Hard
+primary: Composite indexes
+secondary: leftmost-prefix rule, equality before range, skip scans
+concepts: composite_index, explain, sargable, ai_latency_compare
+roles: AI
+time: 15
+dialect: BOTH
+tables: llm_requests(model_name, requested_at, latency_ms)
+columns: plan
+compare: none
+@context
+The request log has a composite index on `(model_name, requested_at)`. Two dashboard queries: (A) one model in June, (B) all models in June. Only one of them can use the index as a simple range.
+@problem
+On `sb_req_perf` with an index on `(model_name, requested_at)`, EXPLAIN query A (`model_name = 'nimbus-pro'` and June) and query B (June only) together as UNION ALL of two counts. Explain why A gets an index range scan and B does not.
+@expected
+A: an index range scan on (model, time). B cannot use a simple range. On the engines used to validate this workbook (PostgreSQL 18, MySQL 8.4) the planner chooses a **skip scan**, jumping through each of the 5 model sections. On PostgreSQL 16/17 you will see a full scan instead.
+@edge_cases
+- B-tree composite indexes are sorted by the first column, then by the second within each first-column value.
+- PostgreSQL 18 and MySQL 8.0.13+ can sometimes "skip scan" a leading column with few distinct values; older versions cannot.
+@hint1
+Think of a phone book sorted by (last name, first name): can you quickly find everyone named "Maria"?
+@hint2
+Equality on the leading column + range on the next column is the ideal pattern.
+@hint3
+For B, an index on `(requested_at)` or `(requested_at, model_name)` would be needed.
+@solution_pg
+DROP TABLE IF EXISTS sb_req_perf;
+CREATE TABLE sb_req_perf AS SELECT * FROM llm_requests;
+CREATE INDEX ix_sb_req_perf_model_time ON sb_req_perf (model_name, requested_at);
+VACUUM ANALYZE sb_req_perf;
+EXPLAIN (COSTS OFF)
+SELECT COUNT(*) FROM sb_req_perf
+WHERE model_name = 'nimbus-pro'
+  AND requested_at >= TIMESTAMP '2025-06-01 00:00:00' AND requested_at < TIMESTAMP '2025-07-01 00:00:00'
+UNION ALL
+SELECT COUNT(*) FROM sb_req_perf
+WHERE requested_at >= TIMESTAMP '2025-06-01 00:00:00' AND requested_at < TIMESTAMP '2025-07-01 00:00:00';
+@solution_mysql
+DROP TABLE IF EXISTS sb_req_perf;
+CREATE TABLE sb_req_perf AS SELECT * FROM llm_requests;
+CREATE INDEX ix_sb_req_perf_model_time ON sb_req_perf (model_name, requested_at);
+ANALYZE TABLE sb_req_perf;
+EXPLAIN FORMAT=TREE
+SELECT COUNT(*) FROM sb_req_perf
+WHERE model_name = 'nimbus-pro'
+  AND requested_at >= TIMESTAMP '2025-06-01 00:00:00' AND requested_at < TIMESTAMP '2025-07-01 00:00:00'
+UNION ALL
+SELECT COUNT(*) FROM sb_req_perf
+WHERE requested_at >= TIMESTAMP '2025-06-01 00:00:00' AND requested_at < TIMESTAMP '2025-07-01 00:00:00';
+@cleanup
+DROP TABLE IF EXISTS sb_req_perf
+@assert
+any('model_name' in r[0] and 'requested_at' in r[0] for r in rows)
+@explanation
+A composite B-tree index is sorted lexicographically: by `model_name`, and within each model by `requested_at`. Query A pins the first column with equality and ranges over the second, a single contiguous slice of the index. Query B constrains only the second column, so matching entries are scattered across every model's section. The engine must either scan everything or jump between model sections. That jumping is a *skip scan* (PostgreSQL 18 "Index Only Scan" with an Index Cond on `requested_at` only; MySQL "Covering index skip scan"). It is cheap here only because `model_name` has 5 distinct values. With thousands of distinct leading values it degrades to scanning everything.
+
+Design rules:
+1. Put equality-filtered columns first, then the range column.
+2. Order by selectivity only among equality columns.
+3. One index can serve several queries via its leftmost prefixes: `(a, b, c)` serves filters on `a`, `a+b` and `a+b+c`.
+@mistakes
+- Creating `(requested_at, model_name)` for query A. It works, but it scans all models for the date range before filtering by model.
+- Assuming that the order of columns in the WHERE clause matters. It does not; the index column order does.
+@performance
+Index column order is one of the highest-impact physical design decisions for time-series and log tables.
+@interview
+"Which composite index would you create for these three queries?" is a frequent system-design-meets-SQL question.
+
+### SQL-158
+title: When an index is not useful (selectivity)
+difficulty: Medium
+primary: Selectivity and when an index is not useful
+secondary: low-cardinality columns, value-dependent plans, statistics
+concepts: selectivity, scan_types, explain, ai_success_rate
+roles: AI, DS
+time: 12
+dialect: BOTH
+tables: llm_requests(status)
+columns: plan
+compare: none
+@context
+Someone added an index on `llm_requests.status` "to speed up status filters". About 92% of requests are `'success'`, and less than 1% are `'content_filtered'`.
+@problem
+On `sb_req_perf` with an index on `status`, EXPLAIN a count of `'success'` rows and a count of `'content_filtered'` rows together (UNION ALL). Explain why the same index is used for one value and ignored for the other.
+@expected
+`content_filtered` → index; `success` → full scan.
+@edge_cases
+- The planner needs value-level statistics (PostgreSQL most-common-values lists; MySQL index dives or histograms) to tell the two cases apart.
+@hint1
+Selectivity = fraction of rows a predicate returns.
+@hint2
+Reading 92% of a table through an index means one random access per row, which is slower than one sequential pass.
+@hint3
+Compare the plans of the two branches.
+@solution_pg
+DROP TABLE IF EXISTS sb_req_perf;
+CREATE TABLE sb_req_perf AS SELECT * FROM llm_requests;
+CREATE INDEX ix_sb_req_perf_status ON sb_req_perf (status);
+VACUUM ANALYZE sb_req_perf;
+EXPLAIN (COSTS OFF)
+SELECT COUNT(latency_ms) FROM sb_req_perf WHERE status = 'success'
+UNION ALL
+SELECT COUNT(latency_ms) FROM sb_req_perf WHERE status = 'content_filtered';
+@solution_mysql
+DROP TABLE IF EXISTS sb_req_perf;
+CREATE TABLE sb_req_perf AS SELECT * FROM llm_requests;
+CREATE INDEX ix_sb_req_perf_status ON sb_req_perf (status);
+ANALYZE TABLE sb_req_perf;
+EXPLAIN FORMAT=TREE
+SELECT COUNT(latency_ms) FROM sb_req_perf WHERE status = 'success'
+UNION ALL
+SELECT COUNT(latency_ms) FROM sb_req_perf WHERE status = 'content_filtered';
+@cleanup
+DROP TABLE IF EXISTS sb_req_perf
+@assert
+any('Seq Scan' in r[0] for r in rows) and any('Index' in r[0] for r in rows)
+@explanation
+Indexes help when a predicate is **selective** (returns a small fraction of rows). For `'success'`, the planner estimates ~92% of rows and chooses a sequential scan. For `'content_filtered'` it estimates a few dozen rows and uses the index. Same column, same index, different values, different plans.
+
+`COUNT(latency_ms)` (rather than `COUNT(*)`) needs a column that is not in the index, which prevents a trivial index-only count and makes the comparison fair.
+
+Practical guidance:
+- Low-cardinality columns rarely deserve a standalone index. A **partial index** (PostgreSQL: `CREATE INDEX ... WHERE status <> 'success'`) indexes only the rare, interesting rows.
+- Combine a low-cardinality column with a selective one in a composite index if queries filter on both.
+@mistakes
+- "Index every column used in WHERE."
+- Forcing index use with hints without measuring.
+@performance
+An unused index still costs storage and write time on every insert.
+@interview
+Shows understanding of cost-based optimization rather than rule-of-thumb indexing.
+
+### SQL-159
+title: EXPLAIN ANALYZE: correlated subquery versus window function
+difficulty: Hard
+primary: EXPLAIN ANALYZE
+secondary: recognizing expensive correlated subqueries, loops/executions, deterministic output options
+concepts: explain_analyze, correlated_cost, correlated_subquery, row_number
+roles: DS
+time: 20
+dialect: BOTH
+tables: support_tickets(ticket_id, org_id, created_at)
+columns: plan
+compare: none
+@context
+SQL-047 used a correlated subquery to find each organization's latest ticket; SQL-061 showed the ROW_NUMBER pattern. Measure both with EXPLAIN ANALYZE.
+@problem
+EXPLAIN ANALYZE a UNION ALL of (a) the count of tickets that are their organization's latest via a correlated scalar subquery and (b) the same count via ROW_NUMBER. Find in the plan how often the correlated subquery is executed.
+@expected
+The correlated branch shows a subplan executed once per ticket (loops ≈ number of tickets); the window branch shows one sort plus one pass.
+@edge_cases
+- PostgreSQL: use `EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)` for stable, readable output.
+- MySQL 8.0.18+: `EXPLAIN ANALYZE` (tree format with actual times and loops).
+- EXPLAIN ANALYZE **executes** the query; never run it on a destructive statement outside a transaction you roll back.
+@hint1
+Look for "SubPlan" (PostgreSQL) or "Select #n (subquery in condition; dependent)" (MySQL) and its `loops` value.
+@hint2
+Both branches return the same number (one latest ticket per organization).
+@hint3
+Compare the work: n index probes versus one sort.
+@solution_pg
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+SELECT COUNT(*)
+FROM support_tickets t
+WHERE t.ticket_id = (SELECT t2.ticket_id FROM support_tickets t2
+                     WHERE t2.org_id = t.org_id
+                     ORDER BY t2.created_at DESC, t2.ticket_id DESC
+                     LIMIT 1)
+UNION ALL
+SELECT COUNT(*)
+FROM (SELECT ROW_NUMBER() OVER (PARTITION BY org_id ORDER BY created_at DESC, ticket_id DESC) AS rn
+      FROM support_tickets) r
+WHERE rn = 1;
+@solution_mysql
+EXPLAIN ANALYZE
+SELECT COUNT(*)
+FROM support_tickets t
+WHERE t.ticket_id = (SELECT t2.ticket_id FROM support_tickets t2
+                     WHERE t2.org_id = t.org_id
+                     ORDER BY t2.created_at DESC, t2.ticket_id DESC
+                     LIMIT 1)
+UNION ALL
+SELECT COUNT(*)
+FROM (SELECT ROW_NUMBER() OVER (PARTITION BY org_id ORDER BY created_at DESC, ticket_id DESC) AS rn
+      FROM support_tickets) r
+WHERE rn = 1;
+@assert
+any('SubPlan' in r[0] for r in rows) and any('loops=' in r[0] for r in rows)
+@explanation
+EXPLAIN ANALYZE runs the query and annotates each node with actual rows and loops. The correlated subquery is a **SubPlan** that runs once per outer row (`loops` ≈ 1,400 here). Each run is a cheap index probe thanks to `support_tickets(org_id, created_at)`, but the cost grows linearly with the outer table and much worse without the index. The window version sorts once and scans once.
+
+Reading tips:
+- `rows=` actual vs estimated: large differences point to stale statistics or correlated predicates.
+- `loops=`: total work = per-loop rows × loops.
+- In PostgreSQL, TIMING OFF and SUMMARY OFF remove noise from the output; for real tuning, keep timings on.
+
+Optimizers can sometimes decorrelate subqueries into joins, but a scalar subquery with ORDER BY ... LIMIT usually stays correlated in both engines.
+@mistakes
+- Comparing two plans by total cost only; check the loops of the inner nodes.
+- Running EXPLAIN ANALYZE on DELETE/UPDATE without a transaction.
+@performance
+Correlated subqueries are fine with a supporting index on small inputs, and dangerous on large ones; window functions scale more predictably.
+@interview
+Reading `loops` in an EXPLAIN ANALYZE plan is a concrete skill senior interviewers probe.
+
+### SQL-160
+title: Let the index provide the order (avoiding a sort)
+difficulty: Medium
+primary: Sorting costs
+secondary: ORDER BY ... LIMIT with a matching composite index, top-N sort
+concepts: sort_agg_cost, composite_index, explain, limit_offset
+roles: AI
+time: 12
+dialect: BOTH
+tables: llm_requests(org_id, requested_at, latency_ms)
+columns: plan
+compare: none
+@context
+The customer console shows an organization's 20 most recent LLM requests, and sometimes its 20 slowest. With an index on `(org_id, requested_at)`, only one of the two can skip sorting.
+@problem
+On `sb_req_perf` with an index on `(org_id, requested_at)`, EXPLAIN a UNION ALL of two parenthesized queries for organization 195: latest 20 by `requested_at DESC`, and slowest 20 by `latency_ms DESC`. Which branch needs a Sort node?
+@expected
+The `requested_at` branch reads the index backwards with no sort; the `latency_ms` branch sorts.
+@edge_cases
+- A top-N with LIMIT uses a bounded "top-N heapsort" (PostgreSQL) instead of sorting everything, but it still reads all of the organization's rows.
+@hint1
+An index stores entries sorted by its columns.
+@hint2
+Equality on `org_id` + order by `requested_at` = a contiguous, already-sorted index slice.
+@hint3
+Use `(SELECT ... ORDER BY ... LIMIT 20) UNION ALL (SELECT ... ORDER BY ... LIMIT 20)`.
+@solution_pg
+DROP TABLE IF EXISTS sb_req_perf;
+CREATE TABLE sb_req_perf AS SELECT * FROM llm_requests;
+CREATE INDEX ix_sb_req_perf_org_time ON sb_req_perf (org_id, requested_at);
+VACUUM ANALYZE sb_req_perf;
+EXPLAIN (COSTS OFF)
+(SELECT request_id, requested_at FROM sb_req_perf WHERE org_id = 195 ORDER BY requested_at DESC LIMIT 20)
+UNION ALL
+(SELECT request_id, requested_at FROM sb_req_perf WHERE org_id = 195 ORDER BY latency_ms DESC LIMIT 20);
+@solution_mysql
+DROP TABLE IF EXISTS sb_req_perf;
+CREATE TABLE sb_req_perf AS SELECT * FROM llm_requests;
+CREATE INDEX ix_sb_req_perf_org_time ON sb_req_perf (org_id, requested_at);
+ANALYZE TABLE sb_req_perf;
+EXPLAIN FORMAT=TREE
+(SELECT request_id, requested_at FROM sb_req_perf WHERE org_id = 195 ORDER BY requested_at DESC LIMIT 20)
+UNION ALL
+(SELECT request_id, requested_at FROM sb_req_perf WHERE org_id = 195 ORDER BY latency_ms DESC LIMIT 20);
+@cleanup
+DROP TABLE IF EXISTS sb_req_perf
+@assert
+any('Sort' in r[0] for r in rows) and any('Backward' in r[0] for r in rows)
+@explanation
+Sorting is often the most expensive part of a query after I/O: it needs memory (work_mem / sort_buffer_size) and spills to disk when that is exceeded. When an index already delivers rows in the requested order, the engine just reads the first N entries ("Index Scan Backward" in PostgreSQL, "Index lookup ... (reverse)" in MySQL) and stops. That is the cheapest possible top-N.
+
+The `latency_ms` branch cannot use the index order, so it reads all of the organization's rows and sorts them. Add `(org_id, latency_ms)` only if that query is frequent; each index has write costs.
+@mistakes
+- Adding `ORDER BY` columns in a different direction mix (`a ASC, b DESC`) than the index supports. MySQL 8 and PostgreSQL support descending index columns for that case.
+@performance
+Index-ordered top-N queries stay fast regardless of table size; sort-based ones grow with the number of matching rows.
+@interview
+"How would you make this paginated feed fast?" Matching index order plus keyset pagination (SQL-012) is the answer.
+
+### SQL-161
+title: Compute once: repeated subqueries versus a single derived table
+difficulty: Hard
+primary: Avoiding repeated calculations
+secondary: duplicated subplans in EXPLAIN, CTE/derived-table rewrite, join order intuition
+concepts: repeated_calc, join_order, explain, semi_join
+roles: AI, DS
+time: 18
+dialect: BOTH
+tables: organizations(org_id, segment, is_deleted); llm_requests(org_id, status, requested_at)
+columns: plan
+compare: none
+@context
+SQL-035 (first version) repeated the same EXISTS subquery twice, once for the count and once for the percentage. Does the engine compute it twice?
+@problem
+EXPLAIN the repeated-EXISTS version of the AI adoption query and identify the duplicated subplan. Then write the single-pass version (the set of adopting organizations computed once and LEFT JOINed) and compare its plan.
+@expected
+The repeated version contains two identical subplans (hashed or per-row); the rewritten version scans `llm_requests` once.
+@edge_cases
+- Some optimizers can merge identical expressions, but you cannot rely on it; the plan tells you.
+@hint1
+Look for two "SubPlan n" nodes (PostgreSQL) or two "Select #n (subquery ...; dependent)" nodes (MySQL).
+@hint2
+Compute the adopting organizations once in a derived table with DISTINCT.
+@hint3
+The solution EXPLAINs the repeated version; EXPLAIN the rewrite yourself and compare.
+@solution_pg
+EXPLAIN (COSTS OFF)
+SELECT o.segment,
+       SUM(CASE WHEN EXISTS (SELECT 1 FROM llm_requests r
+                             WHERE r.org_id = o.org_id AND r.status = 'success'
+                               AND r.requested_at >= TIMESTAMP '2025-04-01 00:00:00')
+                THEN 1 ELSE 0 END) AS adopting_orgs,
+       ROUND(100.0 * SUM(CASE WHEN EXISTS (SELECT 1 FROM llm_requests r
+                                           WHERE r.org_id = o.org_id AND r.status = 'success'
+                                             AND r.requested_at >= TIMESTAMP '2025-04-01 00:00:00')
+                              THEN 1 ELSE 0 END) / COUNT(*), 1) AS adoption_pct
+FROM organizations o
+WHERE o.is_deleted = FALSE
+GROUP BY o.segment;
+@solution_mysql
+EXPLAIN FORMAT=TREE
+SELECT o.segment,
+       SUM(CASE WHEN EXISTS (SELECT 1 FROM llm_requests r
+                             WHERE r.org_id = o.org_id AND r.status = 'success'
+                               AND r.requested_at >= TIMESTAMP '2025-04-01 00:00:00')
+                THEN 1 ELSE 0 END) AS adopting_orgs,
+       ROUND(100.0 * SUM(CASE WHEN EXISTS (SELECT 1 FROM llm_requests r
+                                           WHERE r.org_id = o.org_id AND r.status = 'success'
+                                             AND r.requested_at >= TIMESTAMP '2025-04-01 00:00:00')
+                              THEN 1 ELSE 0 END) / COUNT(*), 1) AS adoption_pct
+FROM organizations o
+WHERE o.is_deleted = FALSE
+GROUP BY o.segment;
+@alternative_note
+The single-pass rewrite: adopting organizations are computed once in a DISTINCT derived table and LEFT JOINed. Its plan contains one aggregation over `llm_requests` and no per-organization subplans.
+@alternative_pg
+EXPLAIN (COSTS OFF)
+SELECT o.segment,
+       COUNT(a.org_id)                              AS adopting_orgs,
+       ROUND(100.0 * COUNT(a.org_id) / COUNT(*), 1) AS adoption_pct
+FROM organizations o
+LEFT JOIN (SELECT DISTINCT org_id FROM llm_requests
+           WHERE status = 'success' AND requested_at >= TIMESTAMP '2025-04-01 00:00:00') a
+       ON a.org_id = o.org_id
+WHERE o.is_deleted = FALSE
+GROUP BY o.segment;
+@alternative_mysql
+EXPLAIN FORMAT=TREE
+SELECT o.segment,
+       COUNT(a.org_id)                              AS adopting_orgs,
+       ROUND(100.0 * COUNT(a.org_id) / COUNT(*), 1) AS adoption_pct
+FROM organizations o
+LEFT JOIN (SELECT DISTINCT org_id FROM llm_requests
+           WHERE status = 'success' AND requested_at >= TIMESTAMP '2025-04-01 00:00:00') a
+       ON a.org_id = o.org_id
+WHERE o.is_deleted = FALSE
+GROUP BY o.segment;
+@assert
+sum(1 for r in rows if r[0].strip().startswith('SubPlan')) >= 2
+@explanation
+SQL is declarative, but repeated subexpressions are often *executed* repeatedly. In the plan, each EXISTS shows up as its own subplan, so the request table is probed twice per organization. (PostgreSQL may "hash" an uncorrelated version, but a correlated EXISTS stays per row.)
+
+Rewrite: compute the set of adopting organizations once (a DISTINCT derived table or CTE) and LEFT JOIN it. The plan then contains a single aggregation over `llm_requests` and a hash join to `organizations`. The rewritten query (shown as the alternative solution) is the version to keep.
+
+**Join order intuition:** the optimizer, not the textual order of the joins, decides the join order and the join algorithm. Your job is to give it a simple, set-based query with good statistics and indexes, and then check the plan. Rewrites that reduce rows early (filtering, pre-aggregation, semi-joins) usually help most.
+@mistakes
+- Copy-pasting a subquery into several SELECT expressions.
+- Believing a CTE is always computed once: inlined CTEs can be expanded at every reference (PostgreSQL 12+ inlines single-reference CTEs; `MATERIALIZED` forces one evaluation).
+@performance
+Halving the number of probes halves the subquery cost; on large fact tables the difference is substantial.
+@interview
+Reading a plan to spot duplicated work is a practical optimization skill.

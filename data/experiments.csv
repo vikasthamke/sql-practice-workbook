@@ -1,0 +1,7 @@
+experiment_id,experiment_name,hypothesis,primary_metric,start_date,end_date,status
+1,pricing_page_v2,A redesigned pricing page increases checkout conversion.,purchase_conversion_14d,2024-03-04,2024-04-14,completed
+2,annual_discount_banner,Showing the annual discount increases purchases.,purchase_conversion_14d,2024-09-02,2024-10-13,completed
+3,ai_assist_default_on,Enabling AI assist by default increases adoption.,ai_assist_adoption_14d,2024-11-04,2024-12-15,completed
+4,onboarding_checklist,An in-app checklist increases week-1 retention of new users.,week1_retention,2024-12-02,2025-02-09,completed
+5,checkout_one_page,A one-page checkout increases purchases (two treatment designs).,purchase_conversion_14d,2025-02-03,2025-03-16,completed
+6,rag_answer_citations,Showing citations in support-bot answers increases thumbs-up rate.,answer_thumbs_up_rate,2025-05-05,,running

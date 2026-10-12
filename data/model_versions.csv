@@ -1,0 +1,7 @@
+model_version_id,model_name,version_label,parent_version_id,algorithm,training_data_end,trained_at,deployed_at,retired_at,stage,default_threshold,hyperparameters
+1,churn_classifier,v1,,logistic_regression,2024-08-01,2024-09-20 14:00:00,2024-10-01 09:00:00,2025-01-15 09:00:00,retired,0.5,"{""C"": 1.0, ""penalty"": ""l2"", ""class_weight"": null}"
+2,churn_classifier,v2,1,gradient_boosting,2024-12-01,2025-01-10 16:30:00,2025-01-15 09:00:00,2025-04-01 09:00:00,retired,0.45,"{""n_estimators"": 300, ""max_depth"": 4, ""learning_rate"": 0.05}"
+3,churn_classifier,v3,2,gradient_boosting,2025-02-01,2025-03-25 11:00:00,2025-04-01 09:00:00,,production,0.4,"{""n_estimators"": 500, ""max_depth"": 5, ""learning_rate"": 0.03, ""scale_pos_weight"": 5}"
+4,churn_classifier,v4,3,lightgbm,2025-03-01,2025-04-22 10:00:00,,,shadow,0.35,"{""num_leaves"": 31, ""learning_rate"": 0.05, ""is_unbalance"": true}"
+5,upsell_propensity,v1,,logistic_regression,2025-02-01,2025-03-01 12:00:00,2025-03-10 09:00:00,,production,0.6,"{""C"": 0.5, ""penalty"": ""l1""}"
+6,upsell_propensity,v2,5,random_forest,2025-04-01,2025-05-02 12:00:00,,,archived,0.55,"{""n_estimators"": 200, ""max_depth"": 8}"

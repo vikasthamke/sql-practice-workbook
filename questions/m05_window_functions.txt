@@ -1,0 +1,1294 @@
+### SQL-058
+title: Number each user's sessions (ROW_NUMBER)
+difficulty: Easy
+primary: ROW_NUMBER with PARTITION BY
+secondary: window ordering with a tie-breaker
+concepts: row_number, partition_by, sessionization
+roles: DS
+time: 6
+dialect: BOTH
+tables: sessions(session_id, user_id, started_at); users(user_id, org_id)
+columns: user_id, session_id, started_at, session_seq
+compare: ordered
+@context
+To study onboarding, product analysts need each user's sessions numbered 1, 2, 3, ... in chronological order.
+@problem
+For users of organization 12, number every session in Q2 2025 per user (`session_seq`, starting at 1 within the quarter). Return `user_id`, `session_id`, `started_at`, `session_seq`, sorted by `user_id`, `session_seq`.
+@expected
+One row per session of organization 12's users in Q2 2025.
+@edge_cases
+- Two sessions of one user could start at the same second; add `session_id` to the window ORDER BY for a deterministic sequence.
+@hint1
+A window function computes a value per row from a set of related rows, without collapsing them.
+@hint2
+`ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY started_at, session_id)`.
+@hint3
+Filter the organization and quarter in WHERE; the numbering then restarts per user within the filtered rows.
+@solution
+SELECT s.user_id,
+       s.session_id,
+       s.started_at,
+       ROW_NUMBER() OVER (PARTITION BY s.user_id
+                          ORDER BY s.started_at, s.session_id) AS session_seq
+FROM sessions s
+JOIN users u ON u.user_id = s.user_id
+WHERE u.org_id = 12
+  AND s.started_at >= TIMESTAMP '2025-04-01 00:00:00'
+  AND s.started_at <  TIMESTAMP '2025-07-01 00:00:00'
+ORDER BY s.user_id, session_seq;
+@explanation
+- `PARTITION BY user_id` restarts the numbering for each user.
+- `ORDER BY started_at, session_id` defines the sequence, and the second key guarantees a strict order.
+- Window functions run **after** WHERE, GROUP BY and HAVING, so the numbering covers only the filtered rows (here: Q2 sessions). To number a user's sessions over their whole history and then show only Q2, compute the window in a subquery first, then filter.
+@mistakes
+- Expecting `session_seq = 1` to be the user's first session ever. It is only their first session within the filter.
+- Ordering only by `started_at`, which can return different numberings between runs when timestamps tie.
+@performance
+`sessions(user_id, started_at)` matches the partition and order keys, so the engine can avoid a separate sort.
+@interview
+The foundation of every "first/last/N-th per group" question.
+
+### SQL-059
+title: ROW_NUMBER vs RANK vs DENSE_RANK on tied counts
+difficulty: Medium
+primary: RANK and DENSE_RANK
+secondary: ties, ROW_NUMBER, window over an aggregate
+concepts: rank, dense_rank, row_number, window_agg
+roles: DS
+time: 10
+dialect: BOTH
+tables: order_items(order_id, product_id); orders(order_id, status, order_ts); products(product_id, product_name)
+columns: product_name, orders, row_num, rnk, dense_rnk
+compare: ordered
+@context
+Merchandising ranks products by how many completed 2025 orders contain them. Counts tie often, and the three ranking functions behave differently on ties.
+@problem
+For each product, count distinct completed orders placed in H1 2025 that contain it. Return the 12 best-ranked products with `orders` and the three rankings (`row_num`, `rnk`, `dense_rnk`) ordered by orders descending. `row_num` breaks ties by `product_name`.
+@expected
+12 rows; you should see tied `rnk` values, gaps after ties, and no gaps in `dense_rnk`.
+@edge_cases
+- With ties at the cut-off, "top 12" is ambiguous; ROW_NUMBER picks arbitrarily unless tie-broken.
+@hint1
+Aggregate first (orders per product), then rank the aggregated rows.
+@hint2
+Window functions can wrap aggregates: `RANK() OVER (ORDER BY COUNT(DISTINCT oi.order_id) DESC)`.
+@hint3
+Order the final output by `orders DESC, product_name` and LIMIT 12.
+@solution
+SELECT p.product_name,
+       COUNT(DISTINCT oi.order_id)                                                   AS orders,
+       ROW_NUMBER() OVER (ORDER BY COUNT(DISTINCT oi.order_id) DESC, p.product_name) AS row_num,
+       RANK()       OVER (ORDER BY COUNT(DISTINCT oi.order_id) DESC)                 AS rnk,
+       DENSE_RANK() OVER (ORDER BY COUNT(DISTINCT oi.order_id) DESC)                 AS dense_rnk
+FROM order_items oi
+JOIN orders o   ON o.order_id = oi.order_id
+JOIN products p ON p.product_id = oi.product_id
+WHERE o.status = 'completed'
+  AND o.order_ts >= TIMESTAMP '2025-01-01 00:00:00'
+  AND o.order_ts <  TIMESTAMP '2025-07-01 00:00:00'
+GROUP BY p.product_id, p.product_name
+ORDER BY orders DESC, p.product_name
+LIMIT 12;
+@explanation
+| function | ties | after a tie of two at position 3 |
+|---|---|---|
+| ROW_NUMBER | always distinct | 3, 4, 5 |
+| RANK | same rank | 3, 3, 5 (gap) |
+| DENSE_RANK | same rank | 3, 3, 4 (no gap) |
+
+Window functions are evaluated after GROUP BY, so they can rank aggregated values directly; no subquery is needed.
+
+Choose by business meaning: "top 3 products" with RANK may return more than 3 rows when tied (fair), ROW_NUMBER returns exactly 3 (arbitrary unless tie-broken), DENSE_RANK answers "the products with the 3 highest counts".
+@mistakes
+- Using ROW_NUMBER for leaderboards where ties should share a position.
+- Expecting `LIMIT` to respect ties; it does not.
+@performance
+One aggregation plus one sort for the windows (they share the same ordering).
+@interview
+Almost guaranteed in SQL interviews. Be ready to explain all three on a tie example.
+
+### SQL-060
+title: Top 2 products by revenue within each category
+difficulty: Medium
+primary: Top-N per group
+secondary: RANK in a derived table, filtering on a window result
+concepts: top_n_per_group, rank, partition_by, ds_top_products
+roles: DS
+time: 12
+dialect: BOTH
+tables: order_items(order_id, product_id, quantity, unit_price, discount_amount); orders(order_id, status, order_ts); products(product_id, product_name, category_id); product_categories(category_id, category_name)
+columns: category_name, product_name, net_revenue, rank_in_category
+compare: ordered
+@context
+Category managers want the two best-selling products (by net revenue from completed orders in H1 2025) in each category; ties should both be shown.
+@problem
+Return `category_name`, `product_name`, `net_revenue` and `rank_in_category` for products ranked 1 or 2 within their category. Sort by category, rank, product name.
+@expected
+About two rows per category (more if tied, fewer if a category sold only one product).
+@edge_cases
+- You cannot filter on a window function in WHERE of the same query level; wrap it in a subquery or CTE.
+@hint1
+Compute revenue per product first, then rank within category.
+@hint2
+`RANK() OVER (PARTITION BY category ORDER BY net_revenue DESC)`.
+@hint3
+Filter `WHERE rank_in_category <= 2` in an outer query.
+@solution
+WITH product_revenue AS (
+    SELECT pc.category_name,
+           p.product_name,
+           SUM(oi.quantity * oi.unit_price - oi.discount_amount) AS net_revenue
+    FROM order_items oi
+    JOIN orders o              ON o.order_id = oi.order_id
+    JOIN products p            ON p.product_id = oi.product_id
+    JOIN product_categories pc ON pc.category_id = p.category_id
+    WHERE o.status = 'completed'
+      AND o.order_ts >= TIMESTAMP '2025-01-01 00:00:00'
+      AND o.order_ts <  TIMESTAMP '2025-07-01 00:00:00'
+    GROUP BY pc.category_name, p.product_name
+),
+ranked AS (
+    SELECT category_name,
+           product_name,
+           net_revenue,
+           RANK() OVER (PARTITION BY category_name ORDER BY net_revenue DESC) AS rank_in_category
+    FROM product_revenue
+)
+SELECT category_name, product_name, net_revenue, rank_in_category
+FROM ranked
+WHERE rank_in_category <= 2
+ORDER BY category_name, rank_in_category, product_name;
+@explanation
+Logical query order: FROM → WHERE → GROUP BY → HAVING → **window functions** → SELECT → ORDER BY → LIMIT. Because windows are computed after WHERE, the filter on `rank_in_category` needs an outer query. Some warehouses offer `QUALIFY` for this; PostgreSQL and MySQL do not.
+
+RANK keeps ties (both tied products are shown); ROW_NUMBER would drop one arbitrarily.
+@mistakes
+- `WHERE RANK() OVER (...) <= 2`: syntax error.
+- `LIMIT 2` (applies to the whole result, not per category).
+@performance
+One aggregation and one partitioned sort; fine for thousands of products.
+@interview
+Top-N per group is the most common window-function interview task.
+
+### SQL-061
+title: What do new buyers buy first?
+difficulty: Medium
+primary: First record per entity with ROW_NUMBER
+secondary: deterministic tie-breaking, joining back to details
+concepts: row_number, top_n_per_group, partition_by, ds_top_products
+roles: DS
+time: 12
+dialect: BOTH
+tables: orders(order_id, user_id, status, order_ts); order_items(order_id, line_number, product_id); products(product_id, product_name)
+columns: product_name, first_purchases
+compare: ordered
+@context
+Growth wants to know which product most often starts a customer's purchase history, using the first line of each buyer's first completed order.
+@problem
+For every user, find their first completed order (earliest `order_ts`, ties broken by `order_id`) and take its line 1. Count users per product of that line and return the top 10 products (`product_name`, `first_purchases`), ties by name.
+@expected
+10 rows.
+@edge_cases
+- Without the `order_id` tie-breaker two orders at the same timestamp could both be "first".
+@hint1
+Rank each user's completed orders by time.
+@hint2
+`ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY order_ts, order_id) = 1` keeps exactly one order per user.
+@hint3
+Join that order to `order_items` with `line_number = 1` and then to `products`.
+@solution
+WITH first_orders AS (
+    SELECT order_id, user_id
+    FROM (
+        SELECT order_id,
+               user_id,
+               ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY order_ts, order_id) AS rn
+        FROM orders
+        WHERE status = 'completed'
+    ) x
+    WHERE rn = 1
+)
+SELECT p.product_name,
+       COUNT(*) AS first_purchases
+FROM first_orders f
+JOIN order_items oi ON oi.order_id = f.order_id AND oi.line_number = 1
+JOIN products p     ON p.product_id = oi.product_id
+GROUP BY p.product_name
+ORDER BY first_purchases DESC, p.product_name
+LIMIT 10;
+@explanation
+`ROW_NUMBER() ... = 1` is the standard "first row per group" pattern. Unlike `MIN(order_ts)` it returns the whole row (here the `order_id`), which can then be joined to details. Each user contributes exactly one first order, and each order exactly one line 1, so the final count is a count of users.
+@mistakes
+- Using `MIN(order_id)` as "first order". It works only if IDs are assigned chronologically, which is an assumption that should be stated.
+- Joining all lines of the first order, which counts multi-line orders several times.
+@performance
+`orders(user_id, order_ts)` serves the partitioned ordering.
+@interview
+Expect follow-ups such as "now the second order" or "the most common first-to-second product transition".
+
+### SQL-062
+title: Average time between purchases (LAG)
+difficulty: Medium
+primary: LAG
+secondary: per-dialect timestamp difference, averaging gaps
+concepts: lag_lead, partition_by, date_functions, ds_analysis_dataset
+roles: DS
+time: 12
+dialect: BOTH
+tables: orders(user_id, status, order_ts)
+columns: user_id, completed_orders, avg_days_between_orders, max_days_between_orders
+compare: ordered
+@context
+The lifecycle team plans re-engagement e-mails based on how long repeat buyers usually wait between purchases.
+@problem
+For users with at least 4 completed orders, compute the gap in days between consecutive completed orders and return `user_id`, `completed_orders`, the average gap and the longest gap (both in days, 1 decimal). Sort by `avg_days_between_orders`, then `user_id`.
+@expected
+One row per user with ≥ 4 completed orders.
+@edge_cases
+- The first order of each user has no previous order; LAG returns NULL and AVG ignores it, which is correct (n orders → n − 1 gaps).
+@hint1
+Put the previous order's timestamp on each row.
+@hint2
+`LAG(order_ts) OVER (PARTITION BY user_id ORDER BY order_ts, order_id)`.
+@hint3
+Seconds between timestamps: PostgreSQL `EXTRACT(EPOCH FROM a - b)`, MySQL `TIMESTAMPDIFF(SECOND, b, a)`; divide by 86400.
+@solution_pg
+SELECT user_id,
+       COUNT(*)                                       AS completed_orders,
+       ROUND(AVG(gap_days), 1)                        AS avg_days_between_orders,
+       ROUND(MAX(gap_days), 1)                        AS max_days_between_orders
+FROM (
+    SELECT user_id,
+           EXTRACT(EPOCH FROM order_ts - LAG(order_ts) OVER (PARTITION BY user_id
+                                                             ORDER BY order_ts, order_id)) / 86400 AS gap_days
+    FROM orders
+    WHERE status = 'completed'
+) g
+GROUP BY user_id
+HAVING COUNT(*) >= 4
+ORDER BY avg_days_between_orders, user_id;
+@solution_mysql
+SELECT user_id,
+       COUNT(*)                                       AS completed_orders,
+       ROUND(AVG(gap_days), 1)                        AS avg_days_between_orders,
+       ROUND(MAX(gap_days), 1)                        AS max_days_between_orders
+FROM (
+    SELECT user_id,
+           TIMESTAMPDIFF(SECOND,
+                         LAG(order_ts) OVER (PARTITION BY user_id ORDER BY order_ts, order_id),
+                         order_ts) / 86400 AS gap_days
+    FROM orders
+    WHERE status = 'completed'
+) g
+GROUP BY user_id
+HAVING COUNT(*) >= 4
+ORDER BY avg_days_between_orders, user_id;
+@explanation
+LAG reads a value from the previous row of the same partition, in window order. Subtracting it from the current value gives inter-purchase gaps. The outer query aggregates: `COUNT(*)` counts all orders (including the first), and AVG/MAX ignore the first order's NULL gap.
+
+Duration is computed in seconds and converted to days, avoiding the truncation of whole-day differences.
+@mistakes
+- Computing `(last − first) / count`: the denominator should be the number of gaps (count − 1).
+- Using `DATEDIFF` in MySQL, which counts calendar-date boundaries, not elapsed time.
+@performance
+One partitioned sort supported by the `orders(user_id, order_ts)` index.
+@interview
+LAG/LEAD questions usually involve differences between consecutive events; the per-dialect duration functions are a common stumbling block.
+
+### SQL-063
+title: Running revenue total for Q1 2025
+difficulty: Medium
+primary: Running totals
+secondary: aggregate first then window, default frame semantics
+concepts: running_total, window_frame, window_agg, date_bucketing
+roles: DS
+time: 10
+dialect: BOTH
+tables: orders(status, order_total, order_ts)
+columns: order_date, revenue, cumulative_revenue
+compare: ordered
+@context
+Finance tracks progress toward the quarterly target with a cumulative revenue curve.
+@problem
+For each day in Q1 2025 with completed orders, return `order_date`, the day's `revenue`, and `cumulative_revenue` since 2025-01-01. Sort by date.
+@expected
+One row per day with completed orders; `cumulative_revenue` never decreases and ends at Q1's total.
+@edge_cases
+- With `ORDER BY` in the window and no explicit frame, the default is `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`, which includes all **peers** (rows with the same ORDER BY value). Running a running sum over raw orders ordered by date would therefore jump by whole days.
+@hint1
+Aggregate to one row per day first.
+@hint2
+`SUM(revenue) OVER (ORDER BY order_date ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)`.
+@hint3
+A window function can wrap an aggregate: `SUM(SUM(order_total)) OVER (ORDER BY ...)` in a grouped query.
+@solution
+SELECT CAST(order_ts AS DATE)                                       AS order_date,
+       SUM(order_total)                                             AS revenue,
+       SUM(SUM(order_total)) OVER (ORDER BY CAST(order_ts AS DATE)
+                                   ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS cumulative_revenue
+FROM orders
+WHERE status = 'completed'
+  AND order_ts >= TIMESTAMP '2025-01-01 00:00:00'
+  AND order_ts <  TIMESTAMP '2025-04-01 00:00:00'
+GROUP BY CAST(order_ts AS DATE)
+ORDER BY order_date;
+@explanation
+The query groups by day, then the window sums the daily sums in date order. `SUM(SUM(x)) OVER (...)` looks odd but is standard: the inner SUM is the GROUP BY aggregate, the outer SUM is the window function over the grouped rows.
+
+Writing the frame explicitly (`ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`) documents intent and avoids the RANGE-peers surprise. Since dates are unique after grouping, ROWS and RANGE give the same result here.
+@mistakes
+- Running total over raw orders with `ORDER BY CAST(order_ts AS DATE)`: all orders of a day get the day's end-of-day total (peers).
+- Forgetting ORDER BY in the window, which yields the grand total on every row.
+@performance
+One aggregation + one sort of ≤ 90 rows.
+@interview
+"Why does my running total jump?" usually means RANGE peers; knowing the default frame is a senior signal.
+
+### SQL-064
+title: Remove duplicate events before counting
+difficulty: Medium
+primary: Deduplication with ROW_NUMBER
+secondary: defining a duplicate key, comparing raw and clean counts
+concepts: dedup_window, row_number, partition_by, ds_duplicates, ml_duplicate_examples
+roles: DS, MLE
+time: 12
+dialect: BOTH
+tables: events(event_id, user_id, session_id, event_name, event_ts)
+columns: event_name, raw_events, deduped_events, duplicates
+compare: ordered
+@context
+Client retries create duplicate events: same user, session, event name and timestamp, but a different `event_id`. Product metrics must count each real action once.
+@problem
+For June 2025, return per `event_name`: raw count, deduplicated count, and number of duplicates. Keep the row with the smallest `event_id` in each duplicate group. Sort by `raw_events` descending, then name.
+@expected
+One row per event type seen in June 2025.
+@edge_cases
+- Server-side events have `session_id IS NULL`; PARTITION BY treats NULLs as one group, which is correct here (the key also includes user and timestamp).
+@hint1
+Define the duplicate key: `(user_id, session_id, event_name, event_ts)`.
+@hint2
+Number rows within each key: `ROW_NUMBER() OVER (PARTITION BY <key> ORDER BY event_id)`.
+@hint3
+`deduped_events = SUM(CASE WHEN rn = 1 THEN 1 ELSE 0 END)`.
+@solution
+SELECT event_name,
+       COUNT(*)                                  AS raw_events,
+       SUM(CASE WHEN rn = 1 THEN 1 ELSE 0 END)   AS deduped_events,
+       SUM(CASE WHEN rn > 1 THEN 1 ELSE 0 END)   AS duplicates
+FROM (
+    SELECT event_name,
+           ROW_NUMBER() OVER (PARTITION BY user_id, session_id, event_name, event_ts
+                              ORDER BY event_id) AS rn
+    FROM events
+    WHERE event_ts >= TIMESTAMP '2025-06-01 00:00:00'
+      AND event_ts <  TIMESTAMP '2025-07-01 00:00:00'
+) e
+GROUP BY event_name
+ORDER BY raw_events DESC, event_name;
+@explanation
+ROW_NUMBER over the duplicate key gives 1 to the surviving row and 2, 3, ... to the copies. Keeping `rn = 1` deduplicates without losing any column (unlike `SELECT DISTINCT`, which only works when *every* selected column is identical). Ordering by `event_id` makes the survivor deterministic.
+
+Unlike `=`, PARTITION BY (like GROUP BY) puts NULL keys in the same group, so two server events with `session_id` NULL and otherwise equal keys are recognized as duplicates.
+
+**ML angle:** duplicated events inflate count features (`events_28d`), and duplicated training rows over-weight some examples; deduplicate at ingestion and test for it (SQL-097).
+@mistakes
+- `SELECT DISTINCT *`: event IDs differ, so nothing is removed.
+- Choosing the survivor without ORDER BY: non-deterministic.
+@performance
+A sort over the June events by the four key columns; an index on `(user_id, event_ts)` helps partially.
+@interview
+"Delete duplicates but keep one" is a top-10 SQL task; window-based dedup is the expected answer.
+
+### SQL-065
+title: 7-day moving average of daily active users
+difficulty: Hard
+primary: Moving averages with ROWS frames
+secondary: date spine to avoid gaps, partial windows
+concepts: moving_avg, window_frame, time_series, recursive_cte, ds_mau
+roles: DS
+time: 18
+dialect: BOTH
+tables: events(user_id, event_ts)
+columns: day, dau, days_in_window, dau_7d_avg
+compare: ordered
+@context
+The DAU chart is noisy because weekends are quiet. The team wants a 7-day trailing average for Q2 2025, published only when a full week of data is available.
+@problem
+For each day of Q2 2025, return `day`, `dau`, `days_in_window` (number of days in the trailing 7-day window, ≤ 7) and `dau_7d_avg` (2 decimals), which is NULL when the window has fewer than 7 days. Days without events must count as 0 DAU.
+@expected
+91 rows; the first 6 rows have NULL averages.
+@edge_cases
+- A `ROWS BETWEEN 6 PRECEDING` frame counts *rows*, not days. If a day were missing from the data, the window would silently stretch across 8+ calendar days. Building a date spine guarantees one row per day.
+@hint1
+Generate every day of the quarter, then attach DAU.
+@hint2
+Use a recursive date spine (SQL-053) LEFT JOINed to a per-day `COUNT(DISTINCT user_id)`.
+@hint3
+`AVG(dau) OVER w` and `COUNT(*) OVER w` with `WINDOW w AS (ORDER BY day ROWS BETWEEN 6 PRECEDING AND CURRENT ROW)`.
+@solution
+WITH RECURSIVE spine AS (
+    SELECT DATE '2025-04-01' AS day
+    UNION ALL
+    SELECT CAST(day + INTERVAL '1' DAY AS DATE) FROM spine WHERE day < DATE '2025-06-30'
+),
+daily AS (
+    SELECT CAST(event_ts AS DATE) AS day, COUNT(DISTINCT user_id) AS dau
+    FROM events
+    WHERE event_ts >= TIMESTAMP '2025-04-01 00:00:00'
+      AND event_ts <  TIMESTAMP '2025-07-01 00:00:00'
+    GROUP BY CAST(event_ts AS DATE)
+),
+filled AS (
+    SELECT s.day, COALESCE(d.dau, 0) AS dau
+    FROM spine s
+    LEFT JOIN daily d ON d.day = s.day
+)
+SELECT day,
+       dau,
+       COUNT(*) OVER w AS days_in_window,
+       CASE WHEN COUNT(*) OVER w = 7 THEN ROUND(AVG(dau) OVER w, 2) END AS dau_7d_avg
+FROM filled
+WINDOW w AS (ORDER BY day ROWS BETWEEN 6 PRECEDING AND CURRENT ROW)
+ORDER BY day;
+@assert
+len(rows) == 91
+rows[5][3] is None and rows[6][3] is not None
+@explanation
+1. The spine makes "7 rows" equal "7 calendar days".
+2. The named window `w` (supported by both engines) is reused for the count and the average, which keeps the frame definition in one place.
+3. The CASE suppresses averages over incomplete windows at the start of the range. Alternatively, start the spine 6 days earlier and filter afterwards.
+
+`AVG` over an integer column returns NUMERIC/DECIMAL in both engines, so ROUND works.
+@mistakes
+- Moving average over raw data with gaps.
+- Mixing up `6 PRECEDING` (7 rows including current) and `7 PRECEDING` (8 rows).
+@performance
+91 rows; the expensive part is the distinct count over the quarter's events.
+@interview
+Frames (`ROWS` vs `RANGE`, preceding/following) and gaps are the core of time-series SQL questions.
+
+### SQL-066
+title: Gaps and overlaps in subscription history (LAG)
+difficulty: Hard
+primary: LAG over intervals
+secondary: classifying consecutive periods, NULL-aware comparisons
+concepts: lag_lead, gaps_islands, ds_duplicates, ds_churn_cohort
+roles: DS
+time: 15
+dialect: BOTH
+tables: subscriptions(subscription_id, org_id, started_at, ended_at)
+columns: org_id, prev_subscription_id, subscription_id, prev_ended_at, started_at, relation
+compare: ordered
+@context
+Revenue operations audits subscription histories. Consecutive periods of one organization should be **contiguous** (next start = previous end). A **gap** means the customer churned and came back; an **overlap** is a billing bug.
+@problem
+For each subscription that has a predecessor within the same organization (ordered by `started_at`, then `subscription_id`), classify the relation to the predecessor as `'contiguous'`, `'gap'` or `'overlap'`. Return only gaps and overlaps with `org_id`, `prev_subscription_id`, `subscription_id`, `prev_ended_at`, `started_at`, `relation`. Sort by `org_id`, `started_at`.
+@expected
+A few overlaps (the known bug) and the reactivation gaps.
+@edge_cases
+- A predecessor that is still open (`ended_at IS NULL`) while a newer period starts is also an overlap.
+@hint1
+Bring the previous period's ID and end onto each row.
+@hint2
+`LAG(ended_at) OVER (PARTITION BY org_id ORDER BY started_at, subscription_id)`.
+@hint3
+`CASE WHEN prev_ended_at IS NULL OR started_at < prev_ended_at THEN 'overlap' WHEN started_at > prev_ended_at THEN 'gap' ELSE 'contiguous' END`, applied only where a predecessor exists.
+@solution
+SELECT org_id, prev_subscription_id, subscription_id, prev_ended_at, started_at, relation
+FROM (
+    SELECT org_id,
+           subscription_id,
+           started_at,
+           prev_subscription_id,
+           prev_ended_at,
+           CASE WHEN prev_ended_at IS NULL OR started_at < prev_ended_at THEN 'overlap'
+                WHEN started_at > prev_ended_at THEN 'gap'
+                ELSE 'contiguous'
+           END AS relation
+    FROM (
+        SELECT org_id,
+               subscription_id,
+               started_at,
+               LAG(subscription_id) OVER (PARTITION BY org_id ORDER BY started_at, subscription_id) AS prev_subscription_id,
+               LAG(ended_at)        OVER (PARTITION BY org_id ORDER BY started_at, subscription_id) AS prev_ended_at
+        FROM subscriptions
+    ) w
+    WHERE prev_subscription_id IS NOT NULL
+) c
+WHERE relation <> 'contiguous'
+ORDER BY org_id, started_at;
+@explanation
+LAG brings two columns of the previous period onto each row. Rows without a predecessor are removed with `prev_subscription_id IS NOT NULL`: testing `prev_ended_at` would be wrong, because a NULL end means "still open". Then the comparison of the current start with the previous end classifies the boundary.
+
+The order of CASE branches matters: the open-predecessor case is handled first, because `started_at < NULL` is UNKNOWN and would fall through.
+
+Only consecutive pairs are compared. A period overlapping a period two steps back would need an interval self join (the overlap check in SQL-141).
+@mistakes
+- Filtering `prev_ended_at IS NOT NULL` and losing overlaps with open predecessors.
+- Ordering by `subscription_id` instead of `started_at` (IDs were renumbered by start time here, but that is not guaranteed in general).
+@performance
+`subscriptions(org_id, started_at)` matches the window.
+@interview
+Interval comparisons with LAG come up in billing, HR (employment periods) and IoT (device states).
+
+### SQL-067
+title: First and latest ticket category per account
+difficulty: Medium
+primary: FIRST_VALUE and LAST_VALUE
+secondary: frame needed for LAST_VALUE, DISTINCT over window output
+concepts: first_last_value, window_frame, partition_by
+roles: DS
+time: 12
+dialect: BOTH
+tables: support_tickets(ticket_id, org_id, created_at, category); organizations(org_id, segment)
+columns: org_id, tickets, first_category, latest_category
+compare: ordered
+@context
+Account reviews mention how a customer's support needs evolved: what they first contacted support about, and what they contact support about now.
+@problem
+For Enterprise organizations with tickets, return `org_id`, total `tickets`, `first_category` (category of the earliest ticket) and `latest_category` (category of the most recent ticket). Order tickets by `created_at`, then `ticket_id`. Sort the output by `org_id`.
+@expected
+One row per Enterprise organization with tickets.
+@edge_cases
+- **LAST_VALUE trap:** with the default frame (`... AND CURRENT ROW`) LAST_VALUE returns the *current* row's value. You need a frame that reaches the end of the partition.
+@hint1
+Both functions read a value from a specific row of the ordered partition.
+@hint2
+Specify `ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING` for LAST_VALUE.
+@hint3
+Every row of a partition then carries the same three values; collapse with DISTINCT (or GROUP BY).
+@solution
+SELECT DISTINCT
+       t.org_id,
+       COUNT(*)          OVER (PARTITION BY t.org_id) AS tickets,
+       FIRST_VALUE(t.category) OVER (PARTITION BY t.org_id ORDER BY t.created_at, t.ticket_id
+                                     ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS first_category,
+       LAST_VALUE(t.category)  OVER (PARTITION BY t.org_id ORDER BY t.created_at, t.ticket_id
+                                     ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS latest_category
+FROM support_tickets t
+JOIN organizations o ON o.org_id = t.org_id
+WHERE o.segment = 'Enterprise'
+ORDER BY t.org_id;
+@explanation
+FIRST_VALUE works with the default frame because the first row is always inside it. LAST_VALUE does not: the default frame stops at the current row, so the "last" value is just the current one. An explicit frame spanning the whole partition fixes that. An equivalent and often clearer trick is `FIRST_VALUE(category) OVER (... ORDER BY created_at DESC, ticket_id DESC)`.
+
+The window results are identical on every row of a partition, so DISTINCT collapses them to one row per organization. The `COUNT(*) OVER (PARTITION BY org_id)` is a window aggregate, so no GROUP BY is needed.
+@mistakes
+- LAST_VALUE without a frame.
+- Ordering by `created_at` only: if two tickets share a timestamp, first and last can change between runs.
+@performance
+Two windows share the same partitioning and ordering, so a single sort serves both.
+@interview
+The LAST_VALUE frame trap is a well-known "gotcha"; explaining *why* scores points.
+
+### SQL-068
+title: Customer value deciles (NTILE)
+difficulty: Medium
+primary: NTILE
+secondary: bucket summaries, revenue share per bucket
+concepts: ntile, window_agg, ratios, ds_segments, pareto
+roles: DS
+time: 12
+dialect: BOTH
+tables: orders(user_id, status, order_total)
+columns: decile, buyers, min_ltv, max_ltv, revenue, revenue_share_pct
+compare: ordered
+@context
+Marketing segments buyers into deciles by lifetime value (sum of completed orders) to target the top groups with loyalty offers.
+@problem
+Assign every buyer to a decile with `NTILE(10)` ordered by lifetime value descending (decile 1 = top 10%). Return per decile: `buyers`, `min_ltv`, `max_ltv`, total `revenue` and `revenue_share_pct` of all buyer revenue (1 decimal). Sort by decile.
+@expected
+10 rows; decile 1 holds a disproportionate share of revenue.
+@edge_cases
+- NTILE splits rows as evenly as possible. When the count is not divisible by 10, the first buckets get one extra row.
+- Ties at bucket boundaries are split arbitrarily unless the ORDER BY is made unique.
+@hint1
+Compute lifetime value per buyer first.
+@hint2
+`NTILE(10) OVER (ORDER BY ltv DESC, user_id)`.
+@hint3
+Share of total = `SUM(revenue) / SUM(SUM(revenue)) OVER ()` in the grouped query.
+@solution
+WITH ltv AS (
+    SELECT user_id, SUM(order_total) AS ltv
+    FROM orders
+    WHERE status = 'completed'
+    GROUP BY user_id
+),
+bucketed AS (
+    SELECT user_id, ltv,
+           NTILE(10) OVER (ORDER BY ltv DESC, user_id) AS decile
+    FROM ltv
+)
+SELECT decile,
+       COUNT(*)                                                    AS buyers,
+       MIN(ltv)                                                    AS min_ltv,
+       MAX(ltv)                                                    AS max_ltv,
+       SUM(ltv)                                                    AS revenue,
+       ROUND(100.0 * SUM(ltv) / SUM(SUM(ltv)) OVER (), 1)          AS revenue_share_pct
+FROM bucketed
+GROUP BY decile
+ORDER BY decile;
+@assert
+len(rows) == 10
+num(rows[0][5]) > 30
+@explanation
+NTILE(n) divides the ordered rows into n buckets of (almost) equal **row count**. It is a rank-based segmentation, not a value-based one: two users with the same LTV can land in different deciles, and decile boundaries do not correspond to round numbers.
+
+`SUM(SUM(ltv)) OVER ()` is the grand total over all groups (an empty OVER means "all rows"), which turns each decile's revenue into a share. The skew of decile 1 is the Pareto pattern explored further in SQL-087.
+@mistakes
+- Using NTILE on raw orders instead of on users.
+- Interpreting deciles as equal-width value ranges.
+@performance
+One sort over buyers; trivial size.
+@interview
+NTILE often appears in segmentation questions; candidates should mention that ties split arbitrarily.
+
+### SQL-069
+title: Month-over-month revenue change
+difficulty: Medium
+primary: Period-over-period comparison with LAG
+secondary: monthly buckets per dialect, percent change with NULL guard
+concepts: period_over_period, lag_lead, date_bucketing, ds_mom_revenue
+roles: DS
+time: 12
+dialect: BOTH
+tables: orders(status, order_total, order_ts)
+columns: month_start, revenue, prev_month_revenue, mom_change_pct
+compare: ordered
+@context
+The monthly business review shows completed-order revenue with the change versus the previous month.
+@problem
+For each month from January 2024 to June 2025, return `month_start`, `revenue`, `prev_month_revenue` and `mom_change_pct` ((revenue − previous) / previous x 100, 1 decimal). The first month has NULLs.
+@expected
+18 rows.
+@edge_cases
+- LAG takes the previous *row*, which is the previous month only if no month is missing. Every month here has revenue, but a production query would build a month spine first.
+- A previous revenue of 0 would divide by zero; NULLIF guards it.
+@hint1
+Aggregate to one row per month, then apply LAG over the months.
+@hint2
+PostgreSQL `DATE_TRUNC('month', ...)`; MySQL `DATE_FORMAT(..., '%Y-%m-01')`.
+@hint3
+`ROUND(100.0 * (revenue - prev) / NULLIF(prev, 0), 1)`.
+@solution_pg
+WITH monthly AS (
+    SELECT CAST(DATE_TRUNC('month', order_ts) AS DATE) AS month_start,
+           SUM(order_total)                            AS revenue
+    FROM orders
+    WHERE status = 'completed'
+      AND order_ts >= TIMESTAMP '2024-01-01 00:00:00'
+      AND order_ts <  TIMESTAMP '2025-07-01 00:00:00'
+    GROUP BY DATE_TRUNC('month', order_ts)
+)
+SELECT month_start,
+       revenue,
+       LAG(revenue) OVER (ORDER BY month_start)                                    AS prev_month_revenue,
+       ROUND(100.0 * (revenue - LAG(revenue) OVER (ORDER BY month_start))
+             / NULLIF(LAG(revenue) OVER (ORDER BY month_start), 0), 1)             AS mom_change_pct
+FROM monthly
+ORDER BY month_start;
+@solution_mysql
+WITH monthly AS (
+    SELECT CAST(DATE_FORMAT(order_ts, '%Y-%m-01') AS DATE) AS month_start,
+           SUM(order_total)                                AS revenue
+    FROM orders
+    WHERE status = 'completed'
+      AND order_ts >= TIMESTAMP '2024-01-01 00:00:00'
+      AND order_ts <  TIMESTAMP '2025-07-01 00:00:00'
+    GROUP BY CAST(DATE_FORMAT(order_ts, '%Y-%m-01') AS DATE)
+)
+SELECT month_start,
+       revenue,
+       LAG(revenue) OVER (ORDER BY month_start)                                    AS prev_month_revenue,
+       ROUND(100.0 * (revenue - LAG(revenue) OVER (ORDER BY month_start))
+             / NULLIF(LAG(revenue) OVER (ORDER BY month_start), 0), 1)             AS mom_change_pct
+FROM monthly
+ORDER BY month_start;
+@explanation
+The CTE fixes the grain at one row per month; LAG then reads the previous month's value. LAG is repeated three times for clarity; the engine computes the window once. For a "same month last year" comparison, use `LAG(revenue, 12)` on a gap-free month spine.
+
+Month-over-month changes on small numbers are volatile; reviewers often prefer 3-month rolling sums or year-over-year comparisons for seasonal businesses.
+@mistakes
+- LAG over raw orders (gives the previous *order*, not month).
+- Integer division in the percentage (PostgreSQL) when revenue is an integer type.
+@performance
+18-row window; the cost is the monthly aggregation.
+@interview
+Expect "what if a month has no sales?", which calls for a spine and COALESCE before LAG.
+
+### SQL-070
+title: Rebuild sessions from raw events (30-minute inactivity rule)
+difficulty: Hard
+primary: Sessionization with LAG and a running sum
+secondary: portable interval comparison, flags → cumulative IDs
+concepts: sessionization, lag_lead, running_total, ml_historical_features
+roles: DS, MLE
+time: 20
+dialect: BOTH
+tables: events(user_id, event_ts)
+columns: user_id, events, derived_sessions, avg_events_per_session
+compare: ordered
+@context
+The client's session IDs are unreliable (server events have none, and mobile clients reuse IDs). Analytics defines a session as a run of a user's events with no gap longer than 30 minutes.
+@problem
+For June 2025, rebuild sessions from `events` alone. For the 10 users with the most events, return `user_id`, `events`, `derived_sessions` and `avg_events_per_session` (2 decimals). Sort by `events` descending, then `user_id`.
+@expected
+10 rows.
+@edge_cases
+- The first event of each user always starts a session (LAG is NULL).
+- A gap of exactly 30 minutes stays in the same session (`>` not `>=`).
+@hint1
+Mark each event that starts a new session with 1, others with 0.
+@hint2
+`CASE WHEN prev_ts IS NULL OR event_ts > prev_ts + INTERVAL '30' MINUTE THEN 1 ELSE 0 END`.
+@hint3
+A running `SUM(flag) OVER (PARTITION BY user_id ORDER BY event_ts ...)` turns flags into session numbers; count distinct numbers per user.
+@solution
+WITH ordered AS (
+    SELECT user_id,
+           event_ts,
+           LAG(event_ts) OVER (PARTITION BY user_id ORDER BY event_ts, event_id) AS prev_ts,
+           event_id
+    FROM events
+    WHERE event_ts >= TIMESTAMP '2025-06-01 00:00:00'
+      AND event_ts <  TIMESTAMP '2025-07-01 00:00:00'
+),
+flagged AS (
+    SELECT user_id, event_ts, event_id,
+           CASE WHEN prev_ts IS NULL OR event_ts > prev_ts + INTERVAL '30' MINUTE
+                THEN 1 ELSE 0 END AS new_session
+    FROM ordered
+),
+numbered AS (
+    SELECT user_id,
+           SUM(new_session) OVER (PARTITION BY user_id ORDER BY event_ts, event_id
+                                  ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS session_no
+    FROM flagged
+)
+SELECT user_id,
+       COUNT(*)                                       AS events,
+       COUNT(DISTINCT session_no)                     AS derived_sessions,
+       ROUND(1.0 * COUNT(*) / COUNT(DISTINCT session_no), 2) AS avg_events_per_session
+FROM numbered
+GROUP BY user_id
+ORDER BY events DESC, user_id
+LIMIT 10;
+@explanation
+Sessionization is a two-window pattern:
+1. **LAG** compares each event with the previous one of the same user and sets a `new_session` flag.
+2. A **running SUM** of the flags assigns the same number to all events of one session (1, 1, 1, 2, 2, 3, ...).
+
+Comparing `event_ts > prev_ts + INTERVAL '30' MINUTE` is portable (no engine-specific date-diff function). The tie-breaker `event_id` keeps duplicate timestamps in a stable order.
+
+**ML angle:** the same pattern produces "sessions in the last 7 days" features from raw logs when upstream session IDs cannot be trusted.
+@mistakes
+- Using RANGE frames (the default) with duplicate timestamps: peers share a running sum, which is harmless here but surprising elsewhere.
+- Applying the 30-minute rule across users (missing PARTITION BY).
+@performance
+A sort by (user, time) over June's events; the `events(user_id, event_ts)` index provides that order.
+@interview
+Sessionization is a classic analytics-engineering question; a clear "flag then cumulative sum" explanation is the expected answer.
+
+### SQL-071
+title: Revenue share within segment and of the total
+difficulty: Medium
+primary: Aggregates used as window functions
+secondary: partitioned totals, nested aggregate windows
+concepts: window_agg, partition_by, ratios, ds_segments
+roles: DS
+time: 10
+dialect: BOTH
+tables: orders(org_id, status, order_total, order_ts); organizations(org_id, segment, country_code)
+columns: segment, country_code, revenue, pct_of_segment, pct_of_total
+compare: ordered
+@context
+Regional sales leads compare their countries within each customer segment and against the whole business for H1 2025.
+@problem
+Return revenue from completed H1-2025 orders per `(segment, country_code)`, its share of the segment's revenue and of total revenue (1 decimal each). Sort by segment, then revenue descending, then country.
+@expected
+One row per segment-country combination with revenue.
+@edge_cases
+- `pct_of_segment` sums to 100 within each segment (up to rounding); `pct_of_total` sums to 100 overall.
+@hint1
+Group by segment and country first.
+@hint2
+`SUM(SUM(order_total)) OVER (PARTITION BY segment)` is the segment total next to each group.
+@hint3
+`SUM(SUM(order_total)) OVER ()` is the grand total.
+@solution
+SELECT g.segment,
+       g.country_code,
+       SUM(o.order_total)                                                                 AS revenue,
+       ROUND(100.0 * SUM(o.order_total) / SUM(SUM(o.order_total)) OVER (PARTITION BY g.segment), 1) AS pct_of_segment,
+       ROUND(100.0 * SUM(o.order_total) / SUM(SUM(o.order_total)) OVER (), 1)                       AS pct_of_total
+FROM orders o
+JOIN organizations g ON g.org_id = o.org_id
+WHERE o.status = 'completed'
+  AND o.order_ts >= TIMESTAMP '2025-01-01 00:00:00'
+  AND o.order_ts <  TIMESTAMP '2025-07-01 00:00:00'
+GROUP BY g.segment, g.country_code
+ORDER BY g.segment, revenue DESC, g.country_code;
+@explanation
+Window aggregates compute group totals without collapsing rows, so a share is a simple division. In a grouped query, the window sees the grouped rows; `SUM(SUM(x)) OVER (PARTITION BY segment)` sums the per-country sums within each segment. An empty `OVER ()` spans all grouped rows.
+@mistakes
+- Computing shares in application code after exporting, which tends to diverge from SQL when filters change.
+- `SUM(o.order_total) OVER (PARTITION BY segment)` (without the inner aggregate) in a grouped query: an error, because `order_total` is not grouped.
+@performance
+One aggregation; windows over a few dozen rows.
+@interview
+Shows comfort with combining GROUP BY and window functions in one SELECT.
+
+### SQL-072
+title: Cumulative CSAT done right (weighted running average)
+difficulty: Hard
+primary: Cumulative averages
+secondary: average of averages vs pooled average, running sums of numerator and denominator
+concepts: cumulative_avg, running_total, window_agg, ds_analysis_dataset
+roles: DS
+time: 15
+dialect: BOTH
+tables: support_tickets(created_at, csat_score)
+columns: month_start, rated, monthly_avg, naive_cumulative_avg, cumulative_avg
+compare: ordered
+@context
+The support dashboard shows the cumulative average CSAT since January 2024. A first version averaged the monthly averages, which gives a small month the same weight as a busy one.
+@problem
+For each month (by ticket `created_at`) from 2024-01 to 2025-06, return `month_start`, `rated` (tickets with CSAT), `monthly_avg`, `naive_cumulative_avg` (running average of monthly averages) and `cumulative_avg` (all ratings so far pooled). Averages with 3 decimals.
+@expected
+18 rows; the two cumulative columns differ.
+@edge_cases
+- Months with few ratings move the naive average disproportionately.
+@hint1
+Keep both the numerator (sum of scores) and denominator (count of ratings) per month.
+@hint2
+Pooled running average = running `SUM(score_sum)` / running `SUM(rated)`.
+@hint3
+Naive version = `AVG(monthly_avg) OVER (ORDER BY month ROWS UNBOUNDED PRECEDING)`.
+@solution_pg
+WITH monthly AS (
+    SELECT CAST(DATE_TRUNC('month', created_at) AS DATE) AS month_start,
+           COUNT(csat_score)                             AS rated,
+           SUM(csat_score)                               AS score_sum
+    FROM support_tickets
+    WHERE created_at >= TIMESTAMP '2024-01-01 00:00:00'
+      AND created_at <  TIMESTAMP '2025-07-01 00:00:00'
+    GROUP BY DATE_TRUNC('month', created_at)
+)
+SELECT month_start,
+       rated,
+       ROUND(1.0 * score_sum / NULLIF(rated, 0), 3)                                   AS monthly_avg,
+       ROUND(AVG(1.0 * score_sum / NULLIF(rated, 0))
+             OVER (ORDER BY month_start ROWS UNBOUNDED PRECEDING), 3)                  AS naive_cumulative_avg,
+       ROUND(1.0 * SUM(score_sum) OVER (ORDER BY month_start ROWS UNBOUNDED PRECEDING)
+             / NULLIF(SUM(rated) OVER (ORDER BY month_start ROWS UNBOUNDED PRECEDING), 0), 3) AS cumulative_avg
+FROM monthly
+ORDER BY month_start;
+@solution_mysql
+WITH monthly AS (
+    SELECT CAST(DATE_FORMAT(created_at, '%Y-%m-01') AS DATE) AS month_start,
+           COUNT(csat_score)                                 AS rated,
+           SUM(csat_score)                                   AS score_sum
+    FROM support_tickets
+    WHERE created_at >= TIMESTAMP '2024-01-01 00:00:00'
+      AND created_at <  TIMESTAMP '2025-07-01 00:00:00'
+    GROUP BY CAST(DATE_FORMAT(created_at, '%Y-%m-01') AS DATE)
+)
+SELECT month_start,
+       rated,
+       ROUND(1.0 * score_sum / NULLIF(rated, 0), 3)                                   AS monthly_avg,
+       ROUND(AVG(1.0 * score_sum / NULLIF(rated, 0))
+             OVER (ORDER BY month_start ROWS UNBOUNDED PRECEDING), 3)                  AS naive_cumulative_avg,
+       ROUND(1.0 * SUM(score_sum) OVER (ORDER BY month_start ROWS UNBOUNDED PRECEDING)
+             / NULLIF(SUM(rated) OVER (ORDER BY month_start ROWS UNBOUNDED PRECEDING), 0), 3) AS cumulative_avg
+FROM monthly
+ORDER BY month_start;
+@explanation
+A cumulative average must pool all observations so far: Σ scores / Σ ratings. The naive running average of monthly averages weights each month equally regardless of volume. In early 2024, when few tickets were rated, a single month can swing the naive value noticeably.
+
+Carrying sums and counts (instead of averages) through every aggregation level keeps metrics re-aggregatable. That principle also underlies OLAP cubes and incremental metric pipelines.
+
+`ROWS UNBOUNDED PRECEDING` is shorthand for `ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`.
+@mistakes
+- Averaging averages (again, see SQL-028).
+- Dividing integer sums in PostgreSQL without `1.0 *`.
+@performance
+18 rows; trivial.
+@interview
+A good discriminator between mechanical and statistical thinking about SQL metrics.
+
+### SQL-073
+title: Longest streak of consecutive active days (gaps and islands)
+difficulty: Hard
+primary: Gaps and islands
+secondary: date minus ROW_NUMBER trick, per-dialect date arithmetic, picking the max island
+concepts: gaps_islands, consecutive, row_number, date_functions, ds_activity_decline
+roles: DS
+time: 20
+dialect: BOTH
+tables: sessions(user_id, started_at)
+columns: user_id, longest_streak_days, streak_start, streak_end
+compare: ordered
+@context
+The engagement team wants to celebrate users with long daily-usage streaks in H1 2025 (a day counts as active if the user started at least one session that UTC day).
+@problem
+For each user, find the longest run of consecutive active days in H1 2025 (earliest run if tied). Return the top 10 users by streak length (ties by `user_id`) with `user_id`, `longest_streak_days`, `streak_start`, `streak_end`.
+@expected
+10 rows.
+@edge_cases
+- Multiple sessions on one day must count as one active day (deduplicate dates first).
+@hint1
+For consecutive dates, `date − (row number)` is constant within a run.
+@hint2
+Number each user's distinct active dates with ROW_NUMBER, then subtract that many days from the date to get an island key.
+@hint3
+Group by (user, island key) to get each run's length and bounds; then pick each user's longest run with another ROW_NUMBER.
+@solution_pg
+WITH days AS (
+    SELECT DISTINCT user_id, CAST(started_at AS DATE) AS d
+    FROM sessions
+    WHERE started_at >= TIMESTAMP '2025-01-01 00:00:00'
+      AND started_at <  TIMESTAMP '2025-07-01 00:00:00'
+),
+keyed AS (
+    SELECT user_id, d,
+           d - CAST(ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY d) AS INT) AS island
+    FROM days
+),
+islands AS (
+    SELECT user_id, island, MIN(d) AS streak_start, MAX(d) AS streak_end, COUNT(*) AS len
+    FROM keyed
+    GROUP BY user_id, island
+),
+best AS (
+    SELECT user_id, len, streak_start, streak_end,
+           ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY len DESC, streak_start) AS rn
+    FROM islands
+)
+SELECT user_id, len AS longest_streak_days, streak_start, streak_end
+FROM best
+WHERE rn = 1
+ORDER BY longest_streak_days DESC, user_id
+LIMIT 10;
+@solution_mysql
+WITH days AS (
+    SELECT DISTINCT user_id, CAST(started_at AS DATE) AS d
+    FROM sessions
+    WHERE started_at >= TIMESTAMP '2025-01-01 00:00:00'
+      AND started_at <  TIMESTAMP '2025-07-01 00:00:00'
+),
+keyed AS (
+    SELECT user_id, d,
+           DATE_SUB(d, INTERVAL ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY d) DAY) AS island
+    FROM days
+),
+islands AS (
+    SELECT user_id, island, MIN(d) AS streak_start, MAX(d) AS streak_end, COUNT(*) AS len
+    FROM keyed
+    GROUP BY user_id, island
+),
+best AS (
+    SELECT user_id, len, streak_start, streak_end,
+           ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY len DESC, streak_start) AS rn
+    FROM islands
+)
+SELECT user_id, len AS longest_streak_days, streak_start, streak_end
+FROM best
+WHERE rn = 1
+ORDER BY longest_streak_days DESC, user_id
+LIMIT 10;
+@dialect_note
+PostgreSQL: `date - integer` returns a date, so `d - CAST(ROW_NUMBER() ... AS INT)` works (ROW_NUMBER returns BIGINT, hence the cast). MySQL: `date - integer` is numeric arithmetic on the YYYYMMDD number, which is wrong; use `DATE_SUB(d, INTERVAL n DAY)`, where `n` may be an expression such as a window function.
+@explanation
+**Gaps and islands**: within a sorted sequence, consecutive values minus their position stay constant. For dates 03-01, 03-02, 03-03, 03-05 with row numbers 1-4, `date − rn` gives 02-28, 02-28, 02-28, 03-01: the first three form one island. Grouping by the island key gives each run's start, end and length. A second window picks the longest run per user.
+
+Deduplicating to one row per (user, day) first is essential. Otherwise two sessions on one day would break the arithmetic.
+@mistakes
+- Forgetting DISTINCT on (user, date).
+- Using `d - rn` in MySQL (numeric subtraction on dates).
+@performance
+One sort for ROW_NUMBER and one aggregation; scales linearly.
+@interview
+One of the most popular "hard" SQL patterns. Explain the invariant (date − position) clearly.
+
+### SQL-074
+title: What happens after a user starts checkout? (LEAD)
+difficulty: Medium
+primary: LEAD
+secondary: next-event analysis, NULL as "no next event"
+concepts: lag_lead, sessionization, funnel, ds_funnel_abandon
+roles: DS
+time: 12
+dialect: BOTH
+tables: events(event_id, user_id, event_name, event_ts)
+columns: next_event, occurrences, pct
+compare: ordered
+@context
+The checkout redesign team wants to know what users do immediately after a `start_checkout` event in 2025: purchase, go back to pricing, leave, ...
+@problem
+For every `start_checkout` event in H1 2025, find the user's **next** event (any type, by time). Return `next_event` (`'(none)'` if there is no later event), `occurrences`, and `pct` of all checkout starts (1 decimal). Sort by occurrences descending, then name.
+@expected
+A distribution over next events: `purchase` dominates, and a small share of checkouts has no later event at all (`(none)`).
+@edge_cases
+- LEAD must look at *all* of the user's events, not only checkout events; filter checkout starts **after** computing LEAD.
+- Restricting the window to H1 2025 means a checkout on 30 June may have its next event in July; this dataset ends in June.
+@hint1
+Compute LEAD over the user's full event stream, then keep only checkout rows.
+@hint2
+`LEAD(event_name) OVER (PARTITION BY user_id ORDER BY event_ts, event_id)`.
+@hint3
+Wrap in a subquery, filter `event_name = 'start_checkout'`, group by `COALESCE(next_event, '(none)')`.
+@solution
+SELECT COALESCE(next_event, '(none)')                                 AS next_event,
+       COUNT(*)                                                       AS occurrences,
+       ROUND(100.0 * COUNT(*) / SUM(COUNT(*)) OVER (), 1)             AS pct
+FROM (
+    SELECT event_name,
+           event_ts,
+           LEAD(event_name) OVER (PARTITION BY user_id ORDER BY event_ts, event_id) AS next_event
+    FROM events
+) e
+WHERE event_name = 'start_checkout'
+  AND event_ts >= TIMESTAMP '2025-01-01 00:00:00'
+  AND event_ts <  TIMESTAMP '2025-07-01 00:00:00'
+GROUP BY COALESCE(next_event, '(none)')
+ORDER BY occurrences DESC, next_event;
+@explanation
+LEAD reads the following row in window order. Because WHERE is applied before window functions at the same query level, LEAD must run in an inner query over the unfiltered stream. Otherwise the "next event" would be the next *checkout*.
+
+A NULL from LEAD means the user never did anything afterwards in the data, which is a strong abandonment signal. `SUM(COUNT(*)) OVER ()` gives the total for the percentage.
+
+Duplicate client events can make "next event = start_checkout" appear; dedupe first (SQL-064) for production numbers.
+@mistakes
+- Filtering to checkout events before LEAD.
+- Ignoring NULLs (users who left).
+@performance
+The inner query sorts all events per user; on large data restrict the inner query to a time window slightly wider than the analysis window.
+@interview
+"Next action" analysis with LEAD is common in product analytics interviews.
+
+### SQL-075
+title: Score trajectories with a named window
+difficulty: Medium
+primary: Named WINDOW clause
+secondary: LAG, running MAX, several functions sharing one window
+concepts: partition_by, lag_lead, window_frame, ml_prediction_drift
+roles: MLE
+time: 10
+dialect: BOTH
+tables: model_predictions(entity_id, model_version_id, batch_id, predicted_at, score)
+columns: entity_id, predicted_date, score, prev_score, score_change, max_score_so_far
+compare: ordered
+@context
+An ML engineer investigates how churn scores of a few accounts evolved across monthly production runs (batches ending in `-a`, production model versions 1-3).
+@problem
+For entities 5, 10 and 20, list each production prediction with `predicted_date`, `score` (4 decimals), `prev_score`, `score_change` and `max_score_so_far`. Use a single named window. Sort by entity, date.
+@expected
+8 rows per entity (one per monthly run).
+@edge_cases
+- A NULL score (scorer failure) makes `score_change` NULL and does not affect MAX.
+@hint1
+All three window calculations use the same partition and order.
+@hint2
+`WINDOW w AS (PARTITION BY entity_id ORDER BY predicted_at)` at the end of the SELECT.
+@hint3
+`MAX(score) OVER (w ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)` extends the named window with a frame.
+@solution
+SELECT entity_id,
+       CAST(predicted_at AS DATE)                                  AS predicted_date,
+       CAST(score AS DECIMAL(6,4))                                 AS score,
+       CAST(LAG(score) OVER w AS DECIMAL(6,4))                     AS prev_score,
+       CAST(score - LAG(score) OVER w AS DECIMAL(6,4))             AS score_change,
+       CAST(MAX(score) OVER (w ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS DECIMAL(6,4)) AS max_score_so_far
+FROM model_predictions
+WHERE entity_id IN (5, 10, 20)
+  AND model_version_id IN (1, 2, 3)
+  AND batch_id LIKE '%-a'
+WINDOW w AS (PARTITION BY entity_id ORDER BY predicted_at)
+ORDER BY entity_id, predicted_date;
+@explanation
+The `WINDOW` clause names a window specification once; functions reference it by name, optionally adding a frame. Both PostgreSQL and MySQL 8 support this SQL-standard feature, which reduces copy-paste errors when several functions must share exactly the same partition and order.
+
+`score` is DOUBLE PRECISION; casting to DECIMAL(6,4) gives the same 4-decimal output in both engines.
+
+**ML angle:** sudden score jumps across consecutive runs for the same entity, without a matching change in features, often reveal a model or feature-pipeline change rather than behaviour change (see SQL-110 for population-level drift).
+@mistakes
+- Including shadow-model rows (version 4), which interleave two models in one trajectory.
+@performance
+Tiny filtered set; the `model_predictions(entity_id, predicted_at)` index serves both filter and window order.
+@interview
+Shows clean window syntax; named windows are underused and noticed by reviewers.
+
+### SQL-076
+title: Rolling 7-day token usage: ROWS versus RANGE frames
+difficulty: Advanced
+primary: RANGE frames with interval offsets
+secondary: irregular time series, per-dialect frame syntax, ROWS pitfall
+concepts: window_frame, rolling_window, moving_avg, ai_volume, ai_token_cost
+roles: AI
+time: 20
+dialect: BOTH
+tables: llm_requests(org_id, requested_at, input_tokens, output_tokens)
+columns: usage_date, tokens, rolling_7_rows, rolling_7_days
+compare: ordered
+@context
+Usage-based billing alerts trigger when an organization's tokens over the trailing 7 **calendar days** exceed its quota. Organization 195 does not use the AI features every day, which breaks a naive implementation.
+@problem
+For organization 195 in June 2025, return each active day's `tokens` (input + output, NULL output as 0), `rolling_7_rows` (sum over the current and previous 6 *rows*) and `rolling_7_days` (sum over the current day and the 6 preceding *calendar days*). Sort by date.
+@expected
+One row per active day; the two rolling columns differ whenever there were inactive days within the last week.
+@edge_cases
+- ROWS counts rows: with gaps, 7 rows can span two or three weeks.
+- RANGE with an interval offset requires a single ORDER BY column of a date/time type.
+@hint1
+First aggregate tokens per day for the organization.
+@hint2
+PostgreSQL: `RANGE BETWEEN INTERVAL '6 days' PRECEDING AND CURRENT ROW`. MySQL: `RANGE BETWEEN INTERVAL 6 DAY PRECEDING AND CURRENT ROW`.
+@hint3
+`ROWS BETWEEN 6 PRECEDING AND CURRENT ROW` for the naive column.
+@solution_pg
+WITH daily AS (
+    SELECT CAST(requested_at AS DATE) AS usage_date,
+           SUM(input_tokens + COALESCE(output_tokens, 0)) AS tokens
+    FROM llm_requests
+    WHERE org_id = 195
+      AND requested_at >= TIMESTAMP '2025-06-01 00:00:00'
+      AND requested_at <  TIMESTAMP '2025-07-01 00:00:00'
+    GROUP BY CAST(requested_at AS DATE)
+)
+SELECT usage_date,
+       tokens,
+       SUM(tokens) OVER (ORDER BY usage_date ROWS BETWEEN 6 PRECEDING AND CURRENT ROW)               AS rolling_7_rows,
+       SUM(tokens) OVER (ORDER BY usage_date RANGE BETWEEN INTERVAL '6 days' PRECEDING AND CURRENT ROW) AS rolling_7_days
+FROM daily
+ORDER BY usage_date;
+@solution_mysql
+WITH daily AS (
+    SELECT CAST(requested_at AS DATE) AS usage_date,
+           SUM(input_tokens + COALESCE(output_tokens, 0)) AS tokens
+    FROM llm_requests
+    WHERE org_id = 195
+      AND requested_at >= TIMESTAMP '2025-06-01 00:00:00'
+      AND requested_at <  TIMESTAMP '2025-07-01 00:00:00'
+    GROUP BY CAST(requested_at AS DATE)
+)
+SELECT usage_date,
+       tokens,
+       SUM(tokens) OVER (ORDER BY usage_date ROWS BETWEEN 6 PRECEDING AND CURRENT ROW)            AS rolling_7_rows,
+       SUM(tokens) OVER (ORDER BY usage_date RANGE BETWEEN INTERVAL 6 DAY PRECEDING AND CURRENT ROW) AS rolling_7_days
+FROM daily
+ORDER BY usage_date;
+@assert
+any(r[2] != r[3] for r in rows)
+@dialect_note
+Both engines support `RANGE` frames with temporal offsets, but the interval literal differs: PostgreSQL uses `INTERVAL '6 days'` (or `'6' DAY`), and MySQL uses `INTERVAL 6 DAY` without quotes inside window frames. MySQL rejects the quoted form there.
+@explanation
+- **ROWS** frames are defined by physical row positions.
+- **RANGE** frames are defined by the *value* of the ORDER BY column: here all rows whose `usage_date` lies within 6 days before the current row's date.
+
+On an irregular series (active days only), only the RANGE version implements "trailing 7 calendar days". The alternative, filling a date spine first and using ROWS (SQL-065), works too and is necessary in engines without interval RANGE support.
+
+The first days of June have partial windows in both versions because May is filtered out. For alerting, include 6 extra days of history in the CTE and filter afterwards.
+
+**Why it matters for AI apps:** quota and cost alerts that use row-based windows fire too late (or never) for bursty customers, exactly the ones most likely to blow a budget.
+@mistakes
+- Using ROWS on sparse data and calling it "7 days".
+- Copying the PostgreSQL interval syntax into a MySQL frame.
+@performance
+Window over ≤ 30 rows; cost is the per-day aggregation.
+@interview
+ROWS vs RANGE is an advanced, frequently probed window-frame topic.
+
+### SQL-077
+title: Consecutive failure streaks per pipeline
+difficulty: Advanced
+primary: Gaps and islands on status values
+secondary: latest attempt per day, islands over calendar dates
+concepts: gaps_islands, consecutive, row_number, dedup_window, ml_pipeline_validation
+roles: MLE
+time: 22
+dialect: BOTH
+tables: pipeline_runs(pipeline_name, run_date, attempt, status)
+columns: pipeline_name, streak_start, streak_end, failed_days
+compare: ordered
+@context
+On-call engineers want to see every period of **3 or more consecutive calendar days** on which a pipeline's final outcome was failure. A day's final outcome is the status of its highest attempt.
+@problem
+Return `pipeline_name`, `streak_start`, `streak_end`, `failed_days` for each such streak, sorted by pipeline and start.
+@expected
+A few long streaks (an outage of the feature pipeline in February/March and of the document indexer in late May).
+@edge_cases
+- A failed first attempt followed by a successful retry is **not** a failed day.
+- A missing day (no run at all) breaks the streak, because the streak is over calendar days.
+- label_build runs weekly; consecutive *calendar* days never occur for it.
+@hint1
+Reduce to one row per (pipeline, run_date) with the final status.
+@hint2
+`ROW_NUMBER() OVER (PARTITION BY pipeline_name, run_date ORDER BY attempt DESC) = 1`.
+@hint3
+On failed days only, apply the date − ROW_NUMBER island trick per pipeline; group and keep islands with ≥ 3 days.
+@solution_pg
+WITH final AS (
+    SELECT pipeline_name, run_date, status
+    FROM (
+        SELECT pipeline_name, run_date, status,
+               ROW_NUMBER() OVER (PARTITION BY pipeline_name, run_date ORDER BY attempt DESC) AS rn
+        FROM pipeline_runs
+    ) x
+    WHERE rn = 1
+),
+failed AS (
+    SELECT pipeline_name, run_date,
+           run_date - CAST(ROW_NUMBER() OVER (PARTITION BY pipeline_name ORDER BY run_date) AS INT) AS island
+    FROM final
+    WHERE status = 'failed'
+)
+SELECT pipeline_name,
+       MIN(run_date) AS streak_start,
+       MAX(run_date) AS streak_end,
+       COUNT(*)      AS failed_days
+FROM failed
+GROUP BY pipeline_name, island
+HAVING COUNT(*) >= 3
+ORDER BY pipeline_name, streak_start;
+@solution_mysql
+WITH final AS (
+    SELECT pipeline_name, run_date, status
+    FROM (
+        SELECT pipeline_name, run_date, status,
+               ROW_NUMBER() OVER (PARTITION BY pipeline_name, run_date ORDER BY attempt DESC) AS rn
+        FROM pipeline_runs
+    ) x
+    WHERE rn = 1
+),
+failed AS (
+    SELECT pipeline_name, run_date,
+           DATE_SUB(run_date, INTERVAL ROW_NUMBER() OVER (PARTITION BY pipeline_name ORDER BY run_date) DAY) AS island
+    FROM final
+    WHERE status = 'failed'
+)
+SELECT pipeline_name,
+       MIN(run_date) AS streak_start,
+       MAX(run_date) AS streak_end,
+       COUNT(*)      AS failed_days
+FROM failed
+GROUP BY pipeline_name, island
+HAVING COUNT(*) >= 3
+ORDER BY pipeline_name, streak_start;
+@assert
+len(rows) >= 2
+@explanation
+Two window passes:
+1. **Deduplicate attempts**: keep the highest attempt per (pipeline, day) to get the day's final outcome. Retried failures that eventually succeeded disappear here.
+2. **Islands**: among failed days, `run_date − rank` is constant for consecutive dates. Because the key is based on calendar dates, a missing day ends an island.
+
+The result is the kind of table an incident review or an SLO report needs.
+
+**ML angle:** a multi-day feature-pipeline outage is exactly what produced the backfilled feature snapshots in `entity_features`; SQL-100 shows how those rows leak into training data if used naively.
+@mistakes
+- Treating any failed attempt as a failed day.
+- Computing islands with ROW_NUMBER over *all* days and subtracting a rank over failed days, which is a valid variant but easy to get wrong when days are missing.
+@performance
+Two partitioned sorts over ~600 rows.
+@interview
+Shows the gaps-and-islands pattern on operational data, a favourite for MLE and data-platform roles.

@@ -1,0 +1,842 @@
+### ASM-01
+title: Share of users by role
+difficulty: Easy
+primary: Aggregation with a window-based share
+secondary: GROUP BY, SUM(COUNT(*)) OVER ()
+concepts: aggregates, window_agg, ratios
+roles: DS
+time: 5
+dialect: BOTH
+tables: users(user_id, role)
+columns: role, users, pct_of_users
+compare: ordered
+@context
+Assessment task. An HR-style breakdown of the user base by role.
+@problem
+Return `role`, `users` and `pct_of_users` (1 decimal) for all users, sorted by `users` descending.
+@expected
+3 rows summing to 100%.
+@edge_cases
+- Percentages may not sum to exactly 100.0 because of rounding.
+@hint1
+Group by role.
+@hint2
+The grand total is available as a window over the grouped rows.
+@hint3
+`100.0 * COUNT(*) / SUM(COUNT(*)) OVER ()`.
+@solution
+SELECT role,
+       COUNT(*)                                          AS users,
+       ROUND(100.0 * COUNT(*) / SUM(COUNT(*)) OVER (), 1) AS pct_of_users
+FROM users
+GROUP BY role
+ORDER BY users DESC, role;
+@explanation
+`SUM(COUNT(*)) OVER ()` sums the grouped counts over all groups, giving the denominator without a second query.
+@mistakes
+- Integer division in PostgreSQL (`COUNT(*) * 100 / total`).
+@rubric
+4 points. 2: correct counts; 1: correct percentages without integer division; 1: deterministic ordering.
+@interview
+Warm-up aggregation.
+
+### ASM-02
+title: Requests without prompt version or trace ID
+difficulty: Easy
+primary: Conditional aggregation over NULLs
+secondary: IS NULL, ratios
+concepts: is_null, conditional_aggregation, ai_missing_metadata
+roles: AI
+time: 6
+dialect: BOTH
+tables: llm_requests(feature, prompt_version_id, trace_id, requested_at)
+columns: feature, requests, no_prompt_pct, no_trace_pct
+compare: ordered
+@context
+Assessment task. Observability review of June 2025 LLM traffic.
+@problem
+Per `feature`, for June 2025: `requests`, `no_prompt_pct` (share without `prompt_version_id`) and `no_trace_pct` (share without `trace_id`), both 2 decimals. Sort by feature.
+@expected
+3 rows.
+@edge_cases
+- `= NULL` never matches.
+@hint1
+Two conditional counts per feature.
+@hint2
+`SUM(CASE WHEN prompt_version_id IS NULL THEN 1 ELSE 0 END)`.
+@hint3
+Divide by `COUNT(*)` with `100.0 *`.
+@solution
+SELECT feature,
+       COUNT(*) AS requests,
+       ROUND(100.0 * SUM(CASE WHEN prompt_version_id IS NULL THEN 1 ELSE 0 END) / COUNT(*), 2) AS no_prompt_pct,
+       ROUND(100.0 * SUM(CASE WHEN trace_id IS NULL THEN 1 ELSE 0 END) / COUNT(*), 2)          AS no_trace_pct
+FROM llm_requests
+WHERE requested_at >= TIMESTAMP '2025-06-01 00:00:00'
+  AND requested_at <  TIMESTAMP '2025-07-01 00:00:00'
+GROUP BY feature
+ORDER BY feature;
+@explanation
+Conditional aggregation computes both completeness rates in one scan.
+@mistakes
+- `COUNT(prompt_version_id)` as the missing count (it counts the opposite).
+@rubric
+4 points. 2: correct NULL tests; 1: correct date range; 1: decimal arithmetic.
+@interview
+Basic data-completeness check.
+
+### ASM-03
+title: Paying customers who never contact support
+difficulty: Medium
+primary: Anti-join combined with a semi-join
+secondary: NOT EXISTS, EXISTS, segment rollup
+concepts: anti_join, not_exists, semi_join, ds_segments
+roles: DS
+time: 10
+dialect: BOTH
+tables: organizations(org_id, segment); subscriptions(org_id, ended_at); support_tickets(org_id, created_at)
+columns: segment, paying_orgs, quiet_paying_orgs
+compare: ordered
+@context
+Assessment task. Customers who pay but never open tickets may be under-engaged.
+@problem
+Per segment, count organizations with an open subscription (`paying_orgs`) and, among them, those without any ticket created in 2025 (`quiet_paying_orgs`). Sort by segment.
+@expected
+3 rows.
+@edge_cases
+- An organization with two open subscriptions must be counted once.
+@hint1
+Start from organizations, not subscriptions.
+@hint2
+`EXISTS` for paying, `NOT EXISTS` for "no ticket in 2025".
+@hint3
+Conditional counts per segment.
+@solution
+SELECT o.segment,
+       COUNT(*) AS paying_orgs,
+       SUM(CASE WHEN NOT EXISTS (SELECT 1 FROM support_tickets t
+                                 WHERE t.org_id = o.org_id
+                                   AND t.created_at >= TIMESTAMP '2025-01-01 00:00:00')
+                THEN 1 ELSE 0 END) AS quiet_paying_orgs
+FROM organizations o
+WHERE EXISTS (SELECT 1 FROM subscriptions s WHERE s.org_id = o.org_id AND s.ended_at IS NULL)
+GROUP BY o.segment
+ORDER BY o.segment;
+@explanation
+Starting from `organizations` and using EXISTS avoids duplicates from multiple subscriptions; NOT EXISTS expresses "no ticket" safely.
+@mistakes
+- Joining subscriptions directly (double counts organizations with overlapping open periods).
+- `org_id NOT IN (SELECT org_id FROM support_tickets ...)`, which works here only because the column is NOT NULL.
+@rubric
+6 points. 2: correct paying population without duplicates; 2: correct anti-join; 1: correct date filter; 1: grouping.
+@interview
+Semi/anti-join fluency.
+
+### ASM-04
+title: Repeat purchase within 90 days
+difficulty: Medium
+primary: Window functions for first and second events
+secondary: ROW_NUMBER, conditional pivot, interval arithmetic
+concepts: row_number, lag_lead, ratios, ds_conversion
+roles: DS
+time: 15
+dialect: BOTH
+tables: orders(user_id, status, order_ts, order_id)
+columns: first_time_buyers, repeat_within_90d, repeat_pct
+compare: ordered
+@context
+Assessment task. Lifecycle marketing measures how many first-time buyers come back quickly.
+@problem
+For users whose **first** completed order was in H2 2024, what share placed a second completed order within 90 days after the first? Return one row: `first_time_buyers`, `repeat_within_90d`, `repeat_pct` (1 decimal).
+@expected
+One row.
+@edge_cases
+- "First" must be the user's first completed order ever, not just within H2 2024.
+- Ties in `order_ts`: break by `order_id`.
+@hint1
+Number each user's completed orders chronologically.
+@hint2
+Pivot order 1 and order 2 timestamps per user with `MAX(CASE WHEN rn = 1 ...)`.
+@hint3
+Filter users whose first order falls in H2 2024; test `second_ts < first_ts + INTERVAL '90' DAY`.
+@solution
+WITH numbered AS (
+    SELECT user_id, order_ts,
+           ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY order_ts, order_id) AS rn
+    FROM orders
+    WHERE status = 'completed'
+),
+firsts AS (
+    SELECT user_id,
+           MAX(CASE WHEN rn = 1 THEN order_ts END) AS first_ts,
+           MAX(CASE WHEN rn = 2 THEN order_ts END) AS second_ts
+    FROM numbered
+    WHERE rn <= 2
+    GROUP BY user_id
+)
+SELECT COUNT(*) AS first_time_buyers,
+       SUM(CASE WHEN second_ts < first_ts + INTERVAL '90' DAY THEN 1 ELSE 0 END) AS repeat_within_90d,
+       ROUND(100.0 * SUM(CASE WHEN second_ts < first_ts + INTERVAL '90' DAY THEN 1 ELSE 0 END) / COUNT(*), 1) AS repeat_pct
+FROM firsts
+WHERE first_ts >= TIMESTAMP '2024-07-01 00:00:00'
+  AND first_ts <  TIMESTAMP '2025-01-01 00:00:00';
+@explanation
+ROW_NUMBER finds each user's first and second completed order; the cohort filter is applied **after** numbering so that "first" means first ever. A NULL second order makes the comparison UNKNOWN, counted as not repeated.
+@mistakes
+- Filtering H2 2024 before numbering (later orders become "first").
+- Using `MIN(order_ts)` for both orders.
+@rubric
+6 points. 2: first order defined over full history; 2: correct 90-day window; 1: NULL second order handled; 1: correct percentage.
+@interview
+Classic repeat-purchase metric.
+
+### ASM-05
+title: Churn base rate by customer segment
+difficulty: Medium
+primary: Joining labels to entity attributes
+secondary: authoritative label selection, test-account exclusion
+concepts: ml_class_balance, dedup_window, multi_join, ratios
+roles: MLE
+time: 12
+dialect: BOTH
+tables: training_labels(label_id, entity_id, label_name, observation_date, label_value, label_available_at); ml_entities(entity_id, org_id, is_test_account); organizations(org_id, segment)
+columns: segment, examples, positive_rate_pct
+compare: ordered
+@context
+Assessment task. Before training per-segment models, check how the churn base rate differs by segment.
+@problem
+For observation date 2025-05-01, using authoritative, non-NULL labels of non-test entities, return per segment the number of examples and the positive rate (2 decimals). Sort by segment.
+@expected
+3 rows.
+@edge_cases
+- Duplicate label rows must not be counted twice.
+@hint1
+Pick the latest label row per entity with ROW_NUMBER.
+@hint2
+Join entities (test flag, org) and organizations (segment).
+@hint3
+`AVG(label_value)` is the positive rate for a 0/1 label.
+@solution
+SELECT o.segment,
+       COUNT(*)                                AS examples,
+       ROUND(100.0 * AVG(l.label_value), 2)    AS positive_rate_pct
+FROM (
+    SELECT entity_id, label_value,
+           ROW_NUMBER() OVER (PARTITION BY entity_id ORDER BY label_available_at DESC, label_id DESC) AS rn
+    FROM training_labels
+    WHERE label_name = 'churned_30d' AND observation_date = DATE '2025-05-01'
+) l
+JOIN ml_entities e   ON e.entity_id = l.entity_id
+JOIN organizations o ON o.org_id = e.org_id
+WHERE l.rn = 1 AND l.label_value IS NOT NULL AND e.is_test_account = FALSE
+GROUP BY o.segment
+ORDER BY o.segment;
+@explanation
+Deduplicate first, filter test accounts and pending labels, then aggregate. `AVG` of a 0/1 SMALLINT returns a decimal in both engines.
+@mistakes
+- Counting raw label rows.
+- Filtering `rn = 1` after a LEFT JOIN that changes row counts.
+@rubric
+6 points. 2: authoritative dedup; 2: correct exclusions; 2: correct rate.
+@interview
+Tests careful ML dataset hygiene.
+
+### ASM-06
+title: Documents whose newest version is an unpublished draft
+difficulty: Medium
+primary: Conditional aggregation over versions
+secondary: MAX(CASE ...) pivots, HAVING
+concepts: conditional_aggregation, having, ai_stale_docs
+roles: AI
+time: 10
+dialect: BOTH
+tables: documents(doc_key, version_number, status, is_deleted)
+columns: doc_key, published_version, draft_version
+compare: ordered
+@context
+Assessment task. Content teams forget drafts. List documents where a draft is newer than the latest published version.
+@problem
+Return non-deleted `doc_key`s whose highest draft version is greater than their highest published version, with both version numbers. Sort by `doc_key`.
+@expected
+About a dozen rows.
+@edge_cases
+- A document without any published version should also appear (published_version NULL)? Decide and state it: here, require a published version.
+@hint1
+Group by `doc_key`.
+@hint2
+`MAX(CASE WHEN status = 'published' THEN version_number END)`.
+@hint3
+Compare the two maxima in HAVING.
+@solution
+SELECT doc_key,
+       MAX(CASE WHEN status = 'published' THEN version_number END) AS published_version,
+       MAX(CASE WHEN status = 'draft' THEN version_number END)     AS draft_version
+FROM documents
+WHERE is_deleted = FALSE
+GROUP BY doc_key
+HAVING MAX(CASE WHEN status = 'draft' THEN version_number END)
+     > MAX(CASE WHEN status = 'published' THEN version_number END)
+ORDER BY doc_key;
+@explanation
+Conditional MAX pivots versions by status into columns; HAVING compares them. A missing published version yields NULL and the comparison is UNKNOWN, so such documents are excluded, as the stated assumption requires.
+@mistakes
+- Using ROW_NUMBER and checking only the newest row's status (misses the published version number).
+@rubric
+6 points. 3: correct pivot; 2: HAVING logic; 1: stated NULL assumption.
+@interview
+Version-management reasoning for RAG corpora.
+
+### ASM-07
+title: Paying organizations and MRR at each month end
+difficulty: Hard
+primary: Point-in-time snapshots with a range join
+secondary: date list, open-period logic, aggregation per snapshot
+concepts: range_join, time_series, union_all, ds_churn_cohort
+roles: DS
+time: 18
+dialect: BOTH
+tables: subscriptions(org_id, mrr, started_at, ended_at)
+columns: month_end, paying_orgs, mrr
+compare: ordered
+@context
+Assessment task. Finance wants the number of paying organizations and the MRR at the end of each month of H1 2025.
+@problem
+For each month end (the last instant of January … June 2025, i.e. the snapshot time `first day of next month 00:00`), count organizations with a subscription active at that instant and sum its MRR. A subscription is active at time T if `started_at < T` and (`ended_at` is NULL or `ended_at >= T`). Return `month_end` (the last calendar date of the month), `paying_orgs` and `mrr`. Sort by month end.
+@expected
+6 rows.
+@edge_cases
+- Organizations with overlapping subscriptions count once in `paying_orgs` but contribute both MRRs.
+@hint1
+Build a 6-row list of snapshot instants with UNION ALL.
+@hint2
+Range-join subscriptions to snapshots.
+@hint3
+`COUNT(DISTINCT org_id)` and `SUM(mrr)` per snapshot.
+@solution
+WITH snaps AS (
+    SELECT DATE '2025-01-31' AS month_end, TIMESTAMP '2025-02-01 00:00:00' AS t
+    UNION ALL SELECT DATE '2025-02-28', TIMESTAMP '2025-03-01 00:00:00'
+    UNION ALL SELECT DATE '2025-03-31', TIMESTAMP '2025-04-01 00:00:00'
+    UNION ALL SELECT DATE '2025-04-30', TIMESTAMP '2025-05-01 00:00:00'
+    UNION ALL SELECT DATE '2025-05-31', TIMESTAMP '2025-06-01 00:00:00'
+    UNION ALL SELECT DATE '2025-06-30', TIMESTAMP '2025-07-01 00:00:00'
+)
+SELECT s.month_end,
+       COUNT(DISTINCT sub.org_id) AS paying_orgs,
+       SUM(sub.mrr)               AS mrr
+FROM snaps s
+JOIN subscriptions sub
+  ON sub.started_at < s.t
+ AND (sub.ended_at IS NULL OR sub.ended_at >= s.t)
+GROUP BY s.month_end
+ORDER BY s.month_end;
+@explanation
+Snapshot metrics need a list of snapshot times and a range join that tests "active at T". Distinct counting protects the organization count from overlaps, while the MRR sum keeps what is actually billed. Free-plan periods count as "paying" here (MRR 0); a stricter definition would add `mrr > 0`.
+@mistakes
+- Grouping subscriptions by start month (that measures new subscriptions, not the active base).
+- `ended_at > T` vs `>= T`: a subscription ending exactly at T is not active after T. Choose deliberately.
+@rubric
+8 points. 3: correct active-at-T condition including NULL ends; 2: snapshot list; 2: distinct org count vs MRR sum; 1: stated definition of "paying".
+@interview
+Snapshot (stock) metrics vs flow metrics is a key analytics concept.
+
+### ASM-08
+title: Audit the logged feature snapshot of a scoring run
+difficulty: Hard
+primary: Point-in-time verification of serving logs
+secondary: recompute the available snapshot per prediction, compare with the log
+concepts: ml_point_in_time, ml_features_after_pred, row_number, conditional_aggregation
+roles: MLE
+time: 18
+dialect: BOTH
+tables: model_predictions(prediction_id, entity_id, batch_id, predicted_at, feature_as_of_ts); entity_features(entity_id, as_of_ts, ingested_at)
+columns: predictions, logged_matches, logged_differs, not_logged
+compare: ordered
+@context
+Assessment task. Verify that the June 2025 production batch (`churn-2025-06-01-a`) logged the snapshot it should have used: the latest snapshot available at `predicted_at`.
+@problem
+Return one row: `predictions`, `logged_matches` (logged `feature_as_of_ts` equals the recomputed latest available `as_of_ts`), `logged_differs` and `not_logged` (NULL log).
+@expected
+One row; almost all predictions match.
+@edge_cases
+- An entity with no available snapshot has a NULL recomputed value.
+@hint1
+Recompute `MAX(as_of_ts)` over snapshots with `as_of_ts <= predicted_at AND ingested_at <= predicted_at` per prediction.
+@hint2
+LEFT JOIN so predictions without any available snapshot remain.
+@hint3
+Classify with CASE: NULL log first, then equality.
+@solution
+WITH recomputed AS (
+    SELECT p.prediction_id,
+           p.feature_as_of_ts,
+           MAX(f.as_of_ts) AS available_as_of_ts
+    FROM model_predictions p
+    LEFT JOIN entity_features f
+           ON f.entity_id = p.entity_id
+          AND f.as_of_ts <= p.predicted_at
+          AND f.ingested_at <= p.predicted_at
+    WHERE p.batch_id = 'churn-2025-06-01-a'
+    GROUP BY p.prediction_id, p.feature_as_of_ts
+)
+SELECT COUNT(*) AS predictions,
+       SUM(CASE WHEN feature_as_of_ts = available_as_of_ts THEN 1 ELSE 0 END) AS logged_matches,
+       SUM(CASE WHEN feature_as_of_ts IS NOT NULL
+                 AND (available_as_of_ts IS NULL OR feature_as_of_ts <> available_as_of_ts) THEN 1 ELSE 0 END) AS logged_differs,
+       SUM(CASE WHEN feature_as_of_ts IS NULL THEN 1 ELSE 0 END) AS not_logged
+FROM recomputed;
+@explanation
+Recomputing what the scorer *should* have read (point in time, availability aware) and comparing it with what it *logged* is a strong consistency test of the serving path. Differences point to logging bugs or to a scorer that ignores `ingested_at`.
+@mistakes
+- Ignoring `ingested_at` in the recomputation.
+- INNER JOIN that drops predictions without available features.
+@rubric
+8 points. 3: PIT recomputation with both time conditions; 2: LEFT JOIN; 2: NULL-safe classification; 1: one-row output.
+@interview
+Tests the MLE core skill: reasoning about event time vs availability time.
+
+### ASM-09
+title: Day-over-day drops in SQL copilot success rate
+difficulty: Hard
+primary: LAG over daily rates
+secondary: volume guards, percentage-point changes
+concepts: lag_lead, ai_regression, ai_success_rate, period_over_period
+roles: AI
+time: 15
+dialect: BOTH
+tables: llm_requests(feature, status, requested_at)
+columns: request_date, requests, success_pct, prev_success_pct, change_pts
+compare: ordered
+@context
+Assessment task. Flag days in Q2 2025 when the SQL copilot's success rate fell by more than 5 percentage points compared with the previous active day, when both days had at least 15 requests.
+@problem
+Return `request_date`, `requests`, `success_pct`, `prev_success_pct` (1 decimal each) and `change_pts` (1 decimal) for flagged days. Sort by date.
+@expected
+A few days.
+@edge_cases
+- "Previous active day" is the previous row, not necessarily the previous calendar day.
+@hint1
+Aggregate per day first.
+@hint2
+LAG both the rate and the volume.
+@hint3
+Filter in an outer query.
+@solution
+WITH daily AS (
+    SELECT CAST(requested_at AS DATE) AS request_date,
+           COUNT(*) AS requests,
+           100.0 * SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) / COUNT(*) AS success_pct
+    FROM llm_requests
+    WHERE feature = 'sql_copilot'
+      AND requested_at >= TIMESTAMP '2025-04-01 00:00:00'
+      AND requested_at <  TIMESTAMP '2025-07-01 00:00:00'
+    GROUP BY CAST(requested_at AS DATE)
+),
+w AS (
+    SELECT request_date, requests, success_pct,
+           LAG(success_pct) OVER (ORDER BY request_date) AS prev_success_pct,
+           LAG(requests)    OVER (ORDER BY request_date) AS prev_requests
+    FROM daily
+)
+SELECT request_date,
+       requests,
+       ROUND(success_pct, 1)                    AS success_pct,
+       ROUND(prev_success_pct, 1)               AS prev_success_pct,
+       ROUND(success_pct - prev_success_pct, 1) AS change_pts
+FROM w
+WHERE requests >= 15
+  AND prev_requests >= 15
+  AND success_pct < prev_success_pct - 5
+ORDER BY request_date;
+@explanation
+Compute rates per day, compare with LAG, then apply both the volume guard and the threshold. Percentage *points* (difference of rates) are the right unit for rate changes.
+@mistakes
+- Filtering low-volume days before LAG, which changes what "previous day" means. Here both days are checked after LAG.
+- Relative change of a rate ("−10%") instead of percentage points.
+@rubric
+8 points. 2: daily rates; 3: LAG and volume guard on both days; 2: correct threshold in points; 1: ordering.
+@interview
+Operational anomaly detection with windows.
+
+### ASM-10
+title: Top 2 ticket categories per segment (with ties)
+difficulty: Medium
+primary: Top-N per group with DENSE_RANK
+secondary: ranking aggregated values, ties
+concepts: dense_rank, top_n_per_group, partition_by
+roles: DS
+time: 10
+dialect: BOTH
+tables: support_tickets(org_id, category, created_at); organizations(org_id, segment)
+columns: segment, category, tickets, category_rank
+compare: ordered
+@context
+Assessment task. Support leadership wants each segment's two largest ticket categories in 2025; ties should share a rank.
+@problem
+Return `segment`, `category`, `tickets` and `category_rank` (DENSE_RANK by tickets descending within segment) for ranks ≤ 2. Sort by segment, rank, category.
+@expected
+About 6 rows (more with ties).
+@edge_cases
+- DENSE_RANK can return more than two categories when counts tie.
+@hint1
+Aggregate tickets per (segment, category).
+@hint2
+Rank inside each segment.
+@hint3
+Filter ranks in an outer query.
+@solution
+SELECT segment, category, tickets, category_rank
+FROM (
+    SELECT o.segment,
+           t.category,
+           COUNT(*) AS tickets,
+           DENSE_RANK() OVER (PARTITION BY o.segment ORDER BY COUNT(*) DESC) AS category_rank
+    FROM support_tickets t
+    JOIN organizations o ON o.org_id = t.org_id
+    WHERE t.created_at >= TIMESTAMP '2025-01-01 00:00:00'
+    GROUP BY o.segment, t.category
+) ranked
+WHERE category_rank <= 2
+ORDER BY segment, category_rank, category;
+@explanation
+Window functions rank grouped rows directly; the outer query filters ranks because WHERE runs before windows.
+@mistakes
+- ROW_NUMBER (arbitrary tie-breaking).
+- LIMIT 2 (global, not per segment).
+@rubric
+6 points. 2: aggregation; 2: partitioned DENSE_RANK; 2: filtering in an outer query.
+@interview
+Top-N per group, again, because it is that common.
+
+### ASM-11
+title: Top-decile lift of the production churn model
+difficulty: Advanced
+primary: Ranking-based model evaluation
+secondary: NTILE over scores, base rate, lift
+concepts: ml_metrics, ntile, ml_model_compare, multiple_ctes
+roles: MLE
+time: 20
+dialect: BOTH
+tables: model_predictions(prediction_id, model_version_id, entity_id, batch_id, score); training_labels(label_id, entity_id, label_name, observation_date, label_value, label_available_at); ml_entities(entity_id, is_test_account)
+columns: examples, top_decile_examples, top_decile_positive_rate_pct, base_rate_pct, lift
+compare: ordered
+@context
+Assessment task. Customer success calls the 10% riskiest accounts. How much better than random is v3 at filling that list?
+@problem
+For v3's batch `churn-2025-05-01-a` (valid scores), joined to authoritative non-NULL labels of non-test entities for 2025-05-01, compute: `examples`, `top_decile_examples` (NTILE(10) = 1 by score descending, ties by entity), `top_decile_positive_rate_pct`, `base_rate_pct` (2 decimals each) and `lift` (= top-decile rate / base rate, 2 decimals).
+@expected
+One row; lift clearly above 1.
+@edge_cases
+- NTILE assigns buckets by row count; with ties at the boundary, ordering by entity_id keeps it deterministic.
+@hint1
+Build the evaluation set (score, label).
+@hint2
+`NTILE(10) OVER (ORDER BY score DESC, entity_id)`.
+@hint3
+Conditional averages for the top decile and overall.
+@solution
+WITH labels AS (
+    SELECT entity_id, label_value
+    FROM (SELECT entity_id, label_value,
+                 ROW_NUMBER() OVER (PARTITION BY entity_id ORDER BY label_available_at DESC, label_id DESC) AS rn
+          FROM training_labels
+          WHERE label_name = 'churned_30d' AND observation_date = DATE '2025-05-01') x
+    WHERE rn = 1 AND label_value IS NOT NULL
+),
+evalset AS (
+    SELECT p.entity_id, p.score, l.label_value,
+           NTILE(10) OVER (ORDER BY p.score DESC, p.entity_id) AS decile
+    FROM model_predictions p
+    JOIN labels l      ON l.entity_id = p.entity_id
+    JOIN ml_entities e ON e.entity_id = p.entity_id AND e.is_test_account = FALSE
+    WHERE p.model_version_id = 3
+      AND p.batch_id = 'churn-2025-05-01-a'
+      AND p.score IS NOT NULL
+)
+SELECT COUNT(*) AS examples,
+       SUM(CASE WHEN decile = 1 THEN 1 ELSE 0 END) AS top_decile_examples,
+       ROUND(100.0 * AVG(CASE WHEN decile = 1 THEN label_value END), 2) AS top_decile_positive_rate_pct,
+       ROUND(100.0 * AVG(label_value), 2) AS base_rate_pct,
+       ROUND(AVG(CASE WHEN decile = 1 THEN label_value END) / AVG(label_value), 2) AS lift
+FROM evalset;
+@explanation
+Lift@10% measures how concentrated churners are among the highest-scored accounts compared with random selection. It directly answers the operational question (a fixed call capacity) and does not depend on the model's threshold.
+@mistakes
+- Using predicted_label instead of ranking by score.
+- Computing deciles over all entities, including those without labels.
+@rubric
+10 points. 3: correct evaluation set (dedup, exclusions); 3: deterministic NTILE; 2: correct rates; 2: lift and its interpretation.
+@interview
+Business-facing model evaluation.
+
+### ASM-12
+title: Pooled recall@5 across retrieval configurations
+difficulty: Advanced
+primary: Retrieval evaluation with pooled relevance
+secondary: union of relevant chunks across systems, per-query recall, macro average
+concepts: ai_hit_rate, ai_retrieval_compare, multiple_ctes, count_distinct
+roles: AI
+time: 20
+dialect: BOTH
+tables: retrieval_evaluations(config_id, query_id, rank_position, chunk_id, is_relevant); retrieval_configs(config_id, config_name)
+columns: config_name, queries_evaluated, recall_at_5_pct
+compare: ordered
+@context
+Assessment task. Hit rate ignores how many relevant chunks were found. A TREC-style **pooled** evaluation treats every chunk judged relevant for a query by any configuration as the set of known relevant chunks.
+@problem
+For each query, the pool = distinct chunks judged relevant (TRUE) by any configuration. For each configuration and query with a non-empty pool, recall@5 = distinct relevant chunks it returned in ranks 1-5 / pool size. Return per configuration: `queries_evaluated` and the mean recall@5 in percent (1 decimal). Sort by config name.
+@expected
+3 rows.
+@edge_cases
+- Queries with an empty pool are excluded (recall undefined).
+@hint1
+CTE 1: pool size per query.
+@hint2
+CTE 2: relevant chunks in the top 5 per (config, query).
+@hint3
+LEFT JOIN configs x queries with a pool to CTE 2 so that configs with 0 found get recall 0.
+@solution
+WITH pool AS (
+    SELECT query_id, COUNT(DISTINCT chunk_id) AS pool_size
+    FROM retrieval_evaluations
+    WHERE is_relevant = TRUE
+    GROUP BY query_id
+),
+found AS (
+    SELECT config_id, query_id, COUNT(DISTINCT chunk_id) AS found_top5
+    FROM retrieval_evaluations
+    WHERE is_relevant = TRUE AND rank_position <= 5
+    GROUP BY config_id, query_id
+)
+SELECT c.config_name,
+       COUNT(*)                                                          AS queries_evaluated,
+       ROUND(100.0 * AVG(1.0 * COALESCE(f.found_top5, 0) / p.pool_size), 1) AS recall_at_5_pct
+FROM retrieval_configs c
+CROSS JOIN pool p
+LEFT JOIN found f ON f.config_id = c.config_id AND f.query_id = p.query_id
+GROUP BY c.config_name
+ORDER BY c.config_name;
+@explanation
+Pooling approximates the unknown full set of relevant documents by merging judgments from all systems, which is the standard way evaluation campaigns compare retrievers. The CROSS JOIN of configs and queries guarantees that a configuration that found nothing for a query contributes a 0 instead of disappearing.
+@mistakes
+- Averaging only over queries where the configuration found something.
+- Counting duplicate chunk IDs within a top-5 list (use DISTINCT).
+@rubric
+10 points. 3: correct pool; 3: per-query recall with zero-filling; 2: macro average; 2: explanation of pooling bias (unjudged chunks).
+@interview
+Evaluation methodology depth for RAG roles.
+
+### ASM-13
+title: Users who tried to buy but never completed
+difficulty: Medium
+primary: HAVING with conditional aggregates
+secondary: "all rows satisfy" logic
+concepts: having, conditional_aggregation, ds_conversion
+roles: DS
+time: 8
+dialect: BOTH
+tables: orders(user_id, status)
+columns: users_with_orders, never_completed, never_completed_pct
+compare: ordered
+@context
+Assessment task. Users whose orders were all canceled, refunded or pending may have hit checkout problems.
+@problem
+Return one row: users with at least one order, users none of whose orders is completed, and that share (2 decimals).
+@expected
+One row.
+@edge_cases
+- "None completed" = completed count is 0, not "has a non-completed order".
+@hint1
+Aggregate per user first.
+@hint2
+`SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) = 0`.
+@hint3
+Aggregate the per-user rows again.
+@solution
+SELECT COUNT(*) AS users_with_orders,
+       SUM(CASE WHEN completed = 0 THEN 1 ELSE 0 END) AS never_completed,
+       ROUND(100.0 * SUM(CASE WHEN completed = 0 THEN 1 ELSE 0 END) / COUNT(*), 2) AS never_completed_pct
+FROM (
+    SELECT user_id, SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) AS completed
+    FROM orders
+    GROUP BY user_id
+) per_user;
+@explanation
+"For all rows" conditions become "count of violating rows = 0" after a per-entity aggregation.
+@mistakes
+- `WHERE status <> 'completed'` (users with mixed histories counted).
+@rubric
+6 points. 3: per-user aggregation; 2: correct "none" logic; 1: share.
+@interview
+Universal quantification in SQL.
+
+### ASM-14
+title: Reactivated customers and time away
+difficulty: Hard
+primary: Gaps between periods with LAG
+secondary: per-dialect day difference, cancellation followed by a new period
+concepts: lag_lead, gaps_islands, churn, date_functions
+roles: DS
+time: 15
+dialect: BOTH
+tables: subscriptions(org_id, status, started_at, ended_at, subscription_id)
+columns: org_id, canceled_at, returned_at, days_away
+compare: ordered
+@context
+Assessment task. Win-back analysis: which organizations canceled and later returned, and after how long?
+@problem
+For each subscription period whose **previous** period of the same organization ended with status `'canceled'`, return `org_id`, `canceled_at` (previous end), `returned_at` (this start) and `days_away` (whole days). Sort by `days_away` descending, then `org_id`.
+@expected
+A list of reactivations.
+@edge_cases
+- Previous period = by `started_at`, then `subscription_id`.
+@hint1
+LAG the previous status and end per organization.
+@hint2
+Keep rows whose previous status is `'canceled'`.
+@hint3
+Day difference: PostgreSQL `CAST(a AS DATE) - CAST(b AS DATE)`, MySQL `DATEDIFF(a, b)`.
+@solution_pg
+SELECT org_id, prev_ended_at AS canceled_at, started_at AS returned_at,
+       CAST(started_at AS DATE) - CAST(prev_ended_at AS DATE) AS days_away
+FROM (
+    SELECT org_id, started_at,
+           LAG(status)   OVER (PARTITION BY org_id ORDER BY started_at, subscription_id) AS prev_status,
+           LAG(ended_at) OVER (PARTITION BY org_id ORDER BY started_at, subscription_id) AS prev_ended_at
+    FROM subscriptions
+) s
+WHERE prev_status = 'canceled'
+ORDER BY days_away DESC, org_id;
+@solution_mysql
+SELECT org_id, prev_ended_at AS canceled_at, started_at AS returned_at,
+       DATEDIFF(started_at, prev_ended_at) AS days_away
+FROM (
+    SELECT org_id, started_at,
+           LAG(status)   OVER (PARTITION BY org_id ORDER BY started_at, subscription_id) AS prev_status,
+           LAG(ended_at) OVER (PARTITION BY org_id ORDER BY started_at, subscription_id) AS prev_ended_at
+    FROM subscriptions
+) s
+WHERE prev_status = 'canceled'
+ORDER BY days_away DESC, org_id;
+@explanation
+LAG exposes the previous period; filtering on its status isolates reactivations. Calendar-day differences use `date - date` in PostgreSQL and `DATEDIFF` in MySQL (which ignores the time part).
+@mistakes
+- Comparing with the *first* subscription instead of the previous one.
+- Using `TIMESTAMPDIFF(DAY, ...)` vs `DATEDIFF` interchangeably. TIMESTAMPDIFF counts full 24h periods.
+@rubric
+8 points. 3: correct LAG partitioning and ordering; 2: correct filter; 2: dialect-correct day difference; 1: ordering.
+@interview
+Win-back analytics with window functions.
+
+### ASM-15
+title: Scoring-run health summary
+difficulty: Easy
+primary: Conditional aggregation per batch
+secondary: NULL counts, prediction rate
+concepts: conditional_aggregation, null_aware_agg, ml_batch_inference
+roles: MLE
+time: 6
+dialect: BOTH
+tables: model_predictions(batch_id, score, feature_as_of_ts, predicted_label)
+columns: batch_id, predictions, null_scores, unlogged_features, predicted_positive_pct
+compare: ordered
+@context
+Assessment task. A quick health summary of every churn scoring batch.
+@problem
+For batches whose ID starts with `churn-`, return `predictions`, `null_scores`, `unlogged_features` and `predicted_positive_pct` (share of predicted_label = 1 among non-NULL labels, 1 decimal). Sort by batch.
+@expected
+One row per churn batch.
+@edge_cases
+- `AVG(predicted_label)` ignores NULLs, which is the desired denominator here.
+@hint1
+Group by `batch_id` with a LIKE filter.
+@hint2
+`COUNT(*) - COUNT(score)` counts NULL scores.
+@hint3
+`100.0 * AVG(predicted_label)`.
+@solution
+SELECT batch_id,
+       COUNT(*)                                 AS predictions,
+       COUNT(*) - COUNT(score)                  AS null_scores,
+       COUNT(*) - COUNT(feature_as_of_ts)       AS unlogged_features,
+       ROUND(100.0 * AVG(predicted_label), 1)   AS predicted_positive_pct
+FROM model_predictions
+WHERE batch_id LIKE 'churn-%'
+GROUP BY batch_id
+ORDER BY batch_id;
+@explanation
+`COUNT(*) - COUNT(col)` is the NULL count; AVG of a 0/1 column is a rate over non-NULL values.
+@mistakes
+- Treating NULL predictions as negatives.
+@rubric
+4 points. 2: NULL counts; 1: rate denominator; 1: filter.
+@interview
+Basic operational monitoring.
+
+### ASM-16
+title: Cost per accepted answer by model
+difficulty: Advanced
+primary: Unit economics combining cost and quality
+secondary: price range join, final feedback, two different grains
+concepts: ai_token_cost, ai_acceptance, multiple_ctes, range_join, dedup_window
+roles: AI, DS
+time: 20
+dialect: BOTH
+tables: llm_requests(request_id, feature, model_name, requested_at, input_tokens, output_tokens, cache_hit); llm_pricing(model_name, effective_from, effective_to, input_usd_per_1k, output_usd_per_1k); ai_feedback(feedback_id, request_id, feedback_type, created_at)
+columns: model_name, requests, cost_usd, accepted_answers, cost_per_accepted_usd
+compare: ordered
+@context
+Assessment task. For the support bot in Q2 2025, which model gives the cheapest **accepted** answer?
+@problem
+Per model: support-bot requests in Q2 2025, total cost (all requests, price in effect, cache hits free; 2 decimals), accepted answers (final feedback = thumbs_up) and cost per accepted answer (4 decimals). Sort by `cost_per_accepted_usd`.
+@expected
+2 rows (atlas-large, nimbus-pro).
+@edge_cases
+- Cost includes failed and unrated requests; acceptance counts only final thumbs-up verdicts.
+- Feedback coverage differs by model, which biases this metric. Mention it.
+@hint1
+Per-request cost via the price range join.
+@hint2
+Final feedback per request via ROW_NUMBER.
+@hint3
+LEFT JOIN feedback to the request-level cost rows, then aggregate per model.
+@solution
+WITH cost AS (
+    SELECT r.request_id, r.model_name,
+           CASE WHEN r.cache_hit THEN 0
+                ELSE r.input_tokens / 1000.0 * p.input_usd_per_1k
+                   + COALESCE(r.output_tokens, 0) / 1000.0 * p.output_usd_per_1k END AS cost_usd
+    FROM llm_requests r
+    JOIN llm_pricing p
+      ON p.model_name = r.model_name
+     AND CAST(r.requested_at AS DATE) BETWEEN p.effective_from AND COALESCE(p.effective_to, DATE '9999-12-31')
+    WHERE r.feature = 'support_bot'
+      AND r.requested_at >= TIMESTAMP '2025-04-01 00:00:00'
+      AND r.requested_at <  TIMESTAMP '2025-07-01 00:00:00'
+),
+final_fb AS (
+    SELECT request_id, feedback_type
+    FROM (SELECT request_id, feedback_type,
+                 ROW_NUMBER() OVER (PARTITION BY request_id ORDER BY created_at DESC, feedback_id DESC) AS rn
+          FROM ai_feedback) x
+    WHERE rn = 1
+)
+SELECT c.model_name,
+       COUNT(*)                                                         AS requests,
+       ROUND(SUM(c.cost_usd), 2)                                        AS cost_usd,
+       SUM(CASE WHEN f.feedback_type = 'thumbs_up' THEN 1 ELSE 0 END)   AS accepted_answers,
+       ROUND(SUM(c.cost_usd) / NULLIF(SUM(CASE WHEN f.feedback_type = 'thumbs_up' THEN 1 ELSE 0 END), 0), 4)
+                                                                        AS cost_per_accepted_usd
+FROM cost c
+LEFT JOIN final_fb f ON f.request_id = c.request_id
+GROUP BY c.model_name
+ORDER BY cost_per_accepted_usd, c.model_name;
+@explanation
+Unit economics combine a cost measured on every request with an outcome measured on a subset. Keeping both at the request grain (one cost row and at most one final verdict per request) prevents fan-out. Because only ~20% of answers get feedback, "cost per accepted answer" is better read as a comparative index between models than as an absolute price.
+@mistakes
+- Joining raw feedback (double counts changed votes).
+- Dividing by all successful requests and calling it "accepted".
+@rubric
+10 points. 3: correct cost with time-varying prices; 3: final feedback dedup; 2: correct aggregation without fan-out; 2: discussion of coverage bias.
+@interview
+Combines AI cost and quality, the core trade-off of LLM product engineering.

@@ -1,0 +1,4 @@
+config_id,config_name,embedding_model,chunk_size_tokens,chunk_overlap_tokens,top_k,uses_reranker,created_at
+1,dense_small_512,embed-small-v2,512,0,5,false,2024-09-20 10:00:00
+2,dense_large_384_ov64,embed-large-v3,384,64,5,false,2025-01-25 10:00:00
+3,hybrid_rerank_k10,embed-large-v3,384,64,10,true,2025-04-10 10:00:00

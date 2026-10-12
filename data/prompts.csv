@@ -1,0 +1,10 @@
+prompt_version_id,prompt_name,version,template_text,created_at,author,is_active
+1,support_answer,1,[v1] You are the Lumen support assistant. Answer using ONLY the context below. Cite sources. Context: {{chunks}} Question: {{question}},2024-10-01 09:00:00,maya.patel,false
+2,support_answer,2,[v2] You are the Lumen support assistant. Answer using ONLY the context below. Cite sources. Context: {{chunks}} Question: {{question}},2024-12-10 10:00:00,maya.patel,false
+3,support_answer,3,[v3] You are the Lumen support assistant. Answer using ONLY the context below. Cite sources. Context: {{chunks}} Question: {{question}},2025-03-05 15:00:00,jonas.weber,false
+4,support_answer,4,[v4] You are the Lumen support assistant. Answer using ONLY the context below. Cite sources. Context: {{chunks}} Question: {{question}},2025-05-20 11:00:00,maya.patel,true
+5,sql_copilot,1,[v1] You write {{dialect}} SQL for the schema below. Return one query and a short explanation. Schema: {{schema}} Request: {{request}},2024-10-01 09:00:00,arjun.iyer,false
+6,sql_copilot,2,[v2] You write {{dialect}} SQL for the schema below. Return one query and a short explanation. Schema: {{schema}} Request: {{request}},2025-01-20 13:00:00,arjun.iyer,false
+7,sql_copilot,3,[v3] You write {{dialect}} SQL for the schema below. Return one query and a short explanation. Schema: {{schema}} Request: {{request}},2025-04-15 16:00:00,lena.fischer,true
+8,doc_summary,1,[v1] Summarize the document for a busy reader in at most {{max_bullets}} bullet points. Document: {{document}},2024-11-01 09:00:00,omar.khan,false
+9,doc_summary,2,[v2] Summarize the document for a busy reader in at most {{max_bullets}} bullet points. Document: {{document}},2025-02-10 12:00:00,omar.khan,true

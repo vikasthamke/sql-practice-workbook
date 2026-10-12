@@ -1,0 +1,767 @@
+### SQL-046
+title: Products priced above the catalogue average
+difficulty: Easy
+primary: Scalar subquery
+secondary: subquery in WHERE and SELECT
+concepts: scalar_subquery, subquery_where, arithmetic
+roles: DS
+time: 6
+dialect: BOTH
+tables: products(product_name, list_price, is_active)
+columns: product_name, list_price, avg_list_price, above_avg_by
+compare: ordered
+@context
+The pricing team reviews active products whose list price is above the average active list price.
+@problem
+Return `product_name`, `list_price`, the average active list price (`avg_list_price`, 2 decimals) and the difference `above_avg_by` (2 decimals) for active products priced above that average. Sort by `list_price` descending, then name.
+@expected
+One row per expensive product. Every row shows the same average.
+@edge_cases
+- The average must be computed over active products only, the same population as the filter.
+@hint1
+You need a single number (the average) next to every row and in the filter.
+@hint2
+A scalar subquery `(SELECT AVG(list_price) FROM products WHERE is_active = TRUE)` returns exactly one value.
+@hint3
+Use it twice, once in SELECT and once in WHERE (or compute it once in a CTE and CROSS JOIN it).
+@solution
+SELECT product_name,
+       list_price,
+       ROUND((SELECT AVG(list_price) FROM products WHERE is_active = TRUE), 2) AS avg_list_price,
+       ROUND(list_price - (SELECT AVG(list_price) FROM products WHERE is_active = TRUE), 2) AS above_avg_by
+FROM products
+WHERE is_active = TRUE
+  AND list_price > (SELECT AVG(list_price) FROM products WHERE is_active = TRUE)
+ORDER BY list_price DESC, product_name;
+@alternative
+WITH stats AS (
+    SELECT AVG(list_price) AS avg_price
+    FROM products
+    WHERE is_active = TRUE
+)
+SELECT p.product_name,
+       p.list_price,
+       ROUND(s.avg_price, 2)                AS avg_list_price,
+       ROUND(p.list_price - s.avg_price, 2) AS above_avg_by
+FROM products p
+CROSS JOIN stats s
+WHERE p.is_active = TRUE
+  AND p.list_price > s.avg_price
+ORDER BY p.list_price DESC, p.product_name;
+@alternative_note
+A one-row CTE cross-joined to the table avoids repeating the subquery and makes the threshold reusable. Both engines evaluate an uncorrelated scalar subquery only once, so performance is the same.
+@explanation
+A **scalar subquery** returns one row and one column, and can be used wherever a single value is allowed. Because it does not reference the outer query (it is *uncorrelated*), the engine evaluates it once. If a scalar subquery ever returned more than one row, the query would fail at runtime: "more than one row returned by a subquery".
+@mistakes
+- `WHERE list_price > AVG(list_price)`: aggregates are not allowed in WHERE.
+- Averaging all products (including discontinued ones) while filtering active ones.
+@performance
+Uncorrelated scalar subqueries are computed once and cached.
+@interview
+Basic subquery fluency; the CTE rewrite shows code-organisation skills.
+
+### SQL-047
+title: Latest ticket per enterprise organization (correlated subquery)
+difficulty: Medium
+primary: Correlated subquery
+secondary: ties in "latest", MAX per group
+concepts: correlated_subquery, subquery_where, top_n_per_group
+roles: DS
+time: 10
+dialect: BOTH
+tables: support_tickets(ticket_id, org_id, created_at, priority, status); organizations(org_id, segment)
+columns: org_id, ticket_id, created_at, priority, status
+compare: ordered
+@context
+Account managers open each Enterprise customer's most recent support ticket before a call.
+@problem
+For every Enterprise organization that has tickets, return its most recent ticket (`org_id`, `ticket_id`, `created_at`, `priority`, `status`). If two tickets share the latest timestamp, return the one with the higher `ticket_id`. Sort by `org_id`.
+@expected
+One row per Enterprise organization with at least one ticket.
+@edge_cases
+- `created_at = MAX(created_at)` alone returns several rows when timestamps tie.
+@hint1
+For each ticket, compare it to the maximum timestamp *of its own organization*.
+@hint2
+A correlated subquery refers to the outer row: `WHERE t2.org_id = t.org_id`.
+@hint3
+To break ties deterministically, look for the maximum `ticket_id` among tickets of the org ordered by `(created_at, ticket_id)`, e.g. `t.ticket_id = (SELECT t2.ticket_id FROM ... ORDER BY t2.created_at DESC, t2.ticket_id DESC LIMIT 1)`.
+@solution
+SELECT t.org_id,
+       t.ticket_id,
+       t.created_at,
+       t.priority,
+       t.status
+FROM support_tickets t
+JOIN organizations o ON o.org_id = t.org_id
+WHERE o.segment = 'Enterprise'
+  AND t.ticket_id = (SELECT t2.ticket_id
+                     FROM support_tickets t2
+                     WHERE t2.org_id = t.org_id
+                     ORDER BY t2.created_at DESC, t2.ticket_id DESC
+                     LIMIT 1)
+ORDER BY t.org_id;
+@explanation
+The subquery runs logically once per outer row and returns the ID of that organization's newest ticket. Using ORDER BY + LIMIT 1 inside the scalar subquery gives a deterministic winner even with tied timestamps. The simpler `t.created_at = (SELECT MAX(created_at) ...)` returns all tied rows.
+
+Window functions (`ROW_NUMBER() OVER (PARTITION BY org_id ORDER BY created_at DESC, ticket_id DESC)`, SQL-061) solve the same problem in one pass and are usually preferred on large tables.
+@mistakes
+- Using MAX(created_at) and assuming uniqueness.
+- Correlating on the wrong column (e.g. `t2.ticket_id = t.ticket_id`), which makes every ticket "the latest".
+@performance
+With the `support_tickets(org_id, created_at)` index each probe is an index range scan (backwards). Without that index this would be O(n²).
+@interview
+Interviewers often ask for both the correlated-subquery and the window-function versions and when each is preferable.
+
+### SQL-048
+title: Active users left in fully churned organizations
+difficulty: Medium
+primary: Subqueries in WHERE (IN / NOT IN)
+secondary: set membership, data-quality rule
+concepts: subquery_where, in_not_in, ds_duplicates, ds_churn_cohort
+roles: DS
+time: 10
+dialect: BOTH
+tables: users(user_id, org_id, status); subscriptions(org_id, status, ended_at)
+columns: org_id, active_users
+compare: ordered
+@context
+When an organization churns, its users should be deactivated. Data quality wants to find organizations that have **no open subscription**, have at least one canceled subscription, and still have users with status `'active'`.
+@problem
+Return `org_id` and the number of still-active users for such organizations, sorted by `active_users` descending, then `org_id`.
+@expected
+A list of organizations with stale user statuses.
+@edge_cases
+- "No open subscription" = no subscription with `ended_at IS NULL`. `subscriptions.org_id` is NOT NULL, so `NOT IN` is safe here, but say so.
+- An organization that canceled and later came back has an open subscription and must be excluded.
+@hint1
+Express each condition as a set of `org_id`s.
+@hint2
+`org_id IN (SELECT org_id FROM subscriptions WHERE status = 'canceled')` and `org_id NOT IN (SELECT org_id FROM subscriptions WHERE ended_at IS NULL)`.
+@hint3
+Filter users by status and both conditions, then group by org.
+@solution
+SELECT u.org_id,
+       COUNT(*) AS active_users
+FROM users u
+WHERE u.status = 'active'
+  AND u.org_id IN (SELECT s.org_id FROM subscriptions s WHERE s.status = 'canceled')
+  AND u.org_id NOT IN (SELECT s.org_id FROM subscriptions s WHERE s.ended_at IS NULL)
+GROUP BY u.org_id
+ORDER BY active_users DESC, u.org_id;
+@explanation
+`IN (subquery)` keeps rows whose value appears in the subquery result (a semi-join). `NOT IN (subquery)` keeps rows whose value does not appear (an anti-join). NOT IN is only safe when the subquery cannot return NULL (SQL-013); `subscriptions.org_id` is declared NOT NULL. In code that will be maintained, prefer NOT EXISTS anyway.
+
+The query encodes a business rule as a data-quality check: a churned customer should not have active seats.
+@mistakes
+- Using `status = 'canceled'` alone and forgetting reactivated customers.
+- Checking only the latest subscription row by ID instead of "any open period".
+@performance
+Both engines turn IN into a semi-join and NOT IN (non-nullable) into an anti-join; `subscriptions(org_id, ...)` supports both.
+@interview
+Shows set-based thinking. Expect follow-up questions on NULL safety and on how to turn this into an automated test.
+
+### SQL-049
+title: Organizations above average 2025 revenue (CTEs)
+difficulty: Medium
+primary: Common table expressions
+secondary: multiple CTEs, CROSS JOIN of a one-row CTE
+concepts: cte, multiple_ctes, ratios, ds_segments
+roles: DS
+time: 10
+dialect: BOTH
+tables: orders(org_id, status, order_total, order_ts); organizations(org_id, org_name, segment)
+columns: org_id, org_name, segment, revenue, avg_org_revenue, revenue_vs_avg
+compare: ordered
+@context
+Customer success wants to know which accounts bring in more than twice the average H1-2025 revenue of paying organizations.
+@problem
+Compute each organization's revenue from completed orders in H1 2025, the average across organizations with revenue, and list organizations with revenue > 2x average. Return `org_id`, `org_name`, `segment`, `revenue`, `avg_org_revenue` (2 decimals), `revenue_vs_avg` (ratio, 2 decimals). Sort by revenue descending.
+@expected
+A short list of top accounts.
+@edge_cases
+- The average is over *organizations that bought*, not over all organizations; state this assumption.
+@hint1
+Break the problem into named steps: revenue per org → average → filter.
+@hint2
+`WITH org_rev AS (...), stats AS (SELECT AVG(revenue) ... FROM org_rev)`.
+@hint3
+Join `org_rev` to `organizations` and `CROSS JOIN stats`.
+@solution
+WITH org_rev AS (
+    SELECT org_id, SUM(order_total) AS revenue
+    FROM orders
+    WHERE status = 'completed'
+      AND order_ts >= TIMESTAMP '2025-01-01 00:00:00'
+      AND order_ts <  TIMESTAMP '2025-07-01 00:00:00'
+    GROUP BY org_id
+),
+stats AS (
+    SELECT AVG(revenue) AS avg_revenue FROM org_rev
+)
+SELECT r.org_id,
+       o.org_name,
+       o.segment,
+       r.revenue,
+       ROUND(s.avg_revenue, 2)               AS avg_org_revenue,
+       ROUND(r.revenue / s.avg_revenue, 2)   AS revenue_vs_avg
+FROM org_rev r
+JOIN organizations o ON o.org_id = r.org_id
+CROSS JOIN stats s
+WHERE r.revenue > 2 * s.avg_revenue
+ORDER BY r.revenue DESC, r.org_id;
+@explanation
+CTEs name intermediate results, so a multi-step calculation reads top to bottom like a pipeline. `org_rev` has one row per paying organization; `stats` aggregates it to a single row. Because `stats` has exactly one row, the CROSS JOIN attaches the average to every row without changing the row count.
+
+PostgreSQL (12+) inlines CTEs that are referenced once and are side-effect free, and MySQL merges or materializes them. Either way, CTEs are a readability tool, not an optimization fence (PostgreSQL < 12 always materialized them).
+@mistakes
+- Averaging over all 200 organizations (including zero-revenue ones) without saying so.
+- Joining `organizations` before computing the average, which is fine here, but would be wrong if the join could duplicate rows.
+@performance
+The orders date filter is applied once; the CTE `org_rev` is referenced twice (directly and via `stats`) and may be materialized.
+@interview
+Clear, named steps are what senior reviewers look for in analytical SQL.
+
+### SQL-050
+title: Account health dataset from several grains
+difficulty: Advanced
+primary: Multiple CTEs as an analytical pipeline
+secondary: pre-aggregation per source, LEFT JOIN zero-filling, as-of date
+concepts: multiple_ctes, cte, left_join, fanout, ds_analysis_dataset, ml_historical_features
+roles: DS, MLE
+time: 25
+dialect: BOTH
+tables: organizations(org_id, segment, is_deleted); users(user_id, org_id); sessions(user_id, started_at); support_tickets(org_id, created_at, resolved_at); orders(org_id, status, order_total, order_ts); subscriptions(org_id, mrr, started_at, ended_at)
+columns: org_id, segment, users, active_users_30d, sessions_30d, open_tickets, revenue_h1_2025, open_mrr
+compare: ordered
+@context
+A churn-risk model and a CS dashboard both need one row per account with signals from different tables, all measured **as of 2025-07-01**.
+@problem
+For non-deleted Mid-Market and Enterprise organizations, return:
+`users` (all user accounts), `active_users_30d` (users with a session in the 30 days before 2025-07-01), `sessions_30d`, `open_tickets` (created before 2025-07-01 and not resolved by then), `revenue_h1_2025` (completed orders), and `open_mrr` (MRR of subscriptions open on 2025-07-01). Missing activity must show as 0. Sort by `open_mrr` descending, then `org_id`.
+@expected
+One row per qualifying organization; no NULLs in the metric columns.
+@edge_cases
+- Every source has a different grain (user, session, ticket, order, subscription period). Joining them raw to organizations would multiply rows.
+- An organization with overlapping open subscriptions (billing bug) sums both, which is consistent with the stored data.
+@hint1
+Write one CTE per source, each aggregated to one row per `org_id`.
+@hint2
+Start from organizations and LEFT JOIN every CTE; wrap metrics in COALESCE(…, 0).
+@hint3
+`active_users_30d` needs sessions joined to users: `COUNT(DISTINCT s.user_id)` per org within `[2025-06-01, 2025-07-01)`.
+@solution
+WITH u AS (
+    SELECT org_id, COUNT(*) AS users
+    FROM users
+    GROUP BY org_id
+),
+act AS (
+    SELECT us.org_id,
+           COUNT(DISTINCT s.user_id) AS active_users_30d,
+           COUNT(*)                  AS sessions_30d
+    FROM sessions s
+    JOIN users us ON us.user_id = s.user_id
+    WHERE s.started_at >= TIMESTAMP '2025-07-01 00:00:00' - INTERVAL '30' DAY
+      AND s.started_at <  TIMESTAMP '2025-07-01 00:00:00'
+    GROUP BY us.org_id
+),
+tix AS (
+    SELECT org_id, COUNT(*) AS open_tickets
+    FROM support_tickets
+    WHERE created_at < TIMESTAMP '2025-07-01 00:00:00'
+      AND (resolved_at IS NULL OR resolved_at >= TIMESTAMP '2025-07-01 00:00:00')
+    GROUP BY org_id
+),
+rev AS (
+    SELECT org_id, SUM(order_total) AS revenue_h1_2025
+    FROM orders
+    WHERE status = 'completed'
+      AND order_ts >= TIMESTAMP '2025-01-01 00:00:00'
+      AND order_ts <  TIMESTAMP '2025-07-01 00:00:00'
+    GROUP BY org_id
+),
+mrr AS (
+    SELECT org_id, SUM(mrr) AS open_mrr
+    FROM subscriptions
+    WHERE started_at < TIMESTAMP '2025-07-01 00:00:00'
+      AND (ended_at IS NULL OR ended_at > TIMESTAMP '2025-07-01 00:00:00')
+    GROUP BY org_id
+)
+SELECT o.org_id,
+       o.segment,
+       COALESCE(u.users, 0)               AS users,
+       COALESCE(act.active_users_30d, 0)  AS active_users_30d,
+       COALESCE(act.sessions_30d, 0)      AS sessions_30d,
+       COALESCE(tix.open_tickets, 0)      AS open_tickets,
+       COALESCE(rev.revenue_h1_2025, 0)   AS revenue_h1_2025,
+       COALESCE(mrr.open_mrr, 0)          AS open_mrr
+FROM organizations o
+LEFT JOIN u   ON u.org_id = o.org_id
+LEFT JOIN act ON act.org_id = o.org_id
+LEFT JOIN tix ON tix.org_id = o.org_id
+LEFT JOIN rev ON rev.org_id = o.org_id
+LEFT JOIN mrr ON mrr.org_id = o.org_id
+WHERE o.is_deleted = FALSE
+  AND o.segment IN ('Mid-Market', 'Enterprise')
+ORDER BY open_mrr DESC, o.org_id;
+@explanation
+This is the canonical **wide analytical table** pattern:
+1. One CTE per source, each reduced to the target grain (organization).
+2. A *spine* (`organizations`) that defines which rows exist.
+3. LEFT JOINs from the spine to each aggregate, with COALESCE to turn "no activity" into 0.
+
+Everything is measured relative to one **as-of instant** (2025-07-01). Tickets are "open" if created before it and not resolved by then. That is a point-in-time definition, not the current `status` column, which can change later. ML feature tables use the same approach (SQL-099).
+@mistakes
+- Joining `sessions`, `tickets` and `orders` directly to `organizations` and using COUNT/SUM: fan-out across sources.
+- Using `status IN ('open','pending')` for open tickets. That gives today's status, not the status as of the snapshot date.
+- Forgetting COALESCE, so organizations without tickets show NULL instead of 0.
+@performance
+Each CTE scans its source once. On large data, filter the session CTE by date first (indexed) and only then join to users.
+@interview
+A realistic take-home style task. Clean CTE structure, explicit grain and as-of logic are what reviewers grade.
+
+### SQL-051
+title: Corporate hierarchy below a parent company (recursive CTE)
+difficulty: Hard
+primary: Recursive CTE (walking down a tree)
+secondary: depth tracking, path strings, dialect type rules
+concepts: recursive_cte, self_join, string_functions
+roles: DS
+time: 15
+dialect: BOTH
+tables: organizations(org_id, org_name, parent_org_id)
+columns: org_id, org_name, depth, path
+compare: ordered
+@context
+For an enterprise deal, sales needs every subsidiary (at any depth) of organization 12, *Summit Networks Co*, with its level in the hierarchy.
+@problem
+Return organization 12 and all its descendants with `depth` (0 for the root) and `path`, a string of org IDs from the root, like `'12 > 49 > 94'`. Sort by `path`.
+@expected
+5 rows (the root plus 4 descendants), depth up to 3.
+@edge_cases
+- **Type rules differ.** PostgreSQL requires the recursive column to have the same type in both branches; MySQL sizes the column from the anchor row, so a longer path would be truncated or raise "Data too long". Cast the path in the anchor member explicitly.
+- A cycle in the data would recurse forever; real code adds a depth limit.
+@hint1
+Anchor member: the root row. Recursive member: children of rows already found.
+@hint2
+`WITH RECURSIVE tree AS (SELECT ... WHERE org_id = 12 UNION ALL SELECT ... FROM organizations c JOIN tree t ON c.parent_org_id = t.org_id)`.
+@hint3
+PostgreSQL: `CAST(org_id AS TEXT)` in the anchor. MySQL: `CAST(org_id AS CHAR(200))`. Extend with `CONCAT(t.path, ' > ', c.org_id)`.
+@solution_pg
+WITH RECURSIVE tree AS (
+    SELECT org_id, org_name, 0 AS depth, CAST(org_id AS TEXT) AS path
+    FROM organizations
+    WHERE org_id = 12
+    UNION ALL
+    SELECT c.org_id, c.org_name, t.depth + 1, CONCAT(t.path, ' > ', c.org_id)
+    FROM organizations c
+    JOIN tree t ON c.parent_org_id = t.org_id
+    WHERE t.depth < 10
+)
+SELECT org_id, org_name, depth, path
+FROM tree
+ORDER BY path;
+@solution_mysql
+WITH RECURSIVE tree AS (
+    SELECT org_id, org_name, 0 AS depth, CAST(org_id AS CHAR(200)) AS path
+    FROM organizations
+    WHERE org_id = 12
+    UNION ALL
+    SELECT c.org_id, c.org_name, t.depth + 1, CONCAT(t.path, ' > ', c.org_id)
+    FROM organizations c
+    JOIN tree t ON c.parent_org_id = t.org_id
+    WHERE t.depth < 10
+)
+SELECT org_id, org_name, depth, path
+FROM tree
+ORDER BY path;
+@assert
+len(rows) == 5
+max(int(r[2]) for r in rows) == 3
+@dialect_note
+Both engines need `WITH RECURSIVE`. The difference is the type of the accumulating string: PostgreSQL rejects `character varying` vs `text` mismatches between the anchor and the recursive member, and MySQL derives the column width from the anchor (`CAST(... AS CHAR(n))` reserves room). `CAST(x AS TEXT)` is not valid in MySQL, and `CAST(x AS CHAR(200))` in PostgreSQL produces a blank-padded `character(200)`, so each engine gets its own cast.
+@explanation
+A recursive CTE has two members joined by UNION ALL:
+1. The **anchor** runs once and seeds the result (the root).
+2. The **recursive member** joins the table to the rows produced in the previous iteration and stops when it adds no new rows.
+
+`depth` counts iterations; `path` accumulates the route, which also gives a natural depth-first sort order. The `t.depth < 10` guard protects against accidental cycles. PostgreSQL 14+ also has a `CYCLE` clause, and MySQL limits recursion with `cte_max_recursion_depth` (default 1000).
+
+Sorting by `path` as a string works here because IDs are compared character by character. For numeric-correct ordering, zero-pad the IDs.
+@mistakes
+- Joining in the wrong direction (`c.org_id = t.parent_org_id`), which walks *up* the tree.
+- Using `UNION` instead of `UNION ALL`: it adds a de-duplication step that is unnecessary here and can hide modelling errors.
+@performance
+Each iteration probes `organizations(parent_org_id)`, which is indexed.
+@interview
+Hierarchies (org charts, categories, bill of materials) are the classic recursive-CTE interview topic.
+
+### SQL-052
+title: Category tree with product counts rolled up to every ancestor
+difficulty: Hard
+primary: Recursive CTE producing ancestor-descendant pairs
+secondary: rolling counts up a hierarchy, LEFT JOIN with zero counts
+concepts: recursive_cte, left_join, aggregates, ds_top_products
+roles: DS
+time: 18
+dialect: BOTH
+tables: product_categories(category_id, category_name, parent_category_id); products(product_id, category_id, is_active)
+columns: category_id, category_name, active_products_incl_descendants
+compare: ordered
+@context
+The storefront shows each category with the number of active products underneath it, including all sub-categories. "Services" should count the products of "Training", "Implementation" and "Custom Integration".
+@problem
+Return every category with `active_products_incl_descendants`. Sort by `category_id`.
+@expected
+11 rows; root categories have the largest counts.
+@edge_cases
+- Products sit on leaf categories only, but the query should also work if a product were attached to an inner node.
+- Categories without products must show 0.
+@hint1
+First build a table of all (ancestor, descendant) pairs, including each category paired with itself.
+@hint2
+Anchor: `SELECT category_id AS ancestor_id, category_id AS descendant_id`. Recursive: add the children of each descendant.
+@hint3
+Join the pairs to products on `descendant_id` and count per ancestor.
+@solution
+WITH RECURSIVE closure AS (
+    SELECT category_id AS ancestor_id, category_id AS descendant_id
+    FROM product_categories
+    UNION ALL
+    SELECT c.ancestor_id, pc.category_id
+    FROM closure c
+    JOIN product_categories pc ON pc.parent_category_id = c.descendant_id
+)
+SELECT pc.category_id,
+       pc.category_name,
+       COUNT(p.product_id) AS active_products_incl_descendants
+FROM product_categories pc
+JOIN closure c       ON c.ancestor_id = pc.category_id
+LEFT JOIN products p ON p.category_id = c.descendant_id
+                    AND p.is_active = TRUE
+GROUP BY pc.category_id, pc.category_name
+ORDER BY pc.category_id;
+@assert
+len(rows) == 11
+@explanation
+The recursive CTE computes the **transitive closure** of the tree: every (ancestor, descendant) pair, including the zero-length pair (category, itself). Once you have the closure, any "roll-up through the hierarchy" is a plain join and GROUP BY. Products attached to any descendant count toward every ancestor.
+
+The LEFT JOIN with the `is_active` filter in ON keeps categories with zero active products. Many production systems store this closure table permanently because hierarchy roll-ups are so common.
+@mistakes
+- Counting only direct children (one level).
+- Putting `p.is_active = TRUE` in WHERE, which removes categories whose products are all inactive.
+@performance
+The closure has at most n x depth rows (here 20); for large trees, a materialized closure table with indexes on both columns is standard.
+@interview
+Transitive closure is a step up from "walk the tree" and signals solid recursive-CTE skills.
+
+### SQL-053
+title: Daily sign-ups with zero days filled in (date spine)
+difficulty: Medium
+primary: Recursive CTE as a date generator
+secondary: LEFT JOIN to a spine, CAST of date arithmetic
+concepts: recursive_cte, time_series, left_join, date_functions
+roles: DS
+time: 12
+dialect: BOTH
+tables: users(user_id, signup_at)
+columns: day, signups
+compare: ordered
+@context
+The sign-up chart for June 2025 has gaps where no one signed up. Charts and moving averages need an explicit 0 for those days.
+@problem
+Return one row for **every** day of June 2025 with the number of sign-ups that day (0 if none). Generate the dates with a recursive CTE so the query is portable.
+@expected
+Exactly 30 rows.
+@edge_cases
+- In PostgreSQL, `date + INTERVAL` returns a TIMESTAMP, which breaks the type match between the recursive branches. Cast back to DATE.
+- MySQL's default `cte_max_recursion_depth` is 1000. Longer spines need a larger value or a calendar table.
+@hint1
+Start the CTE at 2025-06-01 and add one day per iteration until 2025-06-30.
+@hint2
+`SELECT CAST(day + INTERVAL '1' DAY AS DATE) FROM spine WHERE day < DATE '2025-06-30'`.
+@hint3
+LEFT JOIN users on `signup_at >= day AND signup_at < day + 1 day` and `COUNT(u.user_id)`.
+@solution
+WITH RECURSIVE spine AS (
+    SELECT DATE '2025-06-01' AS day
+    UNION ALL
+    SELECT CAST(day + INTERVAL '1' DAY AS DATE)
+    FROM spine
+    WHERE day < DATE '2025-06-30'
+)
+SELECT s.day,
+       COUNT(u.user_id) AS signups
+FROM spine s
+LEFT JOIN users u
+       ON u.signup_at >= s.day
+      AND u.signup_at <  s.day + INTERVAL '1' DAY
+GROUP BY s.day
+ORDER BY s.day;
+@assert
+len(rows) == 30
+@explanation
+A **date spine** is a table containing every period you want to report, independent of whether facts exist. The recursive CTE produces it portably; PostgreSQL users often write `generate_series(DATE '2025-06-01', DATE '2025-06-30', INTERVAL '1 day')` instead (see SQL-170), and many warehouses keep a permanent calendar table.
+
+Joining with a half-open range (`>= day AND < day + 1`) keeps the users' timestamp column unwrapped, so an index on `signup_at` remains usable. `COUNT(u.user_id)` returns 0 for days without a match.
+@mistakes
+- `COUNT(*)` returns 1 for empty days.
+- Forgetting the CAST in PostgreSQL ("recursive query column has type date in non-recursive term but type timestamp overall").
+@performance
+30 index range probes; trivial.
+@interview
+"How do you show days with zero events?" is a standard follow-up to any time-series query.
+
+### SQL-054
+title: Model lineage: all ancestors of a model version
+difficulty: Medium
+primary: Recursive CTE walking up a tree
+secondary: self-referencing foreign key, generations count
+concepts: recursive_cte, ml_model_compare
+roles: MLE
+time: 10
+dialect: BOTH
+tables: model_versions(model_version_id, model_name, version_label, parent_version_id, trained_at, deployed_at)
+columns: model_version_id, version_label, generations_back, trained_at, deployed_at
+compare: ordered
+@context
+An auditor asks for the full training lineage of the shadow model `churn_classifier v4`: every version it was retrained from, back to the first one.
+@problem
+Return v4 and all its ancestors with `generations_back` (0 for v4 itself), plus `trained_at` and `deployed_at`. Find v4 by `model_name` and `version_label`. Sort by `generations_back`.
+@expected
+4 rows: v4, v3, v2, v1.
+@edge_cases
+- The root has `parent_version_id IS NULL`, which naturally stops the recursion.
+@hint1
+Walk from child to parent: each iteration looks up the parent of the previous row.
+@hint2
+Recursive member: `JOIN model_versions p ON p.model_version_id = a.parent_version_id`.
+@hint3
+Carry `generations_back + 1` in the recursive member.
+@solution
+WITH RECURSIVE ancestry AS (
+    SELECT model_version_id, version_label, parent_version_id, trained_at, deployed_at,
+           0 AS generations_back
+    FROM model_versions
+    WHERE model_name = 'churn_classifier' AND version_label = 'v4'
+    UNION ALL
+    SELECT p.model_version_id, p.version_label, p.parent_version_id, p.trained_at, p.deployed_at,
+           a.generations_back + 1
+    FROM model_versions p
+    JOIN ancestry a ON p.model_version_id = a.parent_version_id
+)
+SELECT model_version_id, version_label, generations_back, trained_at, deployed_at
+FROM ancestry
+ORDER BY generations_back;
+@assert
+len(rows) == 4
+@explanation
+Walking *up* a tree joins the parent's primary key to the current row's `parent_version_id`. Each step finds exactly one parent, so the result is a chain. The recursion ends when the root's NULL parent matches nothing.
+
+**ML angle:** lineage queries answer "which data and which parent model produced this model?", a key part of reproducibility and model governance.
+@mistakes
+- Swapping the join direction, which lists descendants instead.
+@performance
+Primary-key lookups only.
+@interview
+Short, but checks that the candidate can write recursion in both directions.
+
+### SQL-055
+title: Accounts with urgent tickets and recent purchases: IN vs EXISTS vs JOIN
+difficulty: Medium
+primary: Subquery versus join trade-offs
+secondary: duplicates from joins, semi-join equivalence
+concepts: subquery_vs_join, semi_join, subquery_where, fanout
+roles: DS
+time: 12
+dialect: BOTH
+tables: organizations(org_id, org_name); support_tickets(org_id, priority, created_at); orders(org_id, status, order_ts)
+columns: org_id, org_name
+compare: ordered
+@context
+Customer success wants accounts that both opened an urgent ticket and completed a purchase in Q2 2025, since an angry and still-buying customer is a renewal risk worth a call.
+@problem
+Return `org_id` and `org_name` of organizations satisfying both conditions, once each, sorted by `org_id`. Solve it with EXISTS, and compare with the IN and JOIN versions.
+@expected
+One row per qualifying organization, no duplicates.
+@edge_cases
+- A JOIN version without DISTINCT returns one row per (urgent ticket x completed order) pair.
+@hint1
+Both conditions are existence tests on child tables.
+@hint2
+`WHERE EXISTS (... tickets ...) AND EXISTS (... orders ...)`.
+@hint3
+The JOIN version needs `SELECT DISTINCT` (or GROUP BY) to remove the fan-out.
+@solution
+SELECT o.org_id,
+       o.org_name
+FROM organizations o
+WHERE EXISTS (SELECT 1 FROM support_tickets t
+              WHERE t.org_id = o.org_id
+                AND t.priority = 'urgent'
+                AND t.created_at >= TIMESTAMP '2025-04-01 00:00:00'
+                AND t.created_at <  TIMESTAMP '2025-07-01 00:00:00')
+  AND EXISTS (SELECT 1 FROM orders r
+              WHERE r.org_id = o.org_id
+                AND r.status = 'completed'
+                AND r.order_ts >= TIMESTAMP '2025-04-01 00:00:00'
+                AND r.order_ts <  TIMESTAMP '2025-07-01 00:00:00')
+ORDER BY o.org_id;
+@alternative
+SELECT DISTINCT o.org_id,
+       o.org_name
+FROM organizations o
+JOIN support_tickets t ON t.org_id = o.org_id
+                      AND t.priority = 'urgent'
+                      AND t.created_at >= TIMESTAMP '2025-04-01 00:00:00'
+                      AND t.created_at <  TIMESTAMP '2025-07-01 00:00:00'
+JOIN orders r          ON r.org_id = o.org_id
+                      AND r.status = 'completed'
+                      AND r.order_ts >= TIMESTAMP '2025-04-01 00:00:00'
+                      AND r.order_ts <  TIMESTAMP '2025-07-01 00:00:00'
+ORDER BY o.org_id;
+@alternative_note
+The JOIN + DISTINCT version returns the same rows, but builds every ticket x order pair first and then removes the duplicates, which is wasted work that grows multiplicatively. An `IN (SELECT org_id ...)` version is equivalent to EXISTS and equally efficient in modern engines.
+@explanation
+When you only need to know *whether* related rows exist, a semi-join (EXISTS/IN) expresses that directly: one output row per organization, no matter how many matches. Joining the children materializes all combinations and needs DISTINCT to repair the result. That is a classic source of slow queries on large child tables, and of wrong numbers when someone later adds a SUM.
+
+Modern optimizers usually plan EXISTS and IN identically (semi-join), so pick the version that reads best and handles NULLs correctly. For NOT IN vs NOT EXISTS, NULL semantics differ (SQL-013).
+@mistakes
+- Forgetting DISTINCT in the JOIN version.
+- Using `IN` with a subquery that returns NULL-able keys in the negated form.
+@performance
+EXISTS stops at the first matching child row per organization; the join version touches every pair.
+@interview
+"Rewrite this join as EXISTS, and tell me why" is a frequent performance-review question.
+
+### SQL-056
+title: Revenue by plan at time of purchase (correlated scalar lookup)
+difficulty: Hard
+primary: Correlated scalar subquery with deterministic tie-breaking
+secondary: as-of lookup, resolving overlapping periods, cost of correlation
+concepts: correlated_subquery, range_join, correlated_cost, ds_mom_revenue
+roles: DS
+time: 18
+dialect: BOTH
+tables: orders(order_id, org_id, status, order_ts, order_total); subscriptions(subscription_id, org_id, plan_id, started_at, ended_at); plans(plan_id, plan_name)
+columns: plan_name, completed_orders, revenue
+compare: ordered
+@context
+SQL-038 showed that some orders match zero or two subscriptions. The business rule is now defined: attribute each order to the subscription that contains `order_ts`; if several do, use the one that **started most recently** (then the highest `subscription_id`); if none does, attribute it to `'no active plan'`.
+@problem
+For completed orders in H1 2025, return revenue by attributed plan: `plan_name`, `completed_orders`, `revenue`. Sort by revenue descending.
+@expected
+One row per plan that received orders, plus possibly `'no active plan'`. The order count equals the number of completed H1-2025 orders, with no duplicates and no losses.
+@edge_cases
+- Overlaps must not duplicate orders, and gaps must not drop them.
+@hint1
+For each order, look up exactly one subscription ID with a scalar subquery.
+@hint2
+`(SELECT s.subscription_id FROM subscriptions s WHERE s.org_id = o.org_id AND s.started_at <= o.order_ts AND (s.ended_at IS NULL OR o.order_ts < s.ended_at) ORDER BY s.started_at DESC, s.subscription_id DESC LIMIT 1)`.
+@hint3
+Compute it in a derived table, LEFT JOIN subscriptions and plans, label NULL as `'no active plan'`, then aggregate.
+@solution
+SELECT COALESCE(p.plan_name, 'no active plan') AS plan_name,
+       COUNT(*)                               AS completed_orders,
+       SUM(a.order_total)                     AS revenue
+FROM (
+    SELECT o.order_id,
+           o.order_total,
+           (SELECT s.subscription_id
+            FROM subscriptions s
+            WHERE s.org_id = o.org_id
+              AND s.started_at <= o.order_ts
+              AND (s.ended_at IS NULL OR o.order_ts < s.ended_at)
+            ORDER BY s.started_at DESC, s.subscription_id DESC
+            LIMIT 1) AS subscription_id
+    FROM orders o
+    WHERE o.status = 'completed'
+      AND o.order_ts >= TIMESTAMP '2025-01-01 00:00:00'
+      AND o.order_ts <  TIMESTAMP '2025-07-01 00:00:00'
+) a
+LEFT JOIN subscriptions s ON s.subscription_id = a.subscription_id
+LEFT JOIN plans p         ON p.plan_id = s.plan_id
+GROUP BY COALESCE(p.plan_name, 'no active plan')
+ORDER BY revenue DESC, plan_name;
+@explanation
+The correlated scalar subquery returns **at most one** subscription per order thanks to `ORDER BY ... LIMIT 1`. Overlaps are resolved by the documented rule, and orders without a match get NULL. The outer LEFT JOINs translate the ID into a plan name without losing the NULL case.
+
+Sanity check: the total of `completed_orders` equals the number of completed H1-2025 orders; a range join without tie-breaking would exceed it.
+
+**Cost:** the subquery runs once per order. With the `subscriptions(org_id, started_at)` index each run is a short index scan, which is fine for thousands of rows. For millions, use a window-function approach (rank candidate matches with ROW_NUMBER, as in SQL-106) or PostgreSQL's `LATERAL` join.
+@mistakes
+- `MAX(subscription_id)` instead of ordering by `started_at`: it encodes a different (accidental) rule.
+- Inner joins that drop `'no active plan'` orders.
+@performance
+Correlated subqueries are fine when each execution is an indexed lookup; without a supporting index they become O(n x m).
+@interview
+As-of attribution with explicit tie-breaking is a senior-level analytics skill; mention the window alternative and the index requirement.
+
+### SQL-057
+title: Second-highest order per enterprise customer without window functions
+difficulty: Hard
+primary: Correlated subquery for N-th value
+secondary: ties (distinct values), comparison with DENSE_RANK
+concepts: correlated_subquery, count_distinct, dense_rank
+roles: DS
+time: 15
+dialect: BOTH
+tables: orders(org_id, status, order_total); organizations(org_id, segment)
+columns: org_id, second_highest_order_total
+compare: ordered
+@context
+A classic interview question, framed on our data: for each Enterprise organization, what is the second-highest distinct completed-order amount? Some legacy systems lack window functions, so solve it without them first.
+@problem
+Return `org_id` and `second_highest_order_total` for Enterprise organizations that have at least two distinct completed order amounts. Sort by `org_id`.
+@expected
+One row per qualifying organization.
+@edge_cases
+- Ties: if the two largest orders have the same amount, the "second-highest distinct value" is the next smaller amount.
+- Organizations with only one distinct amount are excluded.
+@hint1
+An amount is the 2nd highest distinct value if exactly one distinct amount of the same organization is larger.
+@hint2
+Count distinct larger amounts in a correlated subquery.
+@hint3
+`WHERE (SELECT COUNT(DISTINCT o2.order_total) FROM orders o2 WHERE o2.org_id = o.org_id AND o2.status = 'completed' AND o2.order_total > o.order_total) = 1`, with DISTINCT in the outer SELECT.
+@solution
+SELECT DISTINCT o.org_id,
+       o.order_total AS second_highest_order_total
+FROM orders o
+JOIN organizations g ON g.org_id = o.org_id
+WHERE g.segment = 'Enterprise'
+  AND o.status = 'completed'
+  AND (SELECT COUNT(DISTINCT o2.order_total)
+       FROM orders o2
+       WHERE o2.org_id = o.org_id
+         AND o2.status = 'completed'
+         AND o2.order_total > o.order_total) = 1
+ORDER BY o.org_id;
+@alternative
+SELECT org_id,
+       order_total AS second_highest_order_total
+FROM (
+    SELECT DISTINCT o.org_id,
+           o.order_total,
+           DENSE_RANK() OVER (PARTITION BY o.org_id ORDER BY o.order_total DESC) AS rnk
+    FROM orders o
+    JOIN organizations g ON g.org_id = o.org_id
+    WHERE g.segment = 'Enterprise'
+      AND o.status = 'completed'
+) ranked
+WHERE rnk = 2
+ORDER BY org_id;
+@alternative_note
+With window functions, `DENSE_RANK() = 2` gives the second-highest *distinct* value directly (ties share a rank and no rank is skipped). `RANK()` would skip rank 2 after a tie at the top, and `ROW_NUMBER()` would return a duplicate of the maximum.
+@explanation
+For each candidate row, the correlated subquery counts how many distinct amounts of the same organization are strictly larger. Exactly one larger distinct value means the candidate is the second-highest distinct value. The outer DISTINCT removes repeated rows when several orders share that amount.
+
+It is O(n²) per organization in the worst case. The window-function version (DENSE_RANK) is linear after sorting and easier to generalize to "N-th".
+@mistakes
+- `MAX(order_total) WHERE order_total < (SELECT MAX(...))`: correct for N = 2 but does not generalize, and NULL appears if there is no second value.
+- Using ROW_NUMBER, which treats tied amounts as different ranks.
+@performance
+Quadratic correlated subqueries are acceptable on small groups only; prefer DENSE_RANK on real data.
+@interview
+"N-th highest salary" in disguise; interviewers often push from N = 2 to arbitrary N and ties.

@@ -1,0 +1,408 @@
+### CAP-DS
+title: Capstone (Data Science): quarterly business review by segment
+difficulty: Advanced
+primary: Multi-source analytical dataset with period comparison
+secondary: multiple CTEs, as-of subscription logic, conditional aggregation, NULL-safe ratios, semi-joins
+concepts: multiple_ctes, ds_analysis_dataset, ds_segments, ds_churn_cohort, period_over_period, ds_aov, ratios, left_join
+roles: DS
+time: 60
+dialect: BOTH
+tables: organizations(org_id, segment, created_at); orders(org_id, status, order_total, order_ts); subscriptions(org_id, status, ended_at); support_tickets(org_id, created_at, csat_score); llm_requests(org_id, status, requested_at)
+columns: segment, q1_revenue, q2_revenue, qoq_growth_pct, q2_paying_orgs, q2_aov, q2_new_orgs, q2_churned_orgs, q2_avg_csat, q2_ai_adoption_pct
+compare: ordered
+@context
+You are preparing the Q2 2025 business review. Leadership wants **one table, one row per customer segment**, combining revenue, customers, churn, satisfaction and AI adoption. Each number must have a precise definition (write them down before you write SQL).
+@problem
+Return one row per `segment` with:
+1. `q1_revenue`, `q2_revenue`: completed-order revenue in Q1 / Q2 2025 (by `order_ts`).
+2. `qoq_growth_pct`: (Q2 − Q1) / Q1 x 100, 1 decimal (NULL if Q1 is 0).
+3. `q2_paying_orgs`: organizations with at least one completed order in Q2.
+4. `q2_aov`: Q2 revenue / Q2 completed orders, 2 decimals.
+5. `q2_new_orgs`: organizations created in Q2.
+6. `q2_churned_orgs`: organizations with a subscription that ended with status `'canceled'` in Q2 **and** no open subscription afterwards.
+7. `q2_avg_csat`: average CSAT of tickets created in Q2 (2 decimals).
+8. `q2_ai_adoption_pct`: share of the segment's non-deleted organizations with ≥ 1 successful LLM request in Q2 (1 decimal).
+Sort by segment.
+@expected
+3 rows (Enterprise, Mid-Market, SMB), all ten columns filled.
+@edge_cases
+- Every source has a different grain; aggregate each to (organization or segment) **before** joining.
+- A churned organization that came back (open subscription) is not churned.
+- Use half-open quarter boundaries.
+@hint1
+Write one CTE per metric family: revenue, new orgs, churn, CSAT, AI adoption. Each returns one row per segment.
+@hint2
+Revenue: conditional sums over orders joined to organizations (one scan for both quarters). AOV needs the Q2 order count too.
+@hint3
+Join all CTEs to a segment spine (`SELECT DISTINCT segment FROM organizations`) with LEFT JOINs and COALESCE where 0 is the right default.
+@solution
+WITH seg AS (
+    SELECT DISTINCT segment FROM organizations
+),
+rev AS (
+    SELECT g.segment,
+           SUM(CASE WHEN o.order_ts >= TIMESTAMP '2025-01-01 00:00:00' AND o.order_ts < TIMESTAMP '2025-04-01 00:00:00'
+                    THEN o.order_total ELSE 0 END) AS q1_revenue,
+           SUM(CASE WHEN o.order_ts >= TIMESTAMP '2025-04-01 00:00:00' AND o.order_ts < TIMESTAMP '2025-07-01 00:00:00'
+                    THEN o.order_total ELSE 0 END) AS q2_revenue,
+           SUM(CASE WHEN o.order_ts >= TIMESTAMP '2025-04-01 00:00:00' AND o.order_ts < TIMESTAMP '2025-07-01 00:00:00'
+                    THEN 1 ELSE 0 END)             AS q2_orders,
+           COUNT(DISTINCT CASE WHEN o.order_ts >= TIMESTAMP '2025-04-01 00:00:00' AND o.order_ts < TIMESTAMP '2025-07-01 00:00:00'
+                               THEN o.org_id END)  AS q2_paying_orgs
+    FROM orders o
+    JOIN organizations g ON g.org_id = o.org_id
+    WHERE o.status = 'completed'
+      AND o.order_ts >= TIMESTAMP '2025-01-01 00:00:00'
+      AND o.order_ts <  TIMESTAMP '2025-07-01 00:00:00'
+    GROUP BY g.segment
+),
+new_orgs AS (
+    SELECT segment, COUNT(*) AS q2_new_orgs
+    FROM organizations
+    WHERE created_at >= TIMESTAMP '2025-04-01 00:00:00' AND created_at < TIMESTAMP '2025-07-01 00:00:00'
+    GROUP BY segment
+),
+churn AS (
+    SELECT g.segment, COUNT(DISTINCT s.org_id) AS q2_churned_orgs
+    FROM subscriptions s
+    JOIN organizations g ON g.org_id = s.org_id
+    WHERE s.status = 'canceled'
+      AND s.ended_at >= TIMESTAMP '2025-04-01 00:00:00'
+      AND s.ended_at <  TIMESTAMP '2025-07-01 00:00:00'
+      AND NOT EXISTS (SELECT 1 FROM subscriptions o2
+                      WHERE o2.org_id = s.org_id AND o2.ended_at IS NULL)
+    GROUP BY g.segment
+),
+csat AS (
+    SELECT g.segment, AVG(t.csat_score) AS q2_avg_csat
+    FROM support_tickets t
+    JOIN organizations g ON g.org_id = t.org_id
+    WHERE t.created_at >= TIMESTAMP '2025-04-01 00:00:00' AND t.created_at < TIMESTAMP '2025-07-01 00:00:00'
+    GROUP BY g.segment
+),
+ai AS (
+    SELECT g.segment,
+           COUNT(*) AS orgs,
+           SUM(CASE WHEN EXISTS (SELECT 1 FROM llm_requests r
+                                 WHERE r.org_id = g.org_id AND r.status = 'success'
+                                   AND r.requested_at >= TIMESTAMP '2025-04-01 00:00:00'
+                                   AND r.requested_at <  TIMESTAMP '2025-07-01 00:00:00')
+                    THEN 1 ELSE 0 END) AS adopting
+    FROM organizations g
+    WHERE g.is_deleted = FALSE
+    GROUP BY g.segment
+)
+SELECT seg.segment,
+       COALESCE(rev.q1_revenue, 0)                                              AS q1_revenue,
+       COALESCE(rev.q2_revenue, 0)                                              AS q2_revenue,
+       ROUND(100.0 * (rev.q2_revenue - rev.q1_revenue) / NULLIF(rev.q1_revenue, 0), 1) AS qoq_growth_pct,
+       COALESCE(rev.q2_paying_orgs, 0)                                          AS q2_paying_orgs,
+       ROUND(rev.q2_revenue / NULLIF(rev.q2_orders, 0), 2)                      AS q2_aov,
+       COALESCE(new_orgs.q2_new_orgs, 0)                                        AS q2_new_orgs,
+       COALESCE(churn.q2_churned_orgs, 0)                                       AS q2_churned_orgs,
+       ROUND(csat.q2_avg_csat, 2)                                               AS q2_avg_csat,
+       ROUND(100.0 * ai.adopting / NULLIF(ai.orgs, 0), 1)                       AS q2_ai_adoption_pct
+FROM seg
+LEFT JOIN rev      ON rev.segment = seg.segment
+LEFT JOIN new_orgs ON new_orgs.segment = seg.segment
+LEFT JOIN churn    ON churn.segment = seg.segment
+LEFT JOIN csat     ON csat.segment = seg.segment
+LEFT JOIN ai       ON ai.segment = seg.segment
+ORDER BY seg.segment;
+@assert
+len(rows) == 3 and all(r[1] is not None and r[9] is not None for r in rows)
+@explanation
+**Metric definitions** (the most important deliverable of a business review):
+- Revenue = sum of `order_total` of completed orders, by order timestamp (UTC), half-open quarters.
+- AOV = revenue / number of completed orders (order grain, not lines).
+- New organizations = created in the quarter.
+- Churned = canceled in the quarter and no open subscription now (reactivations excluded).
+- CSAT = mean of answered surveys (unanswered excluded, SQL-017).
+- AI adoption = share of current (non-deleted) organizations with a successful LLM request.
+
+**Structure.** Each CTE aggregates one source to the segment grain. Within `rev`, conditional aggregation computes both quarters in one scan, and `COUNT(DISTINCT CASE ... org_id END)` counts paying organizations. The segment spine guarantees one row per segment even if a metric has no data, and every join is one-to-one, so there is no fan-out.
+
+**Quality checks you would run before presenting:** totals of `q1_revenue`/`q2_revenue` match SQL-020's monthly numbers summed per quarter; churn counts match a direct listing of canceled subscriptions; segment sums equal company totals.
+@mistakes
+- Joining orders, tickets and requests to organizations in one query and summing (fan-out across sources).
+- Counting reactivated organizations as churned.
+- Averaging CSAT with unanswered tickets as 0.
+@performance
+Five independent aggregations over modest tables; the EXISTS in `ai` uses `llm_requests(org_id)`.
+@interview
+Take-home SQL assignments usually look like this. Graders look for explicit definitions, correct grains and sanity checks.
+
+### CAP-ML
+title: Capstone (ML Engineering): leakage-safe training snapshot for a new churn model
+difficulty: Advanced
+primary: End-to-end training dataset construction
+secondary: authoritative labels, point-in-time features, derived features, time-based split, dataset summary
+concepts: ml_training_set, ml_point_in_time, ml_time_split, ml_class_balance, ml_missing_features, multiple_ctes, row_number
+roles: MLE
+time: 60
+dialect: BOTH
+tables: training_labels(label_id, entity_id, label_name, observation_date, label_value, label_available_at); ml_entities(entity_id, is_test_account); entity_features(entity_id, as_of_ts, ingested_at, sessions_7d, sessions_28d, days_since_last_session, open_tickets)
+columns: split, label_value, examples, pct_with_features, avg_sessions_28d, avg_days_since_last_session, avg_session_trend
+compare: ordered
+@context
+You are preparing data for churn model v5. The dataset must be **leakage-safe** and reproducible. Use the observation dates 2025-03-01 and 2025-04-01 as training data and 2025-05-01 as validation data. Before handing it to the training job, you produce a summary that reviewers can check.
+@problem
+Build the dataset in SQL (one row per entity and observation date) and return the summary:
+1. Labels: authoritative row per (entity, observation date), non-NULL, non-test entities.
+2. Features: latest snapshot with `as_of_ts <= observation_date` **and** `ingested_at <= observation_date`; keep examples without a snapshot.
+3. Derived feature `session_trend` = `sessions_7d * 4.0 / NULLIF(sessions_28d, 0)` (recent vs. monthly activity).
+4. Split: `'train'` for 2025-03-01 and 2025-04-01, `'validation'` for 2025-05-01.
+Summary per (split, label): `examples`, `pct_with_features` (1 decimal), `avg_sessions_28d`, `avg_days_since_last_session`, `avg_session_trend` (2 decimals each, over examples with features). Sort with train first, then validation, then by label.
+@expected
+4 rows (train/validation x label 0/1).
+@edge_cases
+- The 2025-03-01 date is the backfill trap: its newest snapshots were only ingested on 2025-03-20.
+- Examples without features must stay in the dataset (counted in `examples`, excluded from feature averages).
+@hint1
+Build CTEs in order: labels → examples with split → available snapshots ranked per example → dataset → summary.
+@hint2
+Rank snapshots per (entity, observation date): join examples to `entity_features` on entity and both time conditions, then `ROW_NUMBER() OVER (PARTITION BY entity_id, observation_date ORDER BY as_of_ts DESC)`.
+@hint3
+LEFT JOIN the rank-1 snapshot; `COUNT(f.as_of_ts)` counts examples with features.
+@solution
+WITH labels AS (
+    SELECT x.entity_id, x.observation_date, x.label_value
+    FROM (
+        SELECT l.entity_id, l.observation_date, l.label_value,
+               ROW_NUMBER() OVER (PARTITION BY l.entity_id, l.observation_date
+                                  ORDER BY l.label_available_at DESC, l.label_id DESC) AS rn
+        FROM training_labels l
+        WHERE l.label_name = 'churned_30d'
+          AND l.observation_date IN (DATE '2025-03-01', DATE '2025-04-01', DATE '2025-05-01')
+    ) x
+    JOIN ml_entities e ON e.entity_id = x.entity_id
+    WHERE x.rn = 1 AND x.label_value IS NOT NULL AND e.is_test_account = FALSE
+),
+examples AS (
+    SELECT entity_id, observation_date, label_value,
+           CASE WHEN observation_date < DATE '2025-05-01' THEN 'train' ELSE 'validation' END AS split
+    FROM labels
+),
+ranked AS (
+    SELECT x.entity_id, x.observation_date, f.as_of_ts, f.sessions_7d, f.sessions_28d,
+           f.days_since_last_session,
+           ROW_NUMBER() OVER (PARTITION BY x.entity_id, x.observation_date ORDER BY f.as_of_ts DESC) AS rn
+    FROM examples x
+    JOIN entity_features f
+      ON f.entity_id = x.entity_id
+     AND f.as_of_ts    <= x.observation_date
+     AND f.ingested_at <= x.observation_date
+),
+dataset AS (
+    SELECT x.split, x.entity_id, x.observation_date, x.label_value,
+           r.as_of_ts, r.sessions_28d, r.days_since_last_session,
+           r.sessions_7d * 4.0 / NULLIF(r.sessions_28d, 0) AS session_trend
+    FROM examples x
+    LEFT JOIN ranked r
+           ON r.entity_id = x.entity_id
+          AND r.observation_date = x.observation_date
+          AND r.rn = 1
+)
+SELECT split,
+       label_value,
+       COUNT(*)                                          AS examples,
+       ROUND(100.0 * COUNT(as_of_ts) / COUNT(*), 1)      AS pct_with_features,
+       ROUND(AVG(sessions_28d), 2)                       AS avg_sessions_28d,
+       ROUND(AVG(days_since_last_session), 2)            AS avg_days_since_last_session,
+       ROUND(AVG(session_trend), 2)                      AS avg_session_trend
+FROM dataset
+GROUP BY split, label_value
+ORDER BY CASE split WHEN 'train' THEN 1 ELSE 2 END, label_value;
+@assert
+len(rows) == 4 and rows[0][0] == 'train' and rows[3][0] == 'validation'
+@explanation
+The pipeline mirrors a production feature/label join:
+1. **labels**: deduplicate re-runs (latest availability wins), drop pending outcomes and test accounts.
+2. **examples**: attach the split by observation date. A time-based split means validation is strictly later than training.
+3. **ranked**: all snapshots that were *available* at each observation date, newest first. The join condition encodes point-in-time correctness; ROW_NUMBER picks the snapshot the production scorer would have seen.
+4. **dataset**: one row per example (LEFT JOIN keeps examples without features) plus a derived feature computed with a zero guard.
+5. **summary**: what a reviewer checks: class balance per split, feature coverage, and whether features separate the classes in the expected direction. Churners show fewer sessions and many more days since their last session. The trend feature does *not* separate the classes cleanly here, which is useful information before spending time on it. Also note the lower feature coverage for churners: users who are drifting away are more often missing from recent snapshots, so "missing features" is itself predictive. Make sure the model sees that consistently in training and serving.
+
+Compare the 2025-03-01 coverage with what a naive join would give (SQL-100): here the backfilled snapshots are excluded, so features for that date come from 2025-02-10.
+@mistakes
+- Filtering `rn = 1` in WHERE after a LEFT JOIN (drops examples without features).
+- Computing `sessions_7d * 4 / sessions_28d` with integer division in PostgreSQL.
+- A random split instead of the time-based one.
+@performance
+The ranking join is bounded (≤ 20 snapshots per entity); `entity_features` PK supports it.
+@interview
+A realistic MLE take-home: explain each CTE, the leakage controls and the checks in the summary.
+
+### CAP-AI
+title: Capstone (AI Engineering): weekly RAG health report
+difficulty: Advanced
+primary: Operational and quality report for an LLM/RAG feature
+secondary: per-dialect week buckets, nearest-rank percentiles, price range join, stale retrieval share, final-feedback acceptance
+concepts: multiple_ctes, ai_success_rate, ai_latency_pct, ai_token_cost, ai_stale_docs, ai_acceptance, percentile, range_join
+roles: AI
+time: 60
+dialect: BOTH
+tables: llm_requests(request_id, feature, status, latency_ms, cache_hit, input_tokens, output_tokens, model_name, requested_at); llm_pricing(model_name, effective_from, effective_to, input_usd_per_1k, output_usd_per_1k); llm_request_chunks(request_id, chunk_id); document_chunks(chunk_id, document_id); documents(document_id, status, is_deleted); ai_feedback(feedback_id, request_id, feedback_type, created_at)
+columns: week_start, requests, success_pct, p95_latency_ms, cost_usd, stale_retrieval_pct, acceptance_pct
+compare: ordered
+@context
+You own the support bot (RAG). Every Monday you publish a health report covering reliability, speed, cost, freshness of retrieved content and user acceptance. Build it for the four full weeks of June 2025 (weeks starting 2025-06-02, 06-09, 06-16 and 06-23).
+@problem
+For support-bot requests per ISO week, return:
+- `requests`, `success_pct` (1 decimal)
+- `p95_latency_ms`: nearest-rank p95 over successful, non-cached requests
+- `cost_usd`: price-in-effect cost (cache hits free), 2 decimals
+- `stale_retrieval_pct`: share of requests that retrieved at least one chunk whose document version is now archived, draft or deleted (1 decimal; denominator = requests with retrieved chunks)
+- `acceptance_pct`: thumbs-up share among successful requests with final feedback (1 decimal)
+Sort by week.
+@expected
+4 rows.
+@edge_cases
+- Different metrics have different denominators; write them down.
+- Week truncation is dialect-specific (SQL-133).
+@hint1
+CTE `base`: support-bot requests in range with a `week_start` column (per dialect).
+@hint2
+Separate CTEs for latency ranks, cost (price range join), stale flags (per request MAX of a 0/1 flag) and final feedback.
+@hint3
+Join everything per week (or per request, then aggregate), taking care that each join is one-to-one at the request grain.
+@solution_pg
+WITH base AS (
+    SELECT r.*, CAST(DATE_TRUNC('week', r.requested_at) AS DATE) AS week_start
+    FROM llm_requests r
+    WHERE r.feature = 'support_bot'
+      AND r.requested_at >= TIMESTAMP '2025-06-02 00:00:00'
+      AND r.requested_at <  TIMESTAMP '2025-06-30 00:00:00'
+),
+lat AS (
+    SELECT week_start, latency_ms,
+           ROW_NUMBER() OVER (PARTITION BY week_start ORDER BY latency_ms) AS rn,
+           COUNT(*)     OVER (PARTITION BY week_start)                     AS n
+    FROM base
+    WHERE status = 'success' AND cache_hit = FALSE
+),
+p95 AS (
+    SELECT week_start, MIN(CASE WHEN rn >= CEIL(0.95 * n) THEN latency_ms END) AS p95_latency_ms
+    FROM lat GROUP BY week_start
+),
+cost AS (
+    SELECT b.request_id,
+           CASE WHEN b.cache_hit THEN 0
+                ELSE b.input_tokens / 1000.0 * p.input_usd_per_1k
+                   + COALESCE(b.output_tokens, 0) / 1000.0 * p.output_usd_per_1k END AS cost_usd
+    FROM base b
+    JOIN llm_pricing p
+      ON p.model_name = b.model_name
+     AND CAST(b.requested_at AS DATE) BETWEEN p.effective_from AND COALESCE(p.effective_to, DATE '9999-12-31')
+),
+stale AS (
+    SELECT rc.request_id,
+           MAX(CASE WHEN d.status <> 'published' OR d.is_deleted = TRUE THEN 1 ELSE 0 END) AS has_stale
+    FROM llm_request_chunks rc
+    JOIN document_chunks c ON c.chunk_id = rc.chunk_id
+    JOIN documents d       ON d.document_id = c.document_id
+    GROUP BY rc.request_id
+),
+final_fb AS (
+    SELECT request_id, feedback_type
+    FROM (SELECT request_id, feedback_type,
+                 ROW_NUMBER() OVER (PARTITION BY request_id ORDER BY created_at DESC, feedback_id DESC) AS rn
+          FROM ai_feedback) x
+    WHERE rn = 1
+)
+SELECT b.week_start,
+       COUNT(*)                                                                       AS requests,
+       ROUND(100.0 * SUM(CASE WHEN b.status = 'success' THEN 1 ELSE 0 END) / COUNT(*), 1) AS success_pct,
+       MAX(p95.p95_latency_ms)                                                        AS p95_latency_ms,
+       ROUND(SUM(c.cost_usd), 2)                                                      AS cost_usd,
+       ROUND(100.0 * SUM(s.has_stale) / NULLIF(COUNT(s.request_id), 0), 1)            AS stale_retrieval_pct,
+       ROUND(100.0 * SUM(CASE WHEN b.status = 'success' AND f.feedback_type = 'thumbs_up' THEN 1 ELSE 0 END)
+             / NULLIF(SUM(CASE WHEN b.status = 'success' AND f.feedback_type IS NOT NULL THEN 1 ELSE 0 END), 0), 1)
+                                                                                      AS acceptance_pct
+FROM base b
+JOIN cost c          ON c.request_id = b.request_id
+LEFT JOIN stale s    ON s.request_id = b.request_id
+LEFT JOIN final_fb f ON f.request_id = b.request_id
+JOIN p95             ON p95.week_start = b.week_start
+GROUP BY b.week_start
+ORDER BY b.week_start;
+@solution_mysql
+WITH base AS (
+    SELECT r.*, DATE_SUB(CAST(r.requested_at AS DATE), INTERVAL WEEKDAY(r.requested_at) DAY) AS week_start
+    FROM llm_requests r
+    WHERE r.feature = 'support_bot'
+      AND r.requested_at >= TIMESTAMP '2025-06-02 00:00:00'
+      AND r.requested_at <  TIMESTAMP '2025-06-30 00:00:00'
+),
+lat AS (
+    SELECT week_start, latency_ms,
+           ROW_NUMBER() OVER (PARTITION BY week_start ORDER BY latency_ms) AS rn,
+           COUNT(*)     OVER (PARTITION BY week_start)                     AS n
+    FROM base
+    WHERE status = 'success' AND cache_hit = FALSE
+),
+p95 AS (
+    SELECT week_start, MIN(CASE WHEN rn >= CEIL(0.95 * n) THEN latency_ms END) AS p95_latency_ms
+    FROM lat GROUP BY week_start
+),
+cost AS (
+    SELECT b.request_id,
+           CASE WHEN b.cache_hit THEN 0
+                ELSE b.input_tokens / 1000.0 * p.input_usd_per_1k
+                   + COALESCE(b.output_tokens, 0) / 1000.0 * p.output_usd_per_1k END AS cost_usd
+    FROM base b
+    JOIN llm_pricing p
+      ON p.model_name = b.model_name
+     AND CAST(b.requested_at AS DATE) BETWEEN p.effective_from AND COALESCE(p.effective_to, DATE '9999-12-31')
+),
+stale AS (
+    SELECT rc.request_id,
+           MAX(CASE WHEN d.status <> 'published' OR d.is_deleted = TRUE THEN 1 ELSE 0 END) AS has_stale
+    FROM llm_request_chunks rc
+    JOIN document_chunks c ON c.chunk_id = rc.chunk_id
+    JOIN documents d       ON d.document_id = c.document_id
+    GROUP BY rc.request_id
+),
+final_fb AS (
+    SELECT request_id, feedback_type
+    FROM (SELECT request_id, feedback_type,
+                 ROW_NUMBER() OVER (PARTITION BY request_id ORDER BY created_at DESC, feedback_id DESC) AS rn
+          FROM ai_feedback) x
+    WHERE rn = 1
+)
+SELECT b.week_start,
+       COUNT(*)                                                                       AS requests,
+       ROUND(100.0 * SUM(CASE WHEN b.status = 'success' THEN 1 ELSE 0 END) / COUNT(*), 1) AS success_pct,
+       MAX(p95.p95_latency_ms)                                                        AS p95_latency_ms,
+       ROUND(SUM(c.cost_usd), 2)                                                      AS cost_usd,
+       ROUND(100.0 * SUM(s.has_stale) / NULLIF(COUNT(s.request_id), 0), 1)            AS stale_retrieval_pct,
+       ROUND(100.0 * SUM(CASE WHEN b.status = 'success' AND f.feedback_type = 'thumbs_up' THEN 1 ELSE 0 END)
+             / NULLIF(SUM(CASE WHEN b.status = 'success' AND f.feedback_type IS NOT NULL THEN 1 ELSE 0 END), 0), 1)
+                                                                                      AS acceptance_pct
+FROM base b
+JOIN cost c          ON c.request_id = b.request_id
+LEFT JOIN stale s    ON s.request_id = b.request_id
+LEFT JOIN final_fb f ON f.request_id = b.request_id
+JOIN p95             ON p95.week_start = b.week_start
+GROUP BY b.week_start
+ORDER BY b.week_start;
+@assert
+len(rows) == 4
+@explanation
+The report is a **request-grain fact table** (`base`) enriched with one-row-per-request attributes (cost, stale flag, final feedback) and one-row-per-week attributes (p95), then aggregated per week. Every enrichment is either keyed by `request_id` (one-to-one after aggregation inside the CTE) or by `week_start` (one row per week), so the final GROUP BY counts each request once.
+
+Denominators (state them in the report):
+- success rate: all requests;
+- p95: successful, non-cached requests;
+- stale share: requests that retrieved chunks (rate-limited requests retrieve nothing);
+- acceptance: successful requests with a final feedback verdict.
+
+"Stale" uses the document's *current* status (archived/draft/deleted), which is a stricter rule than SQL-127's time-relative definition and appropriate for a "what should we clean up now" report.
+@mistakes
+- Joining raw `llm_request_chunks` to `base` before aggregating (multiplies requests by retrieved chunks).
+- Computing p95 over all requests including cache hits and failures.
+- Using today's prices for all weeks.
+@performance
+All CTEs are restricted to four weeks of support-bot traffic, except `stale` and `final_fb`, which are small enough here; in production, filter them by the same request range.
+@interview
+An AI-engineering take-home in miniature: reliability, latency, cost, freshness and quality in one reproducible query.

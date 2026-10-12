@@ -1,0 +1,37 @@
+product_id,product_name,category_id,list_price,is_active,launched_on
+1,Extra Storage 100GB,2,19,true,2022-03-01
+2,Extra Storage 1TB,2,149,true,2023-01-15
+3,Advanced Audit Log,2,99,true,2023-06-01
+4,SSO Add-on,2,199,true,2022-09-01
+5,Sandbox Workspace,2,59,true,2023-09-01
+6,Priority Support,2,299,true,2022-01-15
+7,Legacy Reports Pack,2,39,false,2021-05-01
+8,AI Credits 10k,3,25,true,2024-10-01
+9,AI Credits 100k,3,200,true,2024-10-01
+10,Query Credits 1M,3,49,true,2022-02-01
+11,Query Credits 10M,3,399,true,2022-02-01
+12,Export Credits 500,3,15,true,2023-03-01
+13,SQL Fundamentals Course,5,149,true,2022-04-01
+14,Admin Certification,5,349,true,2023-02-01
+15,AI Features Workshop,5,499,true,2024-11-01
+16,Team Onboarding Session,5,250,true,2022-04-01
+17,Data Modeling Bootcamp,5,899,true,2023-08-01
+18,Legacy Webinar Seat,5,49,false,2021-01-01
+19,Implementation - Starter,7,1500,true,2022-06-01
+20,Implementation - Enterprise,7,12000,true,2022-06-01
+21,Data Migration Day,7,1800,true,2022-06-01
+22,Salesforce Integration Build,8,4500,true,2023-01-01
+23,Custom Connector Build,8,6500,true,2023-05-01
+24,Architecture Review,8,3000,true,2024-02-01
+25,Finance KPI Template,10,79,true,2023-01-01
+26,Marketing Funnel Template,10,59,true,2023-01-01
+27,Churn Analysis Template,10,99,true,2023-07-01
+28,RAG Evaluation Template,10,129,true,2025-01-15
+29,SaaS Metrics Template,10,69,true,2023-04-01
+30,Snowflake Connector,11,99,true,2022-05-01
+31,BigQuery Connector,11,99,true,2022-05-01
+32,Kafka Connector,11,149,true,2023-10-01
+33,HubSpot Connector,11,49,true,2023-03-01
+34,Legacy FTP Connector,11,29,false,2020-06-01
+35,Vector DB Connector,11,179,true,2024-12-01
+36,Postgres CDC Connector,11,129,true,2024-04-01

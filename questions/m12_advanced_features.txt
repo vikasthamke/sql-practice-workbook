@@ -1,0 +1,759 @@
+### SQL-162
+title: Query event properties stored as JSONB
+difficulty: Medium
+primary: JSON storage and querying (PostgreSQL JSONB)
+secondary: ->> extraction, @> containment, GIN index concept, MySQL equivalent
+concepts: json, dialect_functions, union_all, ds_funnel_abandon
+roles: DS, AI
+time: 15
+dialect: POSTGRESQL
+tables: events(event_name, event_ts, properties)
+columns: event_name, property_value, events
+compare: ordered
+@context
+Event properties are semi-structured: `view_pricing` carries a `referrer`, `ai_assist_used` a `feature`. Product analysts want breakdowns without a schema change.
+@problem
+For Q2 2025, return per `event_name` and property value: `view_pricing` events by `properties->>'referrer'`, and `ai_assist_used` events by `properties->>'feature'`. Additionally count `ai_assist_used` events whose properties **contain** `{"feature": "sql_copilot"}` with the `@>` operator, labelled `'sql_copilot (@>)'`. Sort by event name, then events descending, then value.
+@expected
+A handful of rows; the `@>` count equals the `sql_copilot` row of the extraction branch.
+@edge_cases
+- `->` returns JSONB, `->>` returns text. Compare text with text.
+- Missing keys yield NULL, not an error.
+@hint1
+`properties->>'referrer'` extracts a text value.
+@hint2
+`properties @> '{"feature": "sql_copilot"}'` tests containment and can use a GIN index.
+@hint3
+Combine the three breakdowns with UNION ALL.
+@solution
+SELECT event_name, properties->>'referrer' AS property_value, COUNT(*) AS events
+FROM events
+WHERE event_name = 'view_pricing'
+  AND event_ts >= TIMESTAMP '2025-04-01 00:00:00' AND event_ts < TIMESTAMP '2025-07-01 00:00:00'
+GROUP BY event_name, properties->>'referrer'
+UNION ALL
+SELECT event_name, properties->>'feature', COUNT(*)
+FROM events
+WHERE event_name = 'ai_assist_used'
+  AND event_ts >= TIMESTAMP '2025-04-01 00:00:00' AND event_ts < TIMESTAMP '2025-07-01 00:00:00'
+GROUP BY event_name, properties->>'feature'
+UNION ALL
+SELECT event_name, 'sql_copilot (@>)', COUNT(*)
+FROM events
+WHERE event_name = 'ai_assist_used'
+  AND properties @> '{"feature": "sql_copilot"}'
+  AND event_ts >= TIMESTAMP '2025-04-01 00:00:00' AND event_ts < TIMESTAMP '2025-07-01 00:00:00'
+GROUP BY event_name
+ORDER BY event_name, events DESC, property_value;
+@equivalent_mysql
+SELECT event_name, properties->>'$.referrer' AS property_value, COUNT(*) AS events
+FROM events
+WHERE event_name = 'view_pricing'
+  AND event_ts >= TIMESTAMP '2025-04-01 00:00:00' AND event_ts < TIMESTAMP '2025-07-01 00:00:00'
+GROUP BY event_name, properties->>'$.referrer'
+UNION ALL
+SELECT event_name, properties->>'$.feature', COUNT(*)
+FROM events
+WHERE event_name = 'ai_assist_used'
+  AND event_ts >= TIMESTAMP '2025-04-01 00:00:00' AND event_ts < TIMESTAMP '2025-07-01 00:00:00'
+GROUP BY event_name, properties->>'$.feature'
+UNION ALL
+SELECT event_name, 'sql_copilot (@>)', COUNT(*)
+FROM events
+WHERE event_name = 'ai_assist_used'
+  AND JSON_CONTAINS(properties, '{"feature": "sql_copilot"}')
+  AND event_ts >= TIMESTAMP '2025-04-01 00:00:00' AND event_ts < TIMESTAMP '2025-07-01 00:00:00'
+GROUP BY event_name
+ORDER BY event_name, events DESC, property_value;
+@dialect_note
+PostgreSQL stores JSON as `JSONB` (binary, keys de-duplicated and sorted) with operators `->`, `->>`, `#>>`, `@>` (containment), `?` (key exists) and GIN indexes (`CREATE INDEX ... USING GIN (properties)` or `jsonb_path_ops`). MySQL's `JSON` type uses path expressions (`'$.key'`) with `->`/`->>` shortcuts and `JSON_CONTAINS` instead of `@>`. MySQL cannot index a JSON column directly; it indexes a generated column or uses a functional index (and multi-valued indexes for arrays). The MySQL equivalent above returns the same rows.
+@explanation
+JSONB keeps flexible attributes queryable: `->>` extracts values for grouping, and `@>` asks "does this document contain this sub-document?". Containment is what GIN indexes accelerate, so filters written as `@>` scale to large event tables, while `properties->>'feature' = 'sql_copilot'` needs an expression index.
+
+The last branch double-checks the extraction branch: both count the same `sql_copilot` events.
+
+Semi-structured columns are convenient but weakly typed. Promote frequently used keys to real columns (or generated columns, SQL-163) once they stabilize.
+@mistakes
+- Comparing `properties->'feature'` (JSONB) with a text literal.
+- Putting every attribute into JSON and losing constraints and types.
+@performance
+A GIN index on `properties` serves `@>` and `?` predicates; without it, both are full scans.
+@interview
+JSONB operators and indexing strategy are common PostgreSQL interview topics.
+
+### SQL-163
+title: Generated column for a normalized e-mail key
+difficulty: Medium
+primary: Generated columns
+secondary: STORED generated columns, indexing a derived value, duplicate lookup
+concepts: generated_columns, index_ddl, ds_duplicates, string_functions
+roles: DS, MLE
+time: 15
+dialect: BOTH
+tables: users(user_id, email)
+columns: email_norm, accounts
+compare: ordered
+@context
+SQL-009, SQL-044 and SQL-142 normalize e-mails with `LOWER(TRIM(email))` on the fly, which prevents index use. A generated column computes the value once per row and can be indexed.
+@problem
+Create `sb_user_emails(user_id PK, email, email_norm)` where `email_norm` is a **stored generated column** `LOWER(TRIM(email))`, index it, load all users, and return the normalized e-mails that belong to more than one account with the account count. Sort by `email_norm`.
+@expected
+About two dozen rows, matching the duplicate clusters of SQL-142.
+@edge_cases
+- You cannot insert into a generated column; omit it from the INSERT column list.
+- MySQL also supports `VIRTUAL` generated columns (computed on read, still indexable); PostgreSQL supports `STORED` (and from PostgreSQL 18 also `VIRTUAL`).
+@hint1
+`email_norm VARCHAR(255) GENERATED ALWAYS AS (LOWER(TRIM(email))) STORED`.
+@hint2
+`CREATE INDEX ... ON sb_user_emails (email_norm)`.
+@hint3
+`GROUP BY email_norm HAVING COUNT(*) > 1`.
+@solution
+DROP TABLE IF EXISTS sb_user_emails;
+CREATE TABLE sb_user_emails (
+    user_id     INT          NOT NULL PRIMARY KEY,
+    email       VARCHAR(255) NOT NULL,
+    email_norm  VARCHAR(255) GENERATED ALWAYS AS (LOWER(TRIM(email))) STORED
+);
+CREATE INDEX ix_sb_user_emails_norm ON sb_user_emails (email_norm);
+INSERT INTO sb_user_emails (user_id, email)
+SELECT user_id, email FROM users;
+@verify
+SELECT email_norm, COUNT(*) AS accounts
+FROM sb_user_emails
+GROUP BY email_norm
+HAVING COUNT(*) > 1
+ORDER BY email_norm;
+@cleanup
+DROP TABLE IF EXISTS sb_user_emails
+@explanation
+A generated column is defined by an expression over other columns of the same row. `STORED` computes it on write and keeps it on disk, so it can be indexed and read like a normal column. The same DDL (`GENERATED ALWAYS AS (...) STORED`) works in PostgreSQL and MySQL. It is a rare case of fully portable advanced DDL.
+
+The index on `email_norm` turns duplicate lookups ("does this normalized e-mail exist?") into index lookups, and could be made `UNIQUE` once the existing duplicates are merged. That is the database-level fix for the duplicate-account problem.
+@mistakes
+- Trying to `UPDATE sb_user_emails SET email_norm = ...` (error: generated columns are read-only).
+- Using non-deterministic functions (e.g. `NOW()`) in a generated column (rejected).
+@performance
+Stored generated columns cost a little on write and save repeated computation and full scans on read.
+@interview
+Shows knowledge of modern DDL features that bridge data quality and performance.
+
+### SQL-164
+title: Sign-ups per local calendar day (time zones)
+difficulty: Advanced
+primary: Date/time zone handling
+secondary: AT TIME ZONE semantics, DST, local-day bucketing, MySQL time zone tables
+concepts: time_zones, date_functions, date_bucketing, dialect_functions
+roles: DS
+time: 20
+dialect: POSTGRESQL
+tables: users(user_id, org_id, signup_at); organizations(org_id, timezone)
+columns: local_signup_date, signups, utc_date_signups
+compare: ordered
+@context
+Timestamps are stored in UTC. The Americas sales team asks: "How many users of our Americas-based customers signed up on each *local* day in March 2025 (the month of the US DST change)?" Each organization has its own IANA time zone (`organizations.timezone`), and bucketing by UTC date moves evening sign-ups into the next day.
+@problem
+For organizations whose `timezone` starts with `'America/'`, convert each sign-up to the organization's **own** zone and count sign-ups per local calendar date from 2025-03-01 to 2025-03-31. Next to it, show how many of the same users' sign-ups fall on that date when bucketed by **UTC** date. Sort by local date.
+@expected
+One row per local date with sign-ups; the two counts differ on some days.
+@edge_cases
+- `ts AT TIME ZONE 'UTC'` turns a naive UTC timestamp into an absolute instant (timestamptz); applying `AT TIME ZONE o.timezone` to that converts it to the organization's wall-clock time. The zone can come from a column. US zones switch to DST on 2025-03-09 (offsets change by one hour), and Sao Paulo has no DST.
+- MySQL: `CONVERT_TZ(ts, 'UTC', 'America/New_York')` works only when the time zone tables are loaded, otherwise it **silently returns NULL**.
+@hint1
+Convert first, then truncate to a date.
+@hint2
+`CAST((u.signup_at AT TIME ZONE 'UTC') AT TIME ZONE o.timezone AS DATE)`.
+@hint3
+Count UTC-date sign-ups for the same date with a correlated subquery or conditional aggregation over both bucketings.
+@solution
+WITH americas_users AS (
+    SELECT u.user_id,
+           u.signup_at,
+           CAST((u.signup_at AT TIME ZONE 'UTC') AT TIME ZONE o.timezone AS DATE) AS local_date
+    FROM users u
+    JOIN organizations o ON o.org_id = u.org_id
+    WHERE o.timezone LIKE 'America/%'
+)
+SELECT l.local_signup_date,
+       l.signups,
+       (SELECT COUNT(*) FROM americas_users n2
+         WHERE CAST(n2.signup_at AS DATE) = l.local_signup_date) AS utc_date_signups
+FROM (
+    SELECT local_date AS local_signup_date, COUNT(*) AS signups
+    FROM americas_users
+    WHERE local_date >= DATE '2025-03-01' AND local_date < DATE '2025-04-01'
+    GROUP BY local_date
+) l
+ORDER BY l.local_signup_date;
+@equivalent_mysql
+WITH americas_users AS (
+    SELECT u.user_id,
+           u.signup_at,
+           CAST(CONVERT_TZ(u.signup_at, 'UTC', o.timezone) AS DATE) AS local_date
+    FROM users u
+    JOIN organizations o ON o.org_id = u.org_id
+    WHERE o.timezone LIKE 'America/%'
+)
+SELECT l.local_signup_date,
+       l.signups,
+       (SELECT COUNT(*) FROM americas_users n2
+         WHERE CAST(n2.signup_at AS DATE) = l.local_signup_date) AS utc_date_signups
+FROM (
+    SELECT local_date AS local_signup_date, COUNT(*) AS signups
+    FROM americas_users
+    WHERE local_date >= DATE '2025-03-01' AND local_date < DATE '2025-04-01'
+    GROUP BY local_date
+) l
+ORDER BY l.local_signup_date;
+@assert
+any(r[1] != r[2] for r in rows)
+@dialect_note
+**PostgreSQL** ships the IANA time zone database, so `AT TIME ZONE 'America/New_York'` (or a zone taken from a column) always works. Mind the double application: on a `timestamp without time zone`, `AT TIME ZONE 'UTC'` *interprets* it as UTC and returns `timestamptz`; on a `timestamptz`, `AT TIME ZONE zone` *renders* local wall-clock time.
+
+**MySQL** needs its time zone tables populated (`mysql_tzinfo_to_sql /usr/share/zoneinfo | mysql -u root mysql` on Linux/macOS, or the downloadable package on Windows). Without them, `CONVERT_TZ` with named zones returns NULL and every row falls out of the date filter **without an error**. Fixed offsets (`'+00:00'`, `'-05:00'`) always work but ignore DST. The MySQL equivalent was validated with loaded time zone tables.
+@explanation
+Business days are local. "Sign-ups on 2025-03-14" for a Chicago customer means midnight-to-midnight Chicago time, which is 05:00 or 06:00 UTC depending on DST. Converting each timestamp to its organization's zone **before** truncating to a date gives the correct buckets. Truncating the UTC timestamp attributes evening sign-ups to the next day, which is why the two count columns differ on several days.
+
+Practical rules: store timestamps in UTC (as this dataset does), store each entity's IANA zone name, convert at query time, and never hard-code offsets for zones with DST.
+@mistakes
+- `signup_at - INTERVAL '5' HOUR` as "New York time" (wrong for half the year).
+- Converting the filter boundaries instead of the data, and getting DST transition days wrong.
+@performance
+Converting each row prevents index use on `signup_at`; for large tables, filter a padded UTC range first (local range ± 14 hours), then apply the exact local filter.
+@interview
+Time zone bugs are among the most common production analytics errors; explaining DST and the double `AT TIME ZONE` is a strong signal.
+
+### SQL-165
+title: Extract numeric limits from document text (regular expressions)
+difficulty: Medium
+primary: Regular expressions
+secondary: regex match and capture per dialect, casting extracted text, case sensitivity
+concepts: regex, string_functions, cast, ai_rag_ingestion
+roles: AI
+time: 15
+dialect: BOTH
+tables: document_chunks(chunk_id, document_id, chunk_text)
+columns: limit_value, chunks, documents
+compare: ordered
+@context
+The support bot often answers questions about limits ("How many X per workspace?"). The content team wants an inventory of the numeric limits mentioned in the knowledge-base chunks, to check that they are consistent.
+@problem
+Find chunks whose text contains `limit is <number>` and extract the first such number. Return per `limit_value` (integer) the number of chunks and of distinct document versions. Sort by `limit_value`.
+@expected
+A few rows (5, 10, 50, 100, 1000).
+@edge_cases
+- PostgreSQL `~` is case-sensitive (`~*` is case-insensitive); MySQL's `REGEXP_LIKE` follows the column collation, so it is **case-insensitive** by default unless you pass the `'c'` match type.
+- Only the first occurrence per chunk is extracted.
+@hint1
+Filter chunks with a regex match, then extract the digits.
+@hint2
+PostgreSQL: `SUBSTRING(chunk_text FROM 'limit is ([0-9]+)')` returns the capture group.
+@hint3
+MySQL: `REGEXP_SUBSTR(chunk_text, 'limit is [0-9]+')`, then strip the non-digits with `REGEXP_REPLACE(..., '[^0-9]', '')` and CAST.
+@solution_pg
+SELECT CAST(SUBSTRING(chunk_text FROM 'limit is ([0-9]+)') AS INT) AS limit_value,
+       COUNT(*)                                                    AS chunks,
+       COUNT(DISTINCT document_id)                                 AS documents
+FROM document_chunks
+WHERE chunk_text ~ 'limit is [0-9]+'
+GROUP BY CAST(SUBSTRING(chunk_text FROM 'limit is ([0-9]+)') AS INT)
+ORDER BY limit_value;
+@solution_mysql
+SELECT CAST(REGEXP_REPLACE(REGEXP_SUBSTR(chunk_text, 'limit is [0-9]+', 1, 1, 'c'), '[^0-9]', '') AS UNSIGNED) AS limit_value,
+       COUNT(*)                                                                                             AS chunks,
+       COUNT(DISTINCT document_id)                                                                          AS documents
+FROM document_chunks
+WHERE REGEXP_LIKE(chunk_text, 'limit is [0-9]+', 'c')
+GROUP BY CAST(REGEXP_REPLACE(REGEXP_SUBSTR(chunk_text, 'limit is [0-9]+', 1, 1, 'c'), '[^0-9]', '') AS UNSIGNED)
+ORDER BY limit_value;
+@dialect_note
+| task | PostgreSQL | MySQL 8 |
+|---|---|---|
+| match | `s ~ 'pat'`, `s ~* 'pat'` (case-insensitive) | `REGEXP_LIKE(s, 'pat', 'c')`, `s REGEXP 'pat'` |
+| extract | `SUBSTRING(s FROM 'pat')` (first capture group), `regexp_match`, `regexp_substr` (15+) | `REGEXP_SUBSTR(s, 'pat')` (whole match, no capture groups) |
+| replace | `regexp_replace(s, 'pat', 'rep', 'g')` | `REGEXP_REPLACE(s, 'pat', 'rep')` (all occurrences) |
+| engine | POSIX ARE (Tcl) | ICU |
+Casting to integer: `CAST(x AS INT)` (PostgreSQL) vs `CAST(x AS UNSIGNED/SIGNED)` (MySQL).
+@explanation
+Regular expressions extract structure from free text. PostgreSQL's `SUBSTRING(... FROM pattern)` returns the parenthesized capture group directly. MySQL's `REGEXP_SUBSTR` returns the whole match, so a second step removes everything that is not a digit.
+
+Case sensitivity is a portability trap: without the `'c'` flag, MySQL would also match "Limit is ...", while PostgreSQL's `~` would not.
+
+**Why it matters for AI apps:** inconsistent facts across chunks (one page says 50, another 100) produce contradictory answers. Text mining in SQL is a cheap first content-QA step before involving an LLM.
+@mistakes
+- Regex patterns that rely on engine-specific classes (`\d` works in both here, but POSIX classes like `[[:digit:]]` are safer across tools).
+- Forgetting that regex filters cannot use B-tree indexes (use trigram indexes, `pg_trgm`, for fast substring search in PostgreSQL).
+@performance
+Full scan with regex evaluation per row; fine for a few thousand chunks.
+@interview
+Shows practical text processing and awareness of regex dialect differences.
+
+### SQL-166
+title: Keyword search over chunks with PostgreSQL full-text search
+difficulty: Advanced
+primary: Full-text search concepts (PostgreSQL)
+secondary: tsvector/tsquery, ranking, stemming, servable-chunk filter, hybrid retrieval
+concepts: full_text, dialect_functions, ai_latest_version_chunks, ai_retrieval_compare
+roles: AI
+time: 20
+dialect: POSTGRESQL
+tables: document_chunks(chunk_id, document_id, chunk_text, embedding_model); documents(document_id, doc_key, status, is_deleted)
+columns: chunk_id, doc_key, rank
+compare: ordered
+@context
+Hybrid retrieval combines vector similarity with keyword search. Exact terms such as product names and error codes are often missed by embeddings. PostgreSQL's full-text search gives a keyword retriever without extra infrastructure.
+@problem
+Find the 10 best servable chunks (published, non-deleted, embedded) for the query "rotate API token", ranked with `ts_rank` (4 decimals; ties by `chunk_id`).
+@expected
+10 rows mentioning API tokens.
+@edge_cases
+- `to_tsvector('english', ...)` stems words ("rotating" → "rotat") and drops stop words.
+- `websearch_to_tsquery` parses user-style queries safely (quotes, OR, -exclusions); `to_tsquery` requires operator syntax.
+@hint1
+Match with `to_tsvector('english', chunk_text) @@ websearch_to_tsquery('english', 'rotate API token')`.
+@hint2
+Rank with `ts_rank(to_tsvector(...), query)`.
+@hint3
+Join documents for the servability filter; order by rank DESC, chunk_id.
+@solution
+SELECT c.chunk_id,
+       d.doc_key,
+       ROUND(CAST(ts_rank(to_tsvector('english', c.chunk_text),
+                          websearch_to_tsquery('english', 'rotate API token')) AS NUMERIC), 4) AS rank
+FROM document_chunks c
+JOIN documents d ON d.document_id = c.document_id
+WHERE d.status = 'published'
+  AND d.is_deleted = FALSE
+  AND c.embedding_model IS NOT NULL
+  AND to_tsvector('english', c.chunk_text) @@ websearch_to_tsquery('english', 'rotate API token')
+ORDER BY rank DESC, c.chunk_id
+LIMIT 10;
+@explanation
+- `to_tsvector` turns text into normalized lexemes; `websearch_to_tsquery` turns the user query into a boolean query of lexemes (AND by default); `@@` tests the match.
+- `ts_rank` scores matches by term frequency and proximity. It is not BM25, but good enough for many internal search features.
+- For speed, index the vector: `CREATE INDEX ... USING GIN (to_tsvector('english', chunk_text))`, or a stored generated `tsvector` column.
+
+**Why it matters for AI apps:** in hybrid RAG, a keyword branch like this runs next to vector search, and the two candidate lists are merged (e.g. with reciprocal rank fusion). It catches exact identifiers that embeddings blur.
+@mistakes
+- Using `to_tsvector(chunk_text)` without a configuration: it depends on `default_text_search_config`, which can differ between servers.
+- Expecting `LIKE '%token%'` to rank results.
+@performance
+Without a GIN index this is a full scan with per-row parsing; with one it is an index lookup plus ranking of the matches.
+@interview
+Shows knowledge of built-in search and of hybrid retrieval design.
+
+### SQL-167
+title: Keyword search over chunks with MySQL FULLTEXT
+difficulty: Advanced
+primary: Full-text search concepts (MySQL)
+secondary: FULLTEXT index, MATCH ... AGAINST, natural language mode, minimum token size
+concepts: full_text, index_ddl, dialect_functions, ai_retrieval_compare
+roles: AI
+time: 20
+dialect: MYSQL
+tables: document_chunks(chunk_id, document_id, chunk_text, embedding_model); documents(document_id, doc_key, status, is_deleted)
+columns: chunk_id, doc_key, score
+compare: ordered
+@context
+The same keyword retriever as SQL-166 on MySQL. InnoDB supports FULLTEXT indexes; `MATCH ... AGAINST` *requires* such an index.
+@problem
+Create a sandbox copy `sb_chunks_ft(chunk_id PK, document_id, chunk_text)` of servable chunks (published, non-deleted, embedded), add a FULLTEXT index on `chunk_text`, and return the top 10 chunks for "rotate API token" in natural language mode with their score (4 decimals; ties by `chunk_id`), plus `doc_key`.
+@expected
+10 rows.
+@edge_cases
+- InnoDB ignores words shorter than `innodb_ft_min_token_size` (default 3) and stop words; "API" (3 letters) is indexed, "is" is not.
+- Natural language mode ranks by a TF-IDF–style relevance; boolean mode (`+rotate +token`) gives exact operators.
+@hint1
+`ALTER TABLE ... ADD FULLTEXT INDEX ft_name (chunk_text)` (or `CREATE FULLTEXT INDEX`).
+@hint2
+`MATCH(chunk_text) AGAINST ('rotate API token' IN NATURAL LANGUAGE MODE)` used both in WHERE and SELECT.
+@hint3
+Join `documents` for `doc_key`.
+@solution
+DROP TABLE IF EXISTS sb_chunks_ft;
+CREATE TABLE sb_chunks_ft (
+    chunk_id     INT  NOT NULL PRIMARY KEY,
+    document_id  INT  NOT NULL,
+    chunk_text   TEXT NOT NULL
+) ENGINE=InnoDB;
+INSERT INTO sb_chunks_ft (chunk_id, document_id, chunk_text)
+SELECT c.chunk_id, c.document_id, c.chunk_text
+FROM document_chunks c
+JOIN documents d ON d.document_id = c.document_id
+WHERE d.status = 'published' AND d.is_deleted = FALSE AND c.embedding_model IS NOT NULL;
+CREATE FULLTEXT INDEX ft_sb_chunks_text ON sb_chunks_ft (chunk_text);
+SELECT f.chunk_id,
+       d.doc_key,
+       ROUND(MATCH(f.chunk_text) AGAINST ('rotate API token' IN NATURAL LANGUAGE MODE), 4) AS score
+FROM sb_chunks_ft f
+JOIN documents d ON d.document_id = f.document_id
+WHERE MATCH(f.chunk_text) AGAINST ('rotate API token' IN NATURAL LANGUAGE MODE)
+ORDER BY score DESC, f.chunk_id
+LIMIT 10;
+@cleanup
+DROP TABLE IF EXISTS sb_chunks_ft
+@assert
+len(rows) == 10
+@explanation
+MySQL full-text search is built on an inverted index (`FULLTEXT`). In natural language mode, `MATCH ... AGAINST` returns a relevance score: words that are rare in the collection and frequent in the row score higher. The same expression in WHERE filters to matching rows, and MySQL evaluates it only once per row.
+
+Differences from PostgreSQL FTS (SQL-166): no stemming by default (InnoDB tokenizes on non-alphanumerics), different stop-word handling, and the score scale is not comparable with `ts_rank`. In both engines, scores from different queries are not comparable either, so merge hybrid results by rank, not by score.
+
+Creating the index on a sandbox copy keeps the main tables unchanged; in production you would index `document_chunks` directly.
+@mistakes
+- Calling `MATCH` on a column list that does not exactly match a FULLTEXT index (error 1191).
+- Expecting partial-word matches in natural language mode (use boolean mode with `*`).
+@performance
+The FULLTEXT index makes matching an index lookup; building it on large tables takes time and memory (`innodb_ft_cache_size`).
+@interview
+Knowing both engines' text-search capabilities, and when to move to a dedicated search engine, is useful for AI-application roles.
+
+### SQL-168
+title: Explode JSON tag arrays into rows with JSON_TABLE
+difficulty: Advanced
+primary: JSON querying (MySQL JSON_TABLE)
+secondary: unnesting arrays, lateral JSON expansion, PostgreSQL equivalent
+concepts: json, dialect_functions, count_distinct, ai_rag_ingestion
+roles: AI
+time: 18
+dialect: MYSQL
+tables: documents(document_id, status, is_deleted, metadata)
+columns: tag, documents
+compare: ordered
+@context
+Each document version stores tags in `metadata.tags` (a JSON array). The content team wants the 10 most common tags among published, non-deleted document versions, which are useful as retrieval filters.
+@problem
+Unnest `metadata->'$.tags'` into one row per tag with `JSON_TABLE`, and return the top 10 tags by number of document versions (ties by tag).
+@expected
+10 rows.
+@edge_cases
+- Documents with NULL metadata produce no rows in JSON_TABLE (the inner join drops them).
+- A tag repeated inside one array would be counted twice by `COUNT(*)`; `COUNT(DISTINCT document_id)` is robust.
+@hint1
+`JSON_TABLE(doc, '$.tags[*]' COLUMNS (tag VARCHAR(60) PATH '$'))` turns an array into rows.
+@hint2
+Use it in the FROM clause after the documents table (it is implicitly lateral).
+@hint3
+Group by the extracted tag.
+@solution
+SELECT jt.tag,
+       COUNT(DISTINCT d.document_id) AS documents
+FROM documents d
+JOIN JSON_TABLE(d.metadata, '$.tags[*]' COLUMNS (tag VARCHAR(60) PATH '$')) AS jt
+WHERE d.status = 'published'
+  AND d.is_deleted = FALSE
+GROUP BY jt.tag
+ORDER BY documents DESC, jt.tag
+LIMIT 10;
+@equivalent_pg
+SELECT t.tag,
+       COUNT(DISTINCT d.document_id) AS documents
+FROM documents d
+CROSS JOIN LATERAL jsonb_array_elements_text(d.metadata->'tags') AS t(tag)
+WHERE d.status = 'published'
+  AND d.is_deleted = FALSE
+GROUP BY t.tag
+ORDER BY documents DESC, t.tag
+LIMIT 10;
+@dialect_note
+MySQL 8.0.4+ provides `JSON_TABLE`, which maps JSON paths to typed relational columns (it also supports nested paths and ordinality columns). PostgreSQL uses set-returning functions such as `jsonb_array_elements_text` with `LATERAL` (and offers SQL-standard `JSON_TABLE` from PostgreSQL 17). Both produce one row per array element; documents without tags disappear unless you use an outer (LEFT) lateral join.
+@explanation
+Arrays inside JSON are a one-to-many relationship hidden in a column. `JSON_TABLE` exposes it as rows, after which normal SQL (GROUP BY, joins) applies. The table function is evaluated per document row, like a lateral join.
+
+**Why it matters for AI apps:** tag and metadata distributions decide whether metadata filters in the vector store are useful (a tag on 90% of documents filters nothing) and reveal inconsistent tagging (`api-token` vs `api_token`).
+@mistakes
+- Using `JSON_EXTRACT(metadata, '$.tags[0]')` and missing all other tags.
+- Grouping by the JSON array text instead of the elements.
+@performance
+JSON_TABLE parses each document's JSON; fine for hundreds of rows. For frequent queries, store tags in a child table.
+@interview
+Unnesting semi-structured data is a common data-engineering task; knowing both dialects' tools is a plus.
+
+### SQL-169
+title: Synchronize index state with MERGE
+difficulty: Advanced
+primary: Upserts with MERGE (PostgreSQL 15+)
+secondary: WHEN MATCHED / NOT MATCHED branches, conditional updates, MySQL alternative
+concepts: upsert, dialect_functions, ai_not_reindexed, ai_rag_ingestion
+roles: AI, MLE
+time: 20
+dialect: POSTGRESQL
+tables: documents(document_id, doc_key, version_number, status, is_deleted, last_indexed_at)
+columns: action_summary, rows_count
+compare: ordered
+@context
+The ingestion service keeps a small state table `sb_index_state(doc_key PK, document_id, version_number, last_indexed_at)` describing what is currently indexed per document. A nightly job synchronizes it from the latest published versions.
+@problem
+Create `sb_index_state` with an outdated snapshot (each non-deleted `doc_key`'s **first** version). Then MERGE the latest published, non-deleted version of every `doc_key` into it: update rows whose `version_number` changed, insert keys that are missing. Return a summary of the final table: how many rows are on their latest version (`'current'`) vs. not (`'outdated'`).
+@expected
+After the MERGE every row is `'current'`; the summary has one row.
+@edge_cases
+- The source must have at most one row per target key, otherwise MERGE raises "MERGE command cannot affect row a second time".
+- `WHEN NOT MATCHED BY SOURCE` (delete target rows missing from the source) needs PostgreSQL 17+; PostgreSQL 16 supports MATCHED / NOT MATCHED only.
+@hint1
+Source: latest published version per `doc_key` (ROW_NUMBER).
+@hint2
+`MERGE INTO target t USING (source) s ON t.doc_key = s.doc_key WHEN MATCHED AND t.version_number <> s.version_number THEN UPDATE ... WHEN NOT MATCHED THEN INSERT ...`.
+@hint3
+Verify by comparing each state row with the source again.
+@setup
+DROP TABLE IF EXISTS sb_index_state;
+CREATE TABLE sb_index_state (
+    doc_key          VARCHAR(100) NOT NULL PRIMARY KEY,
+    document_id      INT          NOT NULL,
+    version_number   INT          NOT NULL,
+    last_indexed_at  TIMESTAMP
+);
+INSERT INTO sb_index_state (doc_key, document_id, version_number, last_indexed_at)
+SELECT doc_key, document_id, version_number, last_indexed_at
+FROM documents
+WHERE version_number = 1 AND is_deleted = FALSE AND doc_key LIKE 'help/%';
+@solution
+MERGE INTO sb_index_state t
+USING (
+    SELECT doc_key, document_id, version_number, last_indexed_at
+    FROM (SELECT d.*,
+                 ROW_NUMBER() OVER (PARTITION BY doc_key ORDER BY version_number DESC) AS rn
+          FROM documents d
+          WHERE status = 'published' AND is_deleted = FALSE) x
+    WHERE rn = 1
+) s
+ON t.doc_key = s.doc_key
+WHEN MATCHED AND t.version_number <> s.version_number THEN
+    UPDATE SET document_id = s.document_id,
+               version_number = s.version_number,
+               last_indexed_at = s.last_indexed_at
+WHEN NOT MATCHED THEN
+    INSERT (doc_key, document_id, version_number, last_indexed_at)
+    VALUES (s.doc_key, s.document_id, s.version_number, s.last_indexed_at);
+@verify
+SELECT CASE WHEN t.version_number = s.version_number THEN 'current' ELSE 'outdated' END AS action_summary,
+       COUNT(*) AS rows_count
+FROM sb_index_state t
+LEFT JOIN (SELECT doc_key, MAX(version_number) AS version_number
+           FROM documents WHERE status = 'published' AND is_deleted = FALSE
+           GROUP BY doc_key) s ON s.doc_key = t.doc_key
+GROUP BY CASE WHEN t.version_number = s.version_number THEN 'current' ELSE 'outdated' END
+ORDER BY action_summary;
+@equivalent_mysql
+INSERT INTO sb_index_state (doc_key, document_id, version_number, last_indexed_at)
+SELECT * FROM (
+    SELECT doc_key, document_id, version_number, last_indexed_at
+    FROM (SELECT d.*,
+                 ROW_NUMBER() OVER (PARTITION BY doc_key ORDER BY version_number DESC) AS rn
+          FROM documents d
+          WHERE status = 'published' AND is_deleted = FALSE) x
+    WHERE rn = 1
+) AS s
+ON DUPLICATE KEY UPDATE document_id     = s.document_id,
+                        version_number  = s.version_number,
+                        last_indexed_at = s.last_indexed_at;
+@setup_mysql
+DROP TABLE IF EXISTS sb_index_state;
+CREATE TABLE sb_index_state (
+    doc_key          VARCHAR(100) NOT NULL PRIMARY KEY,
+    document_id      INT          NOT NULL,
+    version_number   INT          NOT NULL,
+    last_indexed_at  DATETIME
+);
+INSERT INTO sb_index_state (doc_key, document_id, version_number, last_indexed_at)
+SELECT doc_key, document_id, version_number, last_indexed_at
+FROM documents
+WHERE version_number = 1 AND is_deleted = FALSE AND doc_key LIKE 'help/%';
+@cleanup
+DROP TABLE IF EXISTS sb_index_state
+@assert
+rows == [['current', rows[0][1]]]
+@dialect_note
+`MERGE` (SQL:2003) is available in PostgreSQL 15+ (with `RETURNING` and `WHEN NOT MATCHED BY SOURCE` from 17). MySQL has no MERGE; `INSERT ... ON DUPLICATE KEY UPDATE` covers insert-or-update but cannot express conditional branches or deletes in the same statement (the MySQL equivalent above updates unconditionally, which leads to the same final state here). MySQL's `REPLACE INTO` deletes and re-inserts the row, firing delete triggers and cascading foreign keys, so avoid it for upserts.
+@explanation
+MERGE joins a source to a target and applies a different action per match outcome:
+- **WHEN MATCHED AND <condition>**: update only rows that actually changed. That saves writes and keeps change timestamps meaningful.
+- **WHEN NOT MATCHED**: insert new keys.
+
+The source is deduplicated to one row per key with ROW_NUMBER. MERGE refuses to touch a target row twice, a useful safety check.
+
+The setup creates an outdated snapshot (first versions of help-center documents only), so the MERGE both updates existing keys and inserts all other document keys.
+@mistakes
+- A non-unique source key (runtime error).
+- Updating every matched row unconditionally on huge tables (unnecessary write amplification).
+@performance
+MERGE performs one join between source and target; index the target key.
+@interview
+MERGE vs upsert trade-offs are common in data-engineering interviews (SCD type-1 loads, CDC application).
+
+### SQL-170
+title: PostgreSQL shortcuts: DISTINCT ON, FILTER and generate_series
+difficulty: Hard
+primary: Database-specific analytical features (PostgreSQL)
+secondary: DISTINCT ON for latest-row-per-key, aggregate FILTER clause, generate_series date spine
+concepts: dialect_functions, dedup_window, conditional_aggregation, time_series, ai_acceptance
+roles: AI, DS
+time: 18
+dialect: POSTGRESQL
+tables: ai_feedback(feedback_id, request_id, feedback_type, created_at)
+columns: feedback_date, final_thumbs_up, final_thumbs_down, final_flags
+compare: ordered
+@context
+The portable patterns from earlier modules (ROW_NUMBER for the latest row, `SUM(CASE ...)` pivots, recursive date spines) have shorter PostgreSQL-specific spellings. Daily final-feedback counts for June 2025 are a good showcase.
+@problem
+For every day of June 2025 (including days without feedback), count requests whose **final** feedback (latest per request) was given that day, split into thumbs up, thumbs down and flags. Use `DISTINCT ON`, `COUNT(*) FILTER (...)` and `generate_series`.
+@expected
+30 rows.
+@edge_cases
+- `DISTINCT ON (expr)` keeps the first row per expression **according to ORDER BY**, so the ORDER BY must start with the same expression(s).
+- `generate_series` on timestamps returns timestamps; cast to DATE.
+@hint1
+`SELECT DISTINCT ON (request_id) ... ORDER BY request_id, created_at DESC, feedback_id DESC`.
+@hint2
+`COUNT(*) FILTER (WHERE feedback_type = 'thumbs_up')`.
+@hint3
+`generate_series(DATE '2025-06-01', DATE '2025-06-30', INTERVAL '1 day')` LEFT JOINed to the daily counts.
+@solution
+WITH final_fb AS (
+    SELECT DISTINCT ON (request_id)
+           request_id, feedback_type, CAST(created_at AS DATE) AS feedback_date
+    FROM ai_feedback
+    ORDER BY request_id, created_at DESC, feedback_id DESC
+),
+daily AS (
+    SELECT feedback_date,
+           COUNT(*) FILTER (WHERE feedback_type = 'thumbs_up')   AS final_thumbs_up,
+           COUNT(*) FILTER (WHERE feedback_type = 'thumbs_down') AS final_thumbs_down,
+           COUNT(*) FILTER (WHERE feedback_type = 'flag')        AS final_flags
+    FROM final_fb
+    GROUP BY feedback_date
+)
+SELECT CAST(g.d AS DATE)                    AS feedback_date,
+       COALESCE(daily.final_thumbs_up, 0)   AS final_thumbs_up,
+       COALESCE(daily.final_thumbs_down, 0) AS final_thumbs_down,
+       COALESCE(daily.final_flags, 0)       AS final_flags
+FROM generate_series(DATE '2025-06-01', DATE '2025-06-30', INTERVAL '1 day') AS g(d)
+LEFT JOIN daily ON daily.feedback_date = CAST(g.d AS DATE)
+ORDER BY feedback_date;
+@equivalent_mysql
+WITH RECURSIVE spine AS (
+    SELECT DATE '2025-06-01' AS d
+    UNION ALL
+    SELECT d + INTERVAL 1 DAY FROM spine WHERE d < DATE '2025-06-30'
+),
+final_fb AS (
+    SELECT request_id, feedback_type, CAST(created_at AS DATE) AS feedback_date
+    FROM (SELECT f.*,
+                 ROW_NUMBER() OVER (PARTITION BY request_id ORDER BY created_at DESC, feedback_id DESC) AS rn
+          FROM ai_feedback f) x
+    WHERE rn = 1
+),
+daily AS (
+    SELECT feedback_date,
+           SUM(CASE WHEN feedback_type = 'thumbs_up'   THEN 1 ELSE 0 END) AS final_thumbs_up,
+           SUM(CASE WHEN feedback_type = 'thumbs_down' THEN 1 ELSE 0 END) AS final_thumbs_down,
+           SUM(CASE WHEN feedback_type = 'flag'        THEN 1 ELSE 0 END) AS final_flags
+    FROM final_fb
+    GROUP BY feedback_date
+)
+SELECT s.d                                  AS feedback_date,
+       COALESCE(daily.final_thumbs_up, 0)   AS final_thumbs_up,
+       COALESCE(daily.final_thumbs_down, 0) AS final_thumbs_down,
+       COALESCE(daily.final_flags, 0)       AS final_flags
+FROM spine s
+LEFT JOIN daily ON daily.feedback_date = s.d
+ORDER BY feedback_date;
+@assert
+len(rows) == 30
+@dialect_note
+| portable pattern | PostgreSQL shortcut | MySQL |
+|---|---|---|
+| `ROW_NUMBER() ... WHERE rn = 1` | `DISTINCT ON (key) ... ORDER BY key, ...` | ROW_NUMBER only |
+| `SUM(CASE WHEN c THEN 1 ELSE 0 END)` | `COUNT(*) FILTER (WHERE c)` | `SUM(c)` (booleans are integers) |
+| recursive date spine | `generate_series(start, stop, step)` | recursive CTE |
+The MySQL equivalent (validated to return identical rows) uses the portable patterns.
+@explanation
+- **DISTINCT ON** keeps the first row of each group in ORDER BY order, which is the most concise "latest row per key" in PostgreSQL. The ORDER BY must begin with the DISTINCT ON expressions; the remaining sort keys choose the survivor.
+- **FILTER** attaches a WHERE clause to an individual aggregate. It reads better than CASE and works with any aggregate (`AVG(x) FILTER (...)`).
+- **generate_series** produces a set of values (numbers or timestamps), the idiomatic PostgreSQL date spine.
+
+All three are PostgreSQL extensions (FILTER is in the SQL standard but not implemented by MySQL). Use them freely in PostgreSQL-only code; keep the portable forms for shared code.
+@mistakes
+- DISTINCT ON with an ORDER BY that does not start with the DISTINCT ON key (error).
+- Forgetting the deterministic tie-breaker (`feedback_id`) inside DISTINCT ON's ORDER BY.
+@performance
+DISTINCT ON needs a sort by the key; an index on `(request_id, created_at DESC)` can provide it.
+@interview
+Knowing these shortcuts (and their portable equivalents) signals real PostgreSQL experience.
+
+### SQL-171
+title: Top requests per organization with LATERAL joins
+difficulty: Advanced
+primary: LATERAL derived tables
+secondary: correlated top-N per group, comparison with window functions, MySQL 8.0.14+ support
+concepts: dialect_functions, top_n_per_group, correlated_subquery, ai_high_tokens
+roles: AI
+time: 18
+dialect: BOTH
+tables: organizations(org_id, segment); llm_requests(request_id, org_id, requested_at, input_tokens, output_tokens)
+columns: org_id, request_id, total_tokens, token_rank
+compare: ordered
+@context
+For each Enterprise customer, the account team wants the three most token-hungry requests in June 2025 (to discuss prompt hygiene).
+@problem
+Using a LATERAL derived table, return for each Enterprise organization with June traffic its top 3 requests by total tokens (`input + COALESCE(output, 0)`; ties by `request_id`): `org_id`, `request_id`, `total_tokens`, `token_rank` (1-3). Sort by `org_id`, `token_rank`.
+@expected
+Up to 3 rows per Enterprise organization.
+@edge_cases
+- A LATERAL subquery can reference columns of tables to its left (like a correlated subquery), but it returns a table, so it can deliver several rows and columns.
+- MySQL supports LATERAL from 8.0.14.
+@hint1
+`FROM organizations o CROSS JOIN LATERAL (SELECT ... WHERE r.org_id = o.org_id ORDER BY ... LIMIT 3) top3`.
+@hint2
+Number the rows inside the LATERAL subquery with ROW_NUMBER over its own ordering.
+@hint3
+CROSS JOIN LATERAL drops organizations with no rows (like an inner join).
+@solution
+SELECT o.org_id,
+       top3.request_id,
+       top3.total_tokens,
+       top3.token_rank
+FROM organizations o
+CROSS JOIN LATERAL (
+    SELECT r.request_id,
+           r.input_tokens + COALESCE(r.output_tokens, 0) AS total_tokens,
+           ROW_NUMBER() OVER (ORDER BY r.input_tokens + COALESCE(r.output_tokens, 0) DESC, r.request_id) AS token_rank
+    FROM llm_requests r
+    WHERE r.org_id = o.org_id
+      AND r.requested_at >= TIMESTAMP '2025-06-01 00:00:00'
+      AND r.requested_at <  TIMESTAMP '2025-07-01 00:00:00'
+    ORDER BY total_tokens DESC, r.request_id
+    LIMIT 3
+) AS top3
+WHERE o.segment = 'Enterprise'
+ORDER BY o.org_id, top3.token_rank;
+@alternative
+SELECT org_id, request_id, total_tokens, token_rank
+FROM (
+    SELECT r.org_id,
+           r.request_id,
+           r.input_tokens + COALESCE(r.output_tokens, 0) AS total_tokens,
+           ROW_NUMBER() OVER (PARTITION BY r.org_id
+                              ORDER BY r.input_tokens + COALESCE(r.output_tokens, 0) DESC, r.request_id) AS token_rank
+    FROM llm_requests r
+    JOIN organizations o ON o.org_id = r.org_id
+    WHERE o.segment = 'Enterprise'
+      AND r.requested_at >= TIMESTAMP '2025-06-01 00:00:00'
+      AND r.requested_at <  TIMESTAMP '2025-07-01 00:00:00'
+) ranked
+WHERE token_rank <= 3
+ORDER BY org_id, token_rank;
+@alternative_note
+The window-function version ranks every request of every organization and then filters. The LATERAL version runs a small "top 3" query per organization, and with an index on `(org_id, ...)` it reads only a few rows each. Use LATERAL when groups are large and N is small; use windows when you need the ranking over all rows anyway.
+@explanation
+`LATERAL` lets a derived table in FROM refer to columns of preceding FROM items: it is a **correlated derived table**. Here it runs a top-3 query per organization. Compared with a correlated scalar subquery, it can return several rows and columns; compared with window functions, it can stop early per group.
+
+Both PostgreSQL and MySQL (8.0.14+) support `CROSS JOIN LATERAL`. `LEFT JOIN LATERAL (...) ON TRUE` keeps groups with no rows; MySQL also requires that form for outer lateral joins.
+@mistakes
+- Omitting LATERAL: the subquery cannot see `o.org_id` (error).
+- Forgetting deterministic tie-breakers in both the ORDER BY and the ROW_NUMBER.
+@performance
+With an index on `llm_requests(org_id, requested_at)` each lateral execution is an index range scan plus a small sort.
+@interview
+LATERAL is a modern SQL feature that impresses when used for top-N-per-group or for calling set-returning functions per row.

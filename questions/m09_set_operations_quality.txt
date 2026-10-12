@@ -1,0 +1,539 @@
+### SQL-136
+title: UNION versus UNION ALL for a contact list
+difficulty: Easy
+primary: UNION and UNION ALL
+secondary: duplicate elimination, normalization before set operations
+concepts: union, union_all, string_functions, distinct
+roles: DS
+time: 8
+dialect: BOTH
+tables: users(user_id, email, role, status); support_tickets(user_id, priority, created_at)
+columns: union_all_rows, union_rows
+compare: ordered
+@context
+Customer success e-mails two groups about a new escalation process: active admins, and every user who opened an urgent ticket in H1 2025. Each person should receive one e-mail.
+@problem
+Build both lists as normalized e-mails (`LOWER(TRIM(email))`). Return one row with `union_all_rows` (rows from UNION ALL of the two lists) and `union_rows` (rows from UNION).
+@expected
+One row; `union_rows` is smaller.
+@edge_cases
+- A person can appear in both lists and several times in the ticket list (several urgent tickets).
+- **Normalize before UNION.** MySQL's case-insensitive collation would treat `Anna@x.com` and `anna@x.com` as duplicates, but PostgreSQL would not, so the raw UNION gives different counts on the two engines.
+@hint1
+UNION ALL concatenates the results; UNION also removes duplicate rows.
+@hint2
+Count each variant in a derived table.
+@hint3
+`SELECT (SELECT COUNT(*) FROM (... UNION ALL ...) a) AS union_all_rows, (SELECT COUNT(*) FROM (... UNION ...) b) AS union_rows`.
+@solution
+SELECT
+  (SELECT COUNT(*) FROM (
+       SELECT LOWER(TRIM(email)) AS email FROM users WHERE role = 'admin' AND status = 'active'
+       UNION ALL
+       SELECT LOWER(TRIM(u.email)) FROM support_tickets t JOIN users u ON u.user_id = t.user_id
+       WHERE t.priority = 'urgent'
+         AND t.created_at >= TIMESTAMP '2025-01-01 00:00:00'
+         AND t.created_at <  TIMESTAMP '2025-07-01 00:00:00'
+   ) a) AS union_all_rows,
+  (SELECT COUNT(*) FROM (
+       SELECT LOWER(TRIM(email)) AS email FROM users WHERE role = 'admin' AND status = 'active'
+       UNION
+       SELECT LOWER(TRIM(u.email)) FROM support_tickets t JOIN users u ON u.user_id = t.user_id
+       WHERE t.priority = 'urgent'
+         AND t.created_at >= TIMESTAMP '2025-01-01 00:00:00'
+         AND t.created_at <  TIMESTAMP '2025-07-01 00:00:00'
+   ) b) AS union_rows;
+@assert
+num(rows[0][0]) > num(rows[0][1])
+@explanation
+- `UNION ALL` keeps every row, so it is cheap: no sort or hash.
+- `UNION` removes duplicate rows across **and within** both inputs, which costs a sort or hash step.
+
+Use UNION when you need a set, and UNION ALL when duplicates are meaningful or impossible. Duplicate detection depends on the column collation. Normalizing explicitly (`LOWER(TRIM(...))`) makes the result identical on PostgreSQL and MySQL.
+
+Column names come from the first SELECT; later SELECTs only need compatible types and the same number of columns.
+@mistakes
+- Using UNION "to be safe" in pipelines where duplicates matter (e.g. event logs).
+- Relying on engine collation for deduplication.
+@performance
+UNION adds a deduplication step over all rows; UNION ALL streams.
+@interview
+Classic question; mentioning cost and collation shows depth.
+
+### SQL-137
+title: Users who use AI features and buy (INTERSECT)
+difficulty: Medium
+primary: INTERSECT
+secondary: MySQL version support, EXISTS alternative, segment rollup
+concepts: intersect, semi_join, ds_segments, ai_volume
+roles: DS, AI
+time: 12
+dialect: BOTH
+tables: llm_requests(user_id, status, requested_at); orders(user_id, status, order_ts); users(user_id, org_id); organizations(org_id, segment)
+columns: segment, ai_buyers
+compare: ordered
+@context
+Product marketing wants to know how many users in each segment both used an AI feature successfully and completed a purchase in Q2 2025.
+@problem
+Compute the set of users with a successful LLM request in Q2 2025, INTERSECT the set with a completed order in Q2 2025, and count the result per customer segment. Return `segment`, `ai_buyers`, sorted by segment.
+@expected
+3 rows.
+@edge_cases
+- **INTERSECT and EXCEPT require MySQL 8.0.31 or later.** On older MySQL versions use EXISTS (see the alternative).
+- `llm_requests.user_id` can be NULL (system calls); NULL never matches a real user, but exclude it explicitly.
+@hint1
+Both inputs of INTERSECT must return the same columns (here just `user_id`).
+@hint2
+Wrap the INTERSECT in a derived table and join it to users and organizations.
+@hint3
+INTERSECT returns distinct rows, so each user is counted once.
+@solution
+SELECT o.segment,
+       COUNT(*) AS ai_buyers
+FROM (
+    SELECT user_id FROM llm_requests
+    WHERE status = 'success' AND user_id IS NOT NULL
+      AND requested_at >= TIMESTAMP '2025-04-01 00:00:00'
+      AND requested_at <  TIMESTAMP '2025-07-01 00:00:00'
+    INTERSECT
+    SELECT user_id FROM orders
+    WHERE status = 'completed'
+      AND order_ts >= TIMESTAMP '2025-04-01 00:00:00'
+      AND order_ts <  TIMESTAMP '2025-07-01 00:00:00'
+) both_sets
+JOIN users u         ON u.user_id = both_sets.user_id
+JOIN organizations o ON o.org_id = u.org_id
+GROUP BY o.segment
+ORDER BY o.segment;
+@alternative
+SELECT o.segment,
+       COUNT(*) AS ai_buyers
+FROM users u
+JOIN organizations o ON o.org_id = u.org_id
+WHERE EXISTS (SELECT 1 FROM llm_requests r
+              WHERE r.user_id = u.user_id AND r.status = 'success'
+                AND r.requested_at >= TIMESTAMP '2025-04-01 00:00:00'
+                AND r.requested_at <  TIMESTAMP '2025-07-01 00:00:00')
+  AND EXISTS (SELECT 1 FROM orders x
+              WHERE x.user_id = u.user_id AND x.status = 'completed'
+                AND x.order_ts >= TIMESTAMP '2025-04-01 00:00:00'
+                AND x.order_ts <  TIMESTAMP '2025-07-01 00:00:00')
+GROUP BY o.segment
+ORDER BY o.segment;
+@alternative_note
+Two EXISTS semi-joins give the same set, work on every MySQL 8.0 version, and make it easy to add more columns. INTERSECT is more declarative when you only compare keys.
+@explanation
+`A INTERSECT B` returns the distinct rows present in both inputs. It expresses "users in both groups" directly and removes duplicates automatically, because a user with ten requests still appears once.
+
+Set operations compare whole rows, so they need matching column lists. When you need columns from only one side, join afterwards (as here) or use EXISTS.
+@mistakes
+- Joining requests to orders on `user_id` and counting rows, which multiplies requests by orders.
+- Using INTERSECT on MySQL 8.0.30 or older (syntax error).
+@performance
+Both forms read each table once; EXISTS can stop early per user.
+@interview
+Shows command of set operators and their portability limits.
+
+### SQL-138
+title: Paying but inactive customers (EXCEPT)
+difficulty: Medium
+primary: EXCEPT
+secondary: set difference of keys, join back for attributes, churn-risk list
+concepts: except, anti_join, churn, ds_activity_decline
+roles: DS
+time: 12
+dialect: BOTH
+tables: subscriptions(org_id, ended_at, mrr); users(user_id, org_id); sessions(user_id, started_at); organizations(org_id, org_name, segment)
+columns: org_id, org_name, segment, open_mrr
+compare: ordered
+@context
+An organization that pays (open subscription) but has nobody using the product is a churn risk. Customer success wants that list.
+@problem
+Compute organizations with an open subscription EXCEPT organizations with at least one session in the 30 days before 2025-07-01. Return `org_id`, `org_name`, `segment` and `open_mrr` (sum of open subscriptions' MRR). Sort by `open_mrr` descending, then `org_id`.
+@expected
+A list of organizations.
+@edge_cases
+- EXCEPT (MySQL 8.0.31+) returns distinct rows of the first input that are not in the second.
+@hint1
+First input: `SELECT org_id FROM subscriptions WHERE ended_at IS NULL`.
+@hint2
+Second input: org IDs of users with sessions in the window (join sessions → users).
+@hint3
+Join the difference back to organizations and the open subscriptions for the attributes.
+@solution
+SELECT o.org_id,
+       o.org_name,
+       o.segment,
+       SUM(s.mrr) AS open_mrr
+FROM (
+    SELECT org_id FROM subscriptions WHERE ended_at IS NULL
+    EXCEPT
+    SELECT u.org_id
+    FROM sessions se
+    JOIN users u ON u.user_id = se.user_id
+    WHERE se.started_at >= TIMESTAMP '2025-07-01 00:00:00' - INTERVAL '30' DAY
+      AND se.started_at <  TIMESTAMP '2025-07-01 00:00:00'
+) inactive
+JOIN organizations o ON o.org_id = inactive.org_id
+JOIN subscriptions s ON s.org_id = inactive.org_id AND s.ended_at IS NULL
+GROUP BY o.org_id, o.org_name, o.segment
+ORDER BY open_mrr DESC, o.org_id;
+@alternative
+SELECT o.org_id,
+       o.org_name,
+       o.segment,
+       SUM(s.mrr) AS open_mrr
+FROM organizations o
+JOIN subscriptions s ON s.org_id = o.org_id AND s.ended_at IS NULL
+WHERE NOT EXISTS (SELECT 1
+                  FROM sessions se
+                  JOIN users u ON u.user_id = se.user_id
+                  WHERE u.org_id = o.org_id
+                    AND se.started_at >= TIMESTAMP '2025-07-01 00:00:00' - INTERVAL '30' DAY
+                    AND se.started_at <  TIMESTAMP '2025-07-01 00:00:00')
+GROUP BY o.org_id, o.org_name, o.segment
+ORDER BY open_mrr DESC, o.org_id;
+@alternative_note
+`NOT EXISTS` is the anti-join equivalent of EXCEPT on keys. It works on all MySQL 8.0 versions and is NULL-safe. EXCEPT also treats NULLs as equal, unlike NOT IN.
+@explanation
+`A EXCEPT B` keeps distinct rows of A that do not appear in B, a set difference. On a single key column it is equivalent to an anti-join. Unlike NOT IN, EXCEPT compares NULLs as "not distinct", so a NULL in B does not wipe out the result.
+
+The difference contains only keys; joining back to organizations and subscriptions adds the attributes and MRR. Organizations with two open subscriptions (the billing bug) sum both, matching what they are actually billed.
+@mistakes
+- `org_id NOT IN (subquery)` where the subquery could return NULL.
+- Using `ended_at > '2025-07-01'` for "open"; open periods have NULL `ended_at`.
+@performance
+EXCEPT deduplicates both inputs (hash or sort); the NOT EXISTS version probes `users(org_id)` and `sessions(user_id, started_at)`.
+@interview
+Set-difference questions often come with "how else could you write it?".
+
+### SQL-139
+title: Reconcile order headers with order lines (symmetric difference)
+difficulty: Medium
+primary: Comparing records across datasets
+secondary: (A EXCEPT B) UNION ALL (B EXCEPT A), labelling the side
+concepts: compare_datasets, except, union_all, ds_duplicates
+roles: DS, MLE
+time: 15
+dialect: BOTH
+tables: orders(order_id, order_total); order_items(order_id, quantity, unit_price, discount_amount)
+columns: side, order_id, amount
+compare: ordered
+@context
+The finance warehouse has two sources for an order's amount: the header (`orders.order_total`) and the sum of its lines. A reconciliation lists every (order, amount) pair present in one source but not in the other.
+@problem
+Return the symmetric difference of the two sets of `(order_id, amount)`: rows only in the header set labelled `'header_only'`, and rows only in the line set labelled `'lines_only'`. Sort by `order_id`, then `side`.
+@expected
+Two rows per mismatching order (about 2% of orders).
+@edge_cases
+- Set operators compare values, not formatting: `10.0` and `10.00` are equal DECIMALs.
+- An order without lines would appear only on the header side.
+@hint1
+Build both sets with the same two columns.
+@hint2
+`(headers EXCEPT lines)` gives header-only rows; swap for the other side.
+@hint3
+Label each side with a constant column and UNION ALL them.
+@solution
+SELECT 'header_only' AS side, order_id, amount
+FROM (
+    SELECT order_id, order_total AS amount FROM orders
+    EXCEPT
+    SELECT order_id, SUM(quantity * unit_price - discount_amount) FROM order_items GROUP BY order_id
+) h
+UNION ALL
+SELECT 'lines_only', order_id, amount
+FROM (
+    SELECT order_id, SUM(quantity * unit_price - discount_amount) AS amount FROM order_items GROUP BY order_id
+    EXCEPT
+    SELECT order_id, order_total FROM orders
+) l
+ORDER BY order_id, side;
+@assert
+len(rows) % 2 == 0 and len(rows) > 0
+@explanation
+A symmetric difference is the standard "diff" between two datasets: everything that is not in both. Because the comparison covers the whole row `(order_id, amount)`, an order with a wrong total shows up twice, once with each amount, which makes the mismatch obvious.
+
+This pattern is how pipeline outputs are regression-tested: run the old and the new version and diff the outputs. An empty result means identical datasets.
+@mistakes
+- Comparing only `order_id`, which misses value differences.
+- Using UNION instead of UNION ALL for the final step (harmless here, but it hides duplicate diffs in other cases).
+@performance
+Each EXCEPT needs a hash or sort of both inputs; fine for thousands of rows.
+@interview
+"How would you verify that a refactored pipeline produces the same output?" A symmetric diff is the expected answer.
+
+### SQL-140
+title: Orders billed to an organization other than the buyer's
+difficulty: Medium
+primary: Consistency checks across denormalized columns
+secondary: self-referencing hierarchy, CASE classification
+concepts: ds_duplicates, self_join, case, multi_join
+roles: DS
+time: 12
+dialect: BOTH
+tables: orders(order_id, user_id, org_id, order_ts); users(user_id, org_id); organizations(org_id, parent_org_id)
+columns: order_id, order_ts, order_org_id, user_org_id, relationship
+compare: ordered
+@context
+`orders.org_id` is copied from the buyer's organization at checkout. A few orders disagree with the user's current organization. Some are legitimate (billed to the parent company), others are bugs.
+@problem
+List orders whose `org_id` differs from the purchasing user's `org_id`, with `relationship`: `'billed_to_parent'` when the order's org is the parent of the user's org, `'billed_to_subsidiary'` when it is a child, else `'unrelated'`. Sort by `order_id`.
+@expected
+About ten orders.
+@edge_cases
+- `parent_org_id` is NULL for top-level organizations; comparisons with NULL fall through to `'unrelated'`.
+@hint1
+Join orders to users and compare the two `org_id`s.
+@hint2
+Join both organizations to read their parents.
+@hint3
+CASE on `uo.parent_org_id = o.org_id` and `oo.parent_org_id = u.org_id`.
+@solution
+SELECT o.order_id,
+       o.order_ts,
+       o.org_id AS order_org_id,
+       u.org_id AS user_org_id,
+       CASE WHEN uo.parent_org_id = o.org_id THEN 'billed_to_parent'
+            WHEN oo.parent_org_id = u.org_id THEN 'billed_to_subsidiary'
+            ELSE 'unrelated' END AS relationship
+FROM orders o
+JOIN users u          ON u.user_id = o.user_id
+JOIN organizations uo ON uo.org_id = u.org_id
+JOIN organizations oo ON oo.org_id = o.org_id
+WHERE o.org_id <> u.org_id
+ORDER BY o.order_id;
+@explanation
+Denormalized copies (like `orders.org_id`) speed up queries but can drift from their source. The check compares the copy with the source, and the hierarchy explains part of the difference. The two joins to `organizations` (aliases `uo` and `oo`) are a self-referencing lookup: each organization's parent is read from the same table.
+
+`unrelated` rows are data bugs to fix at the source. Parent billing may be a valid business process that should be documented, for example as a separate `billing_org_id` column.
+@mistakes
+- Treating every mismatch as an error.
+- Comparing with `!=`. It works in both engines, but `<>` is the SQL standard operator.
+@performance
+Primary-key joins only.
+@interview
+Shows judgment: distinguishing legitimate business cases from data bugs.
+
+### SQL-141
+title: A data-quality scorecard in one query
+difficulty: Hard
+primary: Data-quality checks combined with UNION ALL
+secondary: anti-joins, self-joins on intervals, duplicate detection, pass/fail status
+concepts: union_all, anti_join, self_join, ds_duplicates, ml_pipeline_validation, referential_integrity
+roles: DS, MLE
+time: 25
+dialect: BOTH
+tables: users(email); orders(order_id, user_id, org_id, status, order_total); order_items(order_id, quantity, unit_price, discount_amount); payments(order_id); subscriptions(subscription_id, org_id, started_at, ended_at); events(user_id, session_id, event_name, event_ts); support_tickets(first_response_at, resolved_at)
+columns: check_name, failing_rows, status
+compare: ordered
+@context
+Before the nightly ML training job, a data-quality gate runs a fixed set of checks. Each check returns the number of failing rows; any non-zero count is a FAIL.
+@problem
+Return one row per check with `check_name`, `failing_rows` and `status` (`'PASS'`/`'FAIL'`):
+1. `email_whitespace`: users whose e-mail has leading/trailing spaces
+2. `duplicate_person_accounts`: accounts beyond the first per normalized e-mail
+3. `order_total_mismatch`: orders whose total differs from their lines by more than 0.005
+4. `completed_without_payment`
+5. `order_org_mismatch`: orders whose `org_id` differs from the user's
+6. `overlapping_subscriptions`: pairs of overlapping periods of the same org
+7. `duplicate_client_events`: extra copies of (user, session, name, timestamp)
+8. `response_after_resolution`: tickets with `first_response_at > resolved_at`
+Sort by `check_name`.
+@expected
+8 rows; most checks fail on this deliberately imperfect dataset, and some pass.
+@edge_cases
+- Each check must return exactly one number, even when nothing fails (COUNT returns 0).
+- Overlap between open periods: treat `ended_at IS NULL` as "far future".
+@hint1
+Write each check as a `SELECT 'name' AS check_name, COUNT(*) AS failing_rows FROM ...`.
+@hint2
+Stack them with UNION ALL inside a derived table.
+@hint3
+Add `CASE WHEN failing_rows = 0 THEN 'PASS' ELSE 'FAIL' END` in the outer query.
+@solution
+SELECT check_name,
+       failing_rows,
+       CASE WHEN failing_rows = 0 THEN 'PASS' ELSE 'FAIL' END AS status
+FROM (
+    SELECT 'email_whitespace' AS check_name, COUNT(*) AS failing_rows
+    FROM users WHERE email <> TRIM(email)
+    UNION ALL
+    SELECT 'duplicate_person_accounts', COALESCE(SUM(n - 1), 0)
+    FROM (SELECT COUNT(*) AS n FROM users GROUP BY LOWER(TRIM(email)) HAVING COUNT(*) > 1) d
+    UNION ALL
+    SELECT 'order_total_mismatch', COUNT(*)
+    FROM orders o
+    JOIN (SELECT order_id, SUM(quantity * unit_price - discount_amount) AS s
+          FROM order_items GROUP BY order_id) i ON i.order_id = o.order_id
+    WHERE ABS(o.order_total - i.s) > 0.005
+    UNION ALL
+    SELECT 'completed_without_payment', COUNT(*)
+    FROM orders o
+    WHERE o.status = 'completed'
+      AND NOT EXISTS (SELECT 1 FROM payments p WHERE p.order_id = o.order_id)
+    UNION ALL
+    SELECT 'order_org_mismatch', COUNT(*)
+    FROM orders o JOIN users u ON u.user_id = o.user_id
+    WHERE o.org_id <> u.org_id
+    UNION ALL
+    SELECT 'overlapping_subscriptions', COUNT(*)
+    FROM subscriptions a
+    JOIN subscriptions b
+      ON b.org_id = a.org_id
+     AND a.subscription_id < b.subscription_id
+     AND a.started_at < COALESCE(b.ended_at, TIMESTAMP '9999-12-31 00:00:00')
+     AND b.started_at < COALESCE(a.ended_at, TIMESTAMP '9999-12-31 00:00:00')
+    UNION ALL
+    SELECT 'duplicate_client_events', COALESCE(SUM(n - 1), 0)
+    FROM (SELECT COUNT(*) AS n FROM events
+          WHERE session_id IS NOT NULL
+          GROUP BY user_id, session_id, event_name, event_ts
+          HAVING COUNT(*) > 1) e
+    UNION ALL
+    SELECT 'response_after_resolution', COUNT(*)
+    FROM support_tickets
+    WHERE first_response_at > resolved_at
+) checks
+ORDER BY check_name;
+@assert
+len(rows) == 8
+any(r[2] == 'PASS' for r in rows) and any(r[2] == 'FAIL' for r in rows)
+@explanation
+Each branch is an independent check reduced to a single count; UNION ALL stacks them into a report with a fixed schema `(check_name, failing_rows)`. The outer query turns counts into a status. New checks are added by appending a branch.
+
+Notable techniques:
+- **Interval overlap**: two periods overlap iff `a.start < b.end AND b.start < a.end`. Open periods use a far-future sentinel via COALESCE. `a.subscription_id < b.subscription_id` counts each pair once.
+- **Duplicates beyond the first**: `SUM(n − 1)` over groups with `n > 1`; COALESCE turns "no duplicate groups" into 0.
+- `email <> TRIM(email)` is reliable in both engines because the default MySQL 8 collation is NO PAD; case problems need a binary comparison (SQL-009).
+
+Data-quality gates like this belong *before* training. A failing gate should block the training job or at least be recorded with the model version.
+@mistakes
+- Checks that return no row instead of 0 (e.g. grouped queries without an outer aggregate), which silently drop out of the report.
+- The interval test `a.start BETWEEN b.start AND b.end`, which misses periods that fully contain the other.
+@performance
+Eight independent scans; acceptable for a nightly gate. At scale, run checks in parallel or on partitions.
+@interview
+Data-quality tests are central to MLE and analytics-engineering roles; a clean, extensible pattern is what interviewers want to see.
+
+### SQL-142
+title: Person-level clusters of duplicate accounts
+difficulty: Hard
+primary: Entity resolution clusters
+secondary: canonical ID per cluster, string aggregation per dialect (STRING_AGG vs GROUP_CONCAT)
+concepts: ds_duplicates, ml_duplicate_examples, dialect_functions, string_functions, left_join
+roles: DS, MLE
+time: 18
+dialect: BOTH
+tables: users(user_id, email); orders(user_id, status)
+columns: canonical_user_id, normalized_email, accounts, account_ids, completed_orders
+compare: ordered
+@context
+Pairs of duplicates (SQL-044) are not enough for a merge job: it needs **clusters**, one row per real person with all their account IDs, a canonical ID (the oldest account) and merged activity.
+@problem
+For every normalized e-mail with more than one account, return `canonical_user_id` (smallest user ID), `normalized_email`, `accounts`, `account_ids` (comma-separated, ascending) and `completed_orders` across all accounts. Sort by `canonical_user_id`.
+@expected
+About two dozen clusters.
+@edge_cases
+- String aggregation is engine-specific: PostgreSQL `STRING_AGG(text, sep ORDER BY ...)`, MySQL `GROUP_CONCAT(expr ORDER BY ... SEPARATOR sep)`.
+- Joining orders before aggregating account IDs would repeat IDs (fan-out); aggregate orders per user first.
+@hint1
+Group users by `LOWER(TRIM(email))` with `HAVING COUNT(*) > 1`.
+@hint2
+LEFT JOIN a per-user completed-order count so accounts without orders still appear.
+@hint3
+PostgreSQL: `STRING_AGG(CAST(u.user_id AS TEXT), ',' ORDER BY u.user_id)`; MySQL: `GROUP_CONCAT(u.user_id ORDER BY u.user_id SEPARATOR ',')`.
+@solution_pg
+SELECT MIN(u.user_id)                                              AS canonical_user_id,
+       LOWER(TRIM(u.email))                                        AS normalized_email,
+       COUNT(*)                                                    AS accounts,
+       STRING_AGG(CAST(u.user_id AS TEXT), ',' ORDER BY u.user_id) AS account_ids,
+       COALESCE(SUM(o.n), 0)                                       AS completed_orders
+FROM users u
+LEFT JOIN (SELECT user_id, COUNT(*) AS n FROM orders WHERE status = 'completed' GROUP BY user_id) o
+       ON o.user_id = u.user_id
+GROUP BY LOWER(TRIM(u.email))
+HAVING COUNT(*) > 1
+ORDER BY canonical_user_id;
+@solution_mysql
+SELECT MIN(u.user_id)                                              AS canonical_user_id,
+       LOWER(TRIM(u.email))                                        AS normalized_email,
+       COUNT(*)                                                    AS accounts,
+       GROUP_CONCAT(u.user_id ORDER BY u.user_id SEPARATOR ',')    AS account_ids,
+       COALESCE(SUM(o.n), 0)                                       AS completed_orders
+FROM users u
+LEFT JOIN (SELECT user_id, COUNT(*) AS n FROM orders WHERE status = 'completed' GROUP BY user_id) o
+       ON o.user_id = u.user_id
+GROUP BY LOWER(TRIM(u.email))
+HAVING COUNT(*) > 1
+ORDER BY canonical_user_id;
+@dialect_note
+`STRING_AGG(expr, delimiter ORDER BY ...)` is the SQL-standard-style aggregate in PostgreSQL; its argument must be text. MySQL's `GROUP_CONCAT(expr ORDER BY ... SEPARATOR ...)` converts automatically, but **truncates silently at `group_concat_max_len` (default 1024 bytes)**. Raise it (`SET SESSION group_concat_max_len = 100000`) for long lists. In MySQL's default collation, grouping by `LOWER(TRIM(email))` behaves the same as in PostgreSQL because the expression is already normalized.
+@explanation
+Grouping by the normalized key forms clusters; HAVING keeps real duplicates. The canonical ID (MIN) is deterministic and stable: the oldest account survives a merge. Orders are pre-aggregated per user so that the LEFT JOIN is one-to-one and cannot duplicate account IDs in the string.
+
+A merge job would use this table to repoint foreign keys (orders, tickets, events) from duplicate accounts to the canonical one. ML pipelines use the same mapping so that one person is never in train and test at the same time.
+@mistakes
+- Joining raw orders, which repeats account IDs in `account_ids` and inflates counts.
+- Forgetting `group_concat_max_len` on large clusters.
+@performance
+Grouping by an expression requires computing it per row; a generated normalized column with an index helps (SQL-163).
+@interview
+Entity resolution is common in DS/MLE interviews; the dialect-specific string aggregation is a frequent portability question.
+
+### SQL-143
+title: Validate the evaluation set against the document corpus
+difficulty: Medium
+primary: Referential integrity without a foreign key
+secondary: soft references, servability rules, status summary
+concepts: referential_integrity, anti_join, semi_join, ai_hit_rate, case
+roles: AI, MLE
+time: 15
+dialect: BOTH
+tables: eval_queries(query_id, gold_doc_key); documents(document_id, doc_key, status, is_deleted); document_chunks(document_id, embedding_model)
+columns: status, queries
+compare: ordered
+@context
+`eval_queries.gold_doc_key` refers to `documents.doc_key`, but there is no foreign key because `doc_key` is not unique (one row per version). Before trusting retrieval metrics, check that every golden question can actually be answered from the servable index.
+@problem
+Classify every evaluation query as `'unknown_doc_key'` (no document with that key), `'no_servable_chunks'` (the key exists but no published, non-deleted version has embedded chunks) or `'ok'`. Return `status`, `queries`, sorted by status.
+@expected
+1-3 rows; most queries are `ok`.
+@edge_cases
+- A gold document whose only indexed version is archived cannot be retrieved correctly, so the query measures nothing.
+@hint1
+Two EXISTS tests per query, from strictest to loosest.
+@hint2
+Servable: EXISTS a chunk with `embedding_model IS NOT NULL` whose document has the key, `status = 'published'` and `is_deleted = FALSE`.
+@hint3
+CASE WHEN NOT EXISTS (key) THEN ... WHEN NOT EXISTS (servable) THEN ... ELSE 'ok' END, then group.
+@solution
+SELECT status, COUNT(*) AS queries
+FROM (
+    SELECT q.query_id,
+           CASE WHEN NOT EXISTS (SELECT 1 FROM documents d WHERE d.doc_key = q.gold_doc_key)
+                     THEN 'unknown_doc_key'
+                WHEN NOT EXISTS (SELECT 1
+                                 FROM documents d
+                                 JOIN document_chunks c ON c.document_id = d.document_id
+                                 WHERE d.doc_key = q.gold_doc_key
+                                   AND d.status = 'published'
+                                   AND d.is_deleted = FALSE
+                                   AND c.embedding_model IS NOT NULL)
+                     THEN 'no_servable_chunks'
+                ELSE 'ok' END AS status
+    FROM eval_queries q
+) s
+GROUP BY status
+ORDER BY status;
+@explanation
+Foreign keys enforce references between unique keys. When the reference is to a non-unique attribute (here a version family), integrity has to be checked by queries. The CASE evaluates the conditions in order, so each query gets the most specific problem.
+
+Golden sets decay as documents are deleted or re-structured. Evaluation pipelines should run this check first and exclude (or fix) unanswerable questions, otherwise retrieval metrics silently drop for reasons unrelated to the retriever.
+@mistakes
+- Joining eval queries to documents with an INNER JOIN, which hides unknown keys.
+- Considering any version servable, including archived and draft ones.
+@performance
+Two indexed EXISTS probes per query (`documents(doc_key, version_number)` unique index, `document_chunks(document_id, ...)`).
+@interview
+Shows that the candidate validates evaluation data, not just models.

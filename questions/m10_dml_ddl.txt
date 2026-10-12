@@ -1,0 +1,789 @@
+### SQL-144
+title: Create a feature registry table with constraints
+difficulty: Easy
+primary: CREATE TABLE with constraints
+secondary: PRIMARY KEY, FOREIGN KEY, CHECK, NOT NULL, DEFAULT, multi-row INSERT
+concepts: create_table, constraints, insert, referential_integrity
+roles: MLE
+time: 12
+dialect: BOTH
+tables: model_versions(model_version_id)
+columns: entity_type, features, active_features
+compare: ordered
+@context
+The ML platform documents every feature in a registry table. The table must reject bad metadata at write time instead of relying on code reviews. All workbook DDL exercises create `sb_` sandbox tables, so the main dataset stays untouched.
+@problem
+Create `sb_feature_registry` with: `feature_name` (primary key), `entity_type` (only `'user'` or `'org'`), `value_type` (only `'int'`, `'float'`, `'bool'`), `owner_team` (required), `first_model_version_id` (optional, must reference `model_versions`) and `is_active` (required, default TRUE). Insert the seven `entity_features` features, then return per `entity_type` the number of features and of active features.
+@expected
+2 rows (org, user).
+@edge_cases
+- **MySQL ignores inline `REFERENCES` clauses on a column definition**; only table-level `FOREIGN KEY` constraints are enforced. Declare foreign keys at table level for portability.
+- MySQL enforces CHECK constraints only from 8.0.16; earlier versions parse and ignore them.
+@hint1
+List columns with types and NOT NULL first, then add named table-level constraints.
+@hint2
+`CONSTRAINT ck_... CHECK (entity_type IN ('user', 'org'))`, `CONSTRAINT fk_... FOREIGN KEY (...) REFERENCES model_versions (model_version_id)`.
+@hint3
+Omit `is_active` in the INSERT column list to use the default.
+@solution
+DROP TABLE IF EXISTS sb_feature_registry;
+CREATE TABLE sb_feature_registry (
+    feature_name            VARCHAR(60) NOT NULL,
+    entity_type             VARCHAR(20) NOT NULL,
+    value_type              VARCHAR(10) NOT NULL,
+    owner_team              VARCHAR(40) NOT NULL,
+    first_model_version_id  INT,
+    is_active               BOOLEAN     NOT NULL DEFAULT TRUE,
+    CONSTRAINT pk_sb_feature_registry PRIMARY KEY (feature_name),
+    CONSTRAINT ck_sb_fr_entity_type   CHECK (entity_type IN ('user', 'org')),
+    CONSTRAINT ck_sb_fr_value_type    CHECK (value_type IN ('int', 'float', 'bool')),
+    CONSTRAINT fk_sb_fr_model_version FOREIGN KEY (first_model_version_id)
+        REFERENCES model_versions (model_version_id)
+);
+INSERT INTO sb_feature_registry (feature_name, entity_type, value_type, owner_team, first_model_version_id) VALUES
+    ('sessions_7d',             'user', 'int',   'growth-data',  1),
+    ('sessions_28d',            'user', 'int',   'growth-data',  1),
+    ('events_28d',              'user', 'int',   'growth-data',  2),
+    ('days_since_last_session', 'user', 'int',   'growth-data',  1),
+    ('avg_session_minutes',     'user', 'float', 'growth-data',  3),
+    ('open_tickets',            'org',  'int',   'support-data', 2),
+    ('seats_used_pct',          'org',  'float', 'billing-data', 3);
+@verify
+SELECT entity_type,
+       COUNT(*)                                       AS features,
+       SUM(CASE WHEN is_active THEN 1 ELSE 0 END)     AS active_features
+FROM sb_feature_registry
+GROUP BY entity_type
+ORDER BY entity_type;
+@cleanup
+DROP TABLE IF EXISTS sb_feature_registry
+@explanation
+Constraints move data-quality rules into the database, where they cannot be bypassed:
+- **PRIMARY KEY**: unique and not NULL; one row per feature.
+- **CHECK**: restricts values. An INSERT with `entity_type = 'account'` fails with a constraint violation.
+- **FOREIGN KEY**: a referenced model version must exist. Inserting `first_model_version_id = 99` fails.
+- **NOT NULL / DEFAULT**: required columns and sensible defaults.
+
+Naming constraints (`CONSTRAINT ck_...`) produces readable error messages and lets you drop or alter them later. In MySQL, CHECK and FOREIGN KEY names must be unique within the schema, hence the `sb_fr` prefix.
+
+To see a violation, try `INSERT INTO sb_feature_registry (feature_name, entity_type, value_type, owner_team) VALUES ('x', 'account', 'int', 't');`. Both engines reject it.
+@mistakes
+- `first_model_version_id INT REFERENCES model_versions(model_version_id)` inline: enforced by PostgreSQL, silently ignored by MySQL.
+- Encoding allowed values only in application code.
+@performance
+Constraints add a small cost on writes (index lookups for FKs and unique keys) and protect every read.
+@interview
+DDL questions test whether a candidate designs for data quality, not just storage.
+
+### SQL-145
+title: Materialize a monthly revenue summary with INSERT ... SELECT
+difficulty: Medium
+primary: INSERT ... SELECT
+secondary: summary tables, per-dialect month truncation, idempotent reloads
+concepts: insert_select, create_table, date_bucketing, ds_mom_revenue
+roles: DS
+time: 12
+dialect: BOTH
+tables: orders(status, order_total, order_ts)
+columns: months, total_revenue, first_month, last_month
+compare: ordered
+@context
+Dashboards query a small summary table instead of scanning orders every time. The job recreates the summary from the source each night.
+@problem
+Create `sb_monthly_revenue(month_start DATE PRIMARY KEY, completed_orders INT, revenue DECIMAL(14,2))` and fill it with INSERT ... SELECT for 2024-01 to 2025-06 from completed orders. Verify with one row: number of months, total revenue, first and last month.
+@expected
+One row: 18 months.
+@edge_cases
+- Re-running the job must not create duplicates: drop/recreate (as here), TRUNCATE first, or use an upsert (SQL-149).
+@hint1
+CREATE TABLE first, then `INSERT INTO sb_monthly_revenue (cols) SELECT ...`.
+@hint2
+Reuse the monthly aggregation from SQL-020.
+@hint3
+The column order of the SELECT must match the INSERT column list.
+@solution_pg
+DROP TABLE IF EXISTS sb_monthly_revenue;
+CREATE TABLE sb_monthly_revenue (
+    month_start       DATE           NOT NULL PRIMARY KEY,
+    completed_orders  INT            NOT NULL,
+    revenue           DECIMAL(14,2)  NOT NULL
+);
+INSERT INTO sb_monthly_revenue (month_start, completed_orders, revenue)
+SELECT CAST(DATE_TRUNC('month', order_ts) AS DATE), COUNT(*), SUM(order_total)
+FROM orders
+WHERE status = 'completed'
+  AND order_ts >= TIMESTAMP '2024-01-01 00:00:00'
+  AND order_ts <  TIMESTAMP '2025-07-01 00:00:00'
+GROUP BY DATE_TRUNC('month', order_ts);
+@solution_mysql
+DROP TABLE IF EXISTS sb_monthly_revenue;
+CREATE TABLE sb_monthly_revenue (
+    month_start       DATE           NOT NULL PRIMARY KEY,
+    completed_orders  INT            NOT NULL,
+    revenue           DECIMAL(14,2)  NOT NULL
+);
+INSERT INTO sb_monthly_revenue (month_start, completed_orders, revenue)
+SELECT CAST(DATE_FORMAT(order_ts, '%Y-%m-01') AS DATE), COUNT(*), SUM(order_total)
+FROM orders
+WHERE status = 'completed'
+  AND order_ts >= TIMESTAMP '2024-01-01 00:00:00'
+  AND order_ts <  TIMESTAMP '2025-07-01 00:00:00'
+GROUP BY CAST(DATE_FORMAT(order_ts, '%Y-%m-01') AS DATE);
+@verify
+SELECT COUNT(*)          AS months,
+       SUM(revenue)      AS total_revenue,
+       MIN(month_start)  AS first_month,
+       MAX(month_start)  AS last_month
+FROM sb_monthly_revenue;
+@cleanup
+DROP TABLE IF EXISTS sb_monthly_revenue
+@explanation
+`INSERT ... SELECT` writes a query result into an existing table in one statement, with no round trip through the application. Declaring the table first (instead of `CREATE TABLE ... AS SELECT`) fixes the column types, the primary key and NOT NULL rules explicitly. CTAS copies whatever types the expressions happen to produce, and no constraints.
+
+The primary key on `month_start` turns accidental double loads into errors instead of silently duplicated revenue.
+@mistakes
+- Relying on positional column order without a column list (`INSERT INTO t SELECT ...`): fragile when the table changes.
+- Appending each night without clearing old rows.
+@performance
+The summary has 18 rows; dashboards reading it no longer scan orders.
+@interview
+Expect follow-ups on incremental loads (only recompute recent months) and on upserts.
+
+### SQL-146
+title: Deactivate users of deleted organizations (UPDATE with a join)
+difficulty: Medium
+primary: UPDATE
+secondary: multi-table UPDATE syntax per dialect, sandbox copy with CREATE TABLE AS
+concepts: update, create_table, multi_join, ds_duplicates
+roles: DS
+time: 12
+dialect: BOTH
+tables: users(user_id, org_id, status); organizations(org_id, is_deleted)
+columns: org_deleted, status, users
+compare: ordered
+@context
+SQL-048 found active users in organizations that left. A clean-up job sets them to `'inactive'`. Practise on a sandbox copy of `users`.
+@problem
+Create `sb_users` as a copy of `users(user_id, org_id, status)`. Update users with status `'active'` whose organization is soft-deleted to `'inactive'` using a join-style UPDATE. Verify with the count of users per (organization deleted?, status).
+@expected
+After the update no row has `org_deleted = true` and status `active`.
+@edge_cases
+- **Multi-table UPDATE syntax differs:** PostgreSQL `UPDATE t SET ... FROM other WHERE ...`; MySQL `UPDATE t JOIN other ON ... SET ...`.
+- A portable alternative is `WHERE org_id IN (SELECT org_id FROM organizations WHERE is_deleted = TRUE)`.
+@hint1
+`CREATE TABLE sb_users AS SELECT user_id, org_id, status FROM users`.
+@hint2
+PostgreSQL: `UPDATE sb_users u SET status = 'inactive' FROM organizations o WHERE o.org_id = u.org_id AND ...`.
+@hint3
+MySQL: `UPDATE sb_users u JOIN organizations o ON o.org_id = u.org_id SET u.status = 'inactive' WHERE ...`.
+@solution_pg
+DROP TABLE IF EXISTS sb_users;
+CREATE TABLE sb_users AS SELECT user_id, org_id, status FROM users;
+UPDATE sb_users u
+SET status = 'inactive'
+FROM organizations o
+WHERE o.org_id = u.org_id
+  AND o.is_deleted = TRUE
+  AND u.status = 'active';
+@solution_mysql
+DROP TABLE IF EXISTS sb_users;
+CREATE TABLE sb_users AS SELECT user_id, org_id, status FROM users;
+UPDATE sb_users u
+JOIN organizations o ON o.org_id = u.org_id
+SET u.status = 'inactive'
+WHERE o.is_deleted = TRUE
+  AND u.status = 'active';
+@verify
+SELECT o.is_deleted AS org_deleted,
+       u.status,
+       COUNT(*)     AS users
+FROM sb_users u
+JOIN organizations o ON o.org_id = u.org_id
+GROUP BY o.is_deleted, u.status
+ORDER BY org_deleted, u.status;
+@cleanup
+DROP TABLE IF EXISTS sb_users
+@dialect_note
+PostgreSQL extends UPDATE with a `FROM` list (the target must not be repeated there). MySQL supports multi-table UPDATE with JOIN syntax and can even update several tables in one statement. Neither syntax works on the other engine. The subquery form `WHERE org_id IN (SELECT ...)` is portable when you only need the other table for filtering.
+@assert
+not any(r[0] in ('t', '1', 'true') and r[1] == 'active' for r in rows)
+@explanation
+An UPDATE that depends on another table filters target rows through a join. Before running it on real data:
+1. Run the same join as a SELECT to see which rows will change.
+2. Wrap the change in a transaction (SQL-148) so it can be rolled back.
+3. Keep the WHERE clause narrow (`u.status = 'active'`) so the statement is idempotent: running it twice changes nothing the second time.
+
+CREATE TABLE AS SELECT (CTAS) is the quickest way to get a disposable copy for practice. It copies data but not constraints or indexes.
+@mistakes
+- Forgetting the WHERE clause (every user becomes inactive).
+- Using a correlated subquery in SET that returns NULL for unmatched rows.
+@performance
+Updates on large tables lock rows and write WAL/binlog. Batch big updates by key range.
+@interview
+Knowing both UPDATE-join syntaxes and the safe-update workflow is expected for analytics engineers.
+
+### SQL-147
+title: Delete duplicate events but keep one copy
+difficulty: Medium
+primary: DELETE
+secondary: window function in a derived table, MySQL error 1093, sandbox copy
+concepts: delete, dedup_window, row_number, create_table
+roles: DS, MLE
+time: 15
+dialect: BOTH
+tables: events(event_id, user_id, session_id, event_name, event_ts)
+columns: rows_left, duplicate_groups
+compare: ordered
+@context
+SQL-064 counted duplicate client events. Now remove them physically from a sandbox copy of June's events, keeping the copy with the smallest `event_id`.
+@problem
+Create `sb_events` from June 2025 events, delete every duplicate except the first per `(user_id, session_id, event_name, event_ts)`, and verify with the remaining row count and the number of duplicate groups left (must be 0).
+@expected
+One row with `duplicate_groups = 0`.
+@edge_cases
+- **MySQL error 1093** ("You can't specify target table for update in FROM clause") occurs when a DELETE's subquery reads the same table directly. Wrapping the window function in a derived table forces materialization and avoids it.
+- `session_id` is NULL for server events; PARTITION BY groups NULLs together, which is correct here.
+@hint1
+Identify rows to delete with `ROW_NUMBER() ... > 1`.
+@hint2
+`DELETE FROM sb_events WHERE event_id IN (SELECT event_id FROM (<ranked rows>) d WHERE d.rn > 1)`.
+@hint3
+The inner derived table is what makes the statement legal in MySQL.
+@solution
+DROP TABLE IF EXISTS sb_events;
+CREATE TABLE sb_events AS
+SELECT event_id, user_id, session_id, event_name, event_ts
+FROM events
+WHERE event_ts >= TIMESTAMP '2025-06-01 00:00:00'
+  AND event_ts <  TIMESTAMP '2025-07-01 00:00:00';
+DELETE FROM sb_events
+WHERE event_id IN (
+    SELECT event_id
+    FROM (
+        SELECT event_id,
+               ROW_NUMBER() OVER (PARTITION BY user_id, session_id, event_name, event_ts
+                                  ORDER BY event_id) AS rn
+        FROM sb_events
+    ) ranked
+    WHERE ranked.rn > 1
+);
+@verify
+SELECT (SELECT COUNT(*) FROM sb_events) AS rows_left,
+       (SELECT COUNT(*) FROM (SELECT 1 AS x FROM sb_events
+                              GROUP BY user_id, session_id, event_name, event_ts
+                              HAVING COUNT(*) > 1) d) AS duplicate_groups;
+@cleanup
+DROP TABLE IF EXISTS sb_events
+@assert
+rows[0][1] == '0'
+@explanation
+Deleting duplicates is a two-step idea: rank the copies within each duplicate key, then delete every rank above 1. Expressing the "rows to delete" as a set of primary keys (`event_id IN (...)`) works in both engines. PostgreSQL also offers `DELETE ... USING` (join syntax), and MySQL offers multi-table `DELETE e FROM sb_events e JOIN (...) d ON ...`.
+
+The verification query proves the post-condition (no duplicate groups) instead of just trusting the DELETE.
+
+In production, prefer preventing duplicates (a unique constraint on the natural key, or idempotent ingestion with upserts) over periodic clean-up.
+@mistakes
+- `DELETE ... WHERE event_id NOT IN (SELECT MIN(event_id) ... GROUP BY ...)`. It works, but it is easy to get wrong, and NOT IN has NULL pitfalls.
+- Deleting from the real `events` table while practising.
+@performance
+Large deletes generate a lot of undo/redo; batch them, or rebuild the table with `CREATE TABLE AS SELECT` of the survivors and swap.
+@interview
+"Delete duplicates keeping one" is asked constantly; mentioning MySQL's 1093 restriction shows hands-on experience.
+
+### SQL-148
+title: Credit transfers with transactions and savepoints
+difficulty: Hard
+primary: Transactions, COMMIT and ROLLBACK
+secondary: SAVEPOINT, atomicity, DDL behaviour per engine
+concepts: transactions, update, create_table, constraints
+roles: AI
+time: 15
+dialect: BOTH
+tables: organizations(org_id)
+columns: org_id, credits
+compare: ordered
+@context
+Organizations hold prepaid AI credits. Moving credits between organizations must be atomic: debit and credit happen together or not at all.
+@problem
+In a sandbox table `sb_credit_balances(org_id, credits >= 0)` with balances 12 → 500, 49 → 100, 94 → 0:
+1. Transfer 200 credits from 12 to 49 and COMMIT.
+2. Start a transfer of 50 from 49, credit the wrong recipient (12), roll back to a savepoint taken after the debit, credit 94 instead, COMMIT.
+3. Start a transfer of 300 from 12 to 94, then abandon it with ROLLBACK.
+Return the final balances, sorted by `org_id`.
+@expected
+3 rows: 12 → 300, 49 → 250, 94 → 50 (the total of 600 is conserved).
+@edge_cases
+- `START TRANSACTION` works in both engines (`BEGIN` also works in both, but means something else inside MySQL stored programs).
+- **DDL inside a transaction:** PostgreSQL DDL is transactional (it can be rolled back); MySQL commits implicitly before and after most DDL statements.
+@hint1
+Group each transfer's statements between `START TRANSACTION` and `COMMIT`/`ROLLBACK`.
+@hint2
+`SAVEPOINT after_debit` marks a point to which `ROLLBACK TO SAVEPOINT after_debit` can return without abandoning the whole transaction.
+@hint3
+Verify that the total balance is unchanged at the end.
+@solution
+DROP TABLE IF EXISTS sb_credit_balances;
+CREATE TABLE sb_credit_balances (
+    org_id   INT NOT NULL PRIMARY KEY,
+    credits  INT NOT NULL,
+    CONSTRAINT ck_sb_credits_nonnegative CHECK (credits >= 0)
+);
+INSERT INTO sb_credit_balances (org_id, credits) VALUES (12, 500), (49, 100), (94, 0);
+
+START TRANSACTION;
+UPDATE sb_credit_balances SET credits = credits - 200 WHERE org_id = 12;
+UPDATE sb_credit_balances SET credits = credits + 200 WHERE org_id = 49;
+COMMIT;
+
+START TRANSACTION;
+UPDATE sb_credit_balances SET credits = credits - 50 WHERE org_id = 49;
+SAVEPOINT after_debit;
+UPDATE sb_credit_balances SET credits = credits + 50 WHERE org_id = 12;
+ROLLBACK TO SAVEPOINT after_debit;
+UPDATE sb_credit_balances SET credits = credits + 50 WHERE org_id = 94;
+COMMIT;
+
+START TRANSACTION;
+UPDATE sb_credit_balances SET credits = credits - 300 WHERE org_id = 12;
+UPDATE sb_credit_balances SET credits = credits + 300 WHERE org_id = 94;
+ROLLBACK;
+@verify
+SELECT org_id, credits
+FROM sb_credit_balances
+ORDER BY org_id;
+@cleanup
+DROP TABLE IF EXISTS sb_credit_balances
+@assert
+[r[1] for r in rows] == ['300', '250', '50']
+@explanation
+A transaction groups statements into one atomic unit:
+- **COMMIT** makes all changes durable and visible to others.
+- **ROLLBACK** discards every change since `START TRANSACTION`.
+- **SAVEPOINT / ROLLBACK TO SAVEPOINT** undoes only the work after the savepoint, which is useful for retrying one step of a longer transaction.
+
+The CHECK constraint is the last line of defence: a transfer that would make a balance negative fails, and the application must then roll back the whole transaction. Otherwise a debit without its matching credit could be committed.
+
+Concurrency (two transfers at once) needs row locks (`SELECT ... FOR UPDATE`) or serializable isolation. That is beyond this exercise, but a classic follow-up question.
+@mistakes
+- Running the debit and the credit as two auto-committed statements (a crash in between loses credits).
+- Assuming `ROLLBACK` undoes a `CREATE TABLE` in MySQL.
+@performance
+Short transactions hold locks briefly; never wait for user input inside a transaction.
+@interview
+ACID basics and savepoints are standard backend/data-engineering questions; the DDL difference is a good bonus.
+
+### SQL-149
+title: Idempotent daily usage loads with an upsert
+difficulty: Hard
+primary: Upserts
+secondary: ON CONFLICT vs ON DUPLICATE KEY UPDATE, composite primary key, re-runnable jobs
+concepts: upsert, insert_select, composite_key, ai_volume
+roles: AI, MLE
+time: 15
+dialect: BOTH
+tables: llm_requests(org_id, requested_at, input_tokens, output_tokens)
+columns: usage_date, orgs, requests, tokens
+compare: ordered
+@context
+A job aggregates LLM usage per organization and day into `sb_daily_usage`. Because late events arrive, the job re-processes the last two days on every run. Rows must be updated, not duplicated.
+@problem
+Create `sb_daily_usage(org_id, usage_date, requests, tokens)` with primary key `(org_id, usage_date)`. Load 2025-06-28 and 2025-06-29, then run the next job for 2025-06-29 and 2025-06-30 as an **upsert**. Verify with per-day totals.
+@expected
+3 rows (06-28, 06-29, 06-30), each day loaded once.
+@edge_cases
+- PostgreSQL: `INSERT ... ON CONFLICT (org_id, usage_date) DO UPDATE SET col = EXCLUDED.col`.
+- MySQL: `INSERT ... ON DUPLICATE KEY UPDATE col = <alias>.col`. With INSERT ... SELECT, reference the derived table's alias. The older `VALUES(col)` function is deprecated since 8.0.20.
+@hint1
+The composite primary key defines what counts as "the same row".
+@hint2
+In PostgreSQL, `EXCLUDED` holds the row proposed for insertion.
+@hint3
+In MySQL, wrap the SELECT in a derived table (`... FROM (SELECT ...) AS new`) and use `new.requests` in the UPDATE list.
+@solution_pg
+DROP TABLE IF EXISTS sb_daily_usage;
+CREATE TABLE sb_daily_usage (
+    org_id      INT    NOT NULL,
+    usage_date  DATE   NOT NULL,
+    requests    INT    NOT NULL,
+    tokens      BIGINT NOT NULL,
+    CONSTRAINT pk_sb_daily_usage PRIMARY KEY (org_id, usage_date)
+);
+INSERT INTO sb_daily_usage (org_id, usage_date, requests, tokens)
+SELECT org_id, CAST(requested_at AS DATE), COUNT(*), SUM(input_tokens + COALESCE(output_tokens, 0))
+FROM llm_requests
+WHERE requested_at >= TIMESTAMP '2025-06-28 00:00:00' AND requested_at < TIMESTAMP '2025-06-30 00:00:00'
+GROUP BY org_id, CAST(requested_at AS DATE);
+INSERT INTO sb_daily_usage (org_id, usage_date, requests, tokens)
+SELECT org_id, CAST(requested_at AS DATE), COUNT(*), SUM(input_tokens + COALESCE(output_tokens, 0))
+FROM llm_requests
+WHERE requested_at >= TIMESTAMP '2025-06-29 00:00:00' AND requested_at < TIMESTAMP '2025-07-01 00:00:00'
+GROUP BY org_id, CAST(requested_at AS DATE)
+ON CONFLICT (org_id, usage_date)
+DO UPDATE SET requests = EXCLUDED.requests,
+              tokens   = EXCLUDED.tokens;
+@solution_mysql
+DROP TABLE IF EXISTS sb_daily_usage;
+CREATE TABLE sb_daily_usage (
+    org_id      INT    NOT NULL,
+    usage_date  DATE   NOT NULL,
+    requests    INT    NOT NULL,
+    tokens      BIGINT NOT NULL,
+    CONSTRAINT pk_sb_daily_usage PRIMARY KEY (org_id, usage_date)
+);
+INSERT INTO sb_daily_usage (org_id, usage_date, requests, tokens)
+SELECT org_id, CAST(requested_at AS DATE), COUNT(*), SUM(input_tokens + COALESCE(output_tokens, 0))
+FROM llm_requests
+WHERE requested_at >= TIMESTAMP '2025-06-28 00:00:00' AND requested_at < TIMESTAMP '2025-06-30 00:00:00'
+GROUP BY org_id, CAST(requested_at AS DATE);
+INSERT INTO sb_daily_usage (org_id, usage_date, requests, tokens)
+SELECT * FROM (
+    SELECT org_id, CAST(requested_at AS DATE) AS usage_date, COUNT(*) AS requests,
+           SUM(input_tokens + COALESCE(output_tokens, 0)) AS tokens
+    FROM llm_requests
+    WHERE requested_at >= TIMESTAMP '2025-06-29 00:00:00' AND requested_at < TIMESTAMP '2025-07-01 00:00:00'
+    GROUP BY org_id, CAST(requested_at AS DATE)
+) AS new
+ON DUPLICATE KEY UPDATE requests = new.requests,
+                        tokens   = new.tokens;
+@verify
+SELECT usage_date,
+       COUNT(*)       AS orgs,
+       SUM(requests)  AS requests,
+       SUM(tokens)    AS tokens
+FROM sb_daily_usage
+GROUP BY usage_date
+ORDER BY usage_date;
+@cleanup
+DROP TABLE IF EXISTS sb_daily_usage
+@assert
+len(rows) == 3
+@dialect_note
+| | PostgreSQL | MySQL |
+|---|---|---|
+| syntax | `ON CONFLICT (cols) DO UPDATE SET c = EXCLUDED.c` | `ON DUPLICATE KEY UPDATE c = alias.c` |
+| conflict target | explicit unique constraint/columns | any unique key (ambiguous with several unique keys) |
+| do nothing | `ON CONFLICT DO NOTHING` | `INSERT IGNORE` (also hides other errors!) |
+| SQL standard | `MERGE` (PostgreSQL 15+, SQL-169) | not available |
+@explanation
+An **upsert** inserts new keys and updates existing ones atomically, which makes the load **idempotent**: re-running the same job leaves the table in the same state. That is essential for pipelines that retry or re-process late data.
+
+The 2025-06-29 rows from the first load are overwritten by the second job's fresh aggregates (same values here, because the data is static); 2025-06-30 rows are inserted.
+@mistakes
+- DELETE + INSERT without a transaction (readers see a gap).
+- `INSERT IGNORE` in MySQL, which silently skips *all* errors on conflicting rows, including data errors.
+@performance
+Each conflicting row costs an index lookup plus an update; batch upserts by date to keep transactions small.
+@interview
+Upserts and idempotency are core data-engineering topics; knowing both dialects is expected for MLE/DE roles.
+
+### SQL-150
+title: A view for servable RAG chunks
+difficulty: Easy
+primary: Views
+secondary: encapsulating business rules, CREATE OR REPLACE VIEW, querying a view
+concepts: views, ai_latest_version_chunks, ai_stale_docs, create_table
+roles: AI
+time: 10
+dialect: BOTH
+tables: document_chunks(chunk_id, document_id, token_count, embedding_model); documents(document_id, doc_key, source_type, status, is_deleted)
+columns: source_type, documents, chunks, tokens
+compare: ordered
+@context
+Several teams (retrieval, evaluation, analytics) need "the chunks the bot may serve". Encode the rule once in a view instead of copying the WHERE clause everywhere.
+@problem
+Create the view `sb_v_servable_chunks` (published, non-deleted document versions; embedded chunks only) exposing `chunk_id`, `document_id`, `doc_key`, `source_type`, `token_count`. Then query it: per `source_type`, distinct documents, chunks and total tokens.
+@expected
+5 rows.
+@edge_cases
+- A view stores the query, not the data; it always reflects current table contents.
+@hint1
+`CREATE OR REPLACE VIEW name AS SELECT ...`.
+@hint2
+Reuse the servability rule from SQL-125.
+@hint3
+Query the view like a table.
+@solution
+CREATE OR REPLACE VIEW sb_v_servable_chunks AS
+SELECT c.chunk_id,
+       c.document_id,
+       d.doc_key,
+       d.source_type,
+       c.token_count
+FROM document_chunks c
+JOIN documents d ON d.document_id = c.document_id
+WHERE d.status = 'published'
+  AND d.is_deleted = FALSE
+  AND c.embedding_model IS NOT NULL;
+@verify
+SELECT source_type,
+       COUNT(DISTINCT doc_key) AS documents,
+       COUNT(*)                AS chunks,
+       SUM(token_count)        AS tokens
+FROM sb_v_servable_chunks
+GROUP BY source_type
+ORDER BY source_type;
+@cleanup
+DROP VIEW IF EXISTS sb_v_servable_chunks
+@explanation
+A view is a named, stored query. Benefits: one definition of a business rule, simpler downstream SQL, and a stable interface while the underlying tables change. Permissions can also be granted on the view without exposing the base tables.
+
+Both engines inline simple views into the calling query, so filtering a view costs about the same as filtering the base query. Materialized views (PostgreSQL `CREATE MATERIALIZED VIEW`; MySQL has none) store results and must be refreshed.
+@mistakes
+- Stacking views on views until no one understands the final query.
+- `SELECT *` in a view definition: in PostgreSQL the column list is frozen at creation time, and MySQL expands `*` immediately too, so later table changes are not reflected.
+@performance
+Same as the underlying query; views are not a caching mechanism.
+@interview
+Views as "single source of truth" for metric definitions are a common analytics-engineering topic.
+
+### SQL-151
+title: Reuse an intermediate result with a temporary table
+difficulty: Medium
+primary: Temporary tables
+secondary: session scope, MySQL "can't reopen table" limitation, CTE alternative
+concepts: temp_tables, semi_join, conditional_aggregation, ds_conversion
+roles: DS
+time: 12
+dialect: BOTH
+tables: sessions(user_id, started_at); users(user_id, org_id); organizations(org_id, segment); orders(user_id, status, order_ts)
+columns: segment, active_users, buyers, buyer_pct
+compare: ordered
+@context
+An analysis session repeatedly uses "users active in Q2 2025". Computing it once into a temporary table keeps later queries short.
+@problem
+Create the temporary table `tmp_q2_active` with the distinct users who started a session in Q2 2025, then return per segment the active users, those with a completed order in Q2 2025 (`buyers`), and `buyer_pct` (1 decimal). Sort by segment.
+@expected
+3 rows.
+@edge_cases
+- Temporary tables live only in the current session (connection) and disappear when it ends.
+- **MySQL cannot reference the same TEMPORARY table twice in one statement** (error 1137 "Can't reopen table"), e.g. in a self-join or in both an outer query and a subquery. Use a CTE or a regular table for that.
+@hint1
+`CREATE TEMPORARY TABLE tmp_q2_active AS SELECT DISTINCT user_id FROM sessions WHERE ...`.
+@hint2
+Join it to users and organizations; test purchases with EXISTS.
+@hint3
+Reference `tmp_q2_active` only once in the final statement.
+@solution
+CREATE TEMPORARY TABLE tmp_q2_active AS
+SELECT DISTINCT user_id
+FROM sessions
+WHERE started_at >= TIMESTAMP '2025-04-01 00:00:00'
+  AND started_at <  TIMESTAMP '2025-07-01 00:00:00';
+SELECT o.segment,
+       COUNT(*) AS active_users,
+       SUM(CASE WHEN EXISTS (SELECT 1 FROM orders x
+                             WHERE x.user_id = t.user_id
+                               AND x.status = 'completed'
+                               AND x.order_ts >= TIMESTAMP '2025-04-01 00:00:00'
+                               AND x.order_ts <  TIMESTAMP '2025-07-01 00:00:00')
+                THEN 1 ELSE 0 END) AS buyers,
+       ROUND(100.0 * SUM(CASE WHEN EXISTS (SELECT 1 FROM orders x
+                                           WHERE x.user_id = t.user_id
+                                             AND x.status = 'completed'
+                                             AND x.order_ts >= TIMESTAMP '2025-04-01 00:00:00'
+                                             AND x.order_ts <  TIMESTAMP '2025-07-01 00:00:00')
+                              THEN 1 ELSE 0 END) / COUNT(*), 1) AS buyer_pct
+FROM tmp_q2_active t
+JOIN users u         ON u.user_id = t.user_id
+JOIN organizations o ON o.org_id = u.org_id
+GROUP BY o.segment
+ORDER BY o.segment;
+@explanation
+`CREATE TEMPORARY TABLE ... AS SELECT` materializes an intermediate result for the rest of the session. Compared with a CTE:
+- a temp table is computed once and can be indexed and reused by many statements;
+- a CTE lives only inside one statement but has no "reopen" limitation in MySQL.
+
+Temporary tables shadow permanent tables with the same name, and they are private to the session, so two analysts can use `tmp_q2_active` simultaneously without conflict.
+@mistakes
+- Self-joining a temp table in MySQL (error 1137).
+- Using temp tables in connection-pooled applications and assuming they persist between requests.
+@performance
+Materializing a small set (≈ 800 user IDs) once can be cheaper than recomputing a heavy subquery in many statements; add an index on large temp tables.
+@interview
+Shows practical knowledge of session-scoped objects and engine limitations.
+
+### SQL-152
+title: Normalize a flat ticket import into dimension and fact tables
+difficulty: Hard
+primary: Normalization fundamentals
+secondary: surrogate keys with ROW_NUMBER, natural keys, FK-linked tables, reconstruction check
+concepts: normalization, create_table, insert_select, constraints, referential_integrity
+roles: DS, MLE
+time: 25
+dialect: BOTH
+tables: support_tickets(ticket_id, org_id, category, priority, created_at); organizations(org_id, org_name, country_code, segment)
+columns: import_rows, dim_rows, fact_rows, unreconstructable_rows
+compare: ordered
+@context
+A partner sends support tickets as a flat file: every row repeats the organization's name, country and segment. Repeated attributes waste space and drift apart when one copy is updated (an update anomaly). Normalize the import into an organization dimension and a ticket fact table.
+@problem
+1. Build the flat import `sb_ticket_import` from Q2-2025 tickets (ticket ID, source org ID, org name, country, segment, category, priority, created date).
+2. Create `sb_dim_org` (surrogate `org_key`, unique `source_org_id`, attributes) and `sb_fact_ticket` (ticket attributes + `org_key` FK).
+3. Load both with INSERT ... SELECT.
+Verify with the row counts and the number of import rows that cannot be reconstructed by joining fact and dimension (must be 0).
+@expected
+One row; `dim_rows` much smaller than `fact_rows`, and `unreconstructable_rows = 0`.
+@edge_cases
+- `org_name` is not unique in this dataset; using it as the natural key would merge two companies. Keep the source system's ID as the natural key.
+@hint1
+Distinct organizations from the import → dimension rows; `ROW_NUMBER()` creates surrogate keys.
+@hint2
+The fact load joins the import to the dimension on `source_org_id` to look up `org_key`.
+@hint3
+Reconstruction check: import rows with NOT EXISTS a matching fact⋈dimension row.
+@solution
+DROP TABLE IF EXISTS sb_fact_ticket;
+DROP TABLE IF EXISTS sb_dim_org;
+DROP TABLE IF EXISTS sb_ticket_import;
+CREATE TABLE sb_ticket_import AS
+SELECT t.ticket_id,
+       t.org_id                   AS source_org_id,
+       o.org_name,
+       o.country_code,
+       o.segment,
+       t.category,
+       t.priority,
+       CAST(t.created_at AS DATE) AS created_date
+FROM support_tickets t
+JOIN organizations o ON o.org_id = t.org_id
+WHERE t.created_at >= TIMESTAMP '2025-04-01 00:00:00'
+  AND t.created_at <  TIMESTAMP '2025-07-01 00:00:00';
+CREATE TABLE sb_dim_org (
+    org_key        INT          NOT NULL,
+    source_org_id  INT          NOT NULL,
+    org_name       VARCHAR(120) NOT NULL,
+    country_code   CHAR(2)      NOT NULL,
+    segment        VARCHAR(20)  NOT NULL,
+    CONSTRAINT pk_sb_dim_org PRIMARY KEY (org_key),
+    CONSTRAINT uq_sb_dim_org_source UNIQUE (source_org_id)
+);
+INSERT INTO sb_dim_org (org_key, source_org_id, org_name, country_code, segment)
+SELECT ROW_NUMBER() OVER (ORDER BY source_org_id), source_org_id, org_name, country_code, segment
+FROM (SELECT DISTINCT source_org_id, org_name, country_code, segment FROM sb_ticket_import) d;
+CREATE TABLE sb_fact_ticket (
+    ticket_id     INT         NOT NULL,
+    org_key       INT         NOT NULL,
+    category      VARCHAR(30) NOT NULL,
+    priority      VARCHAR(10) NOT NULL,
+    created_date  DATE        NOT NULL,
+    CONSTRAINT pk_sb_fact_ticket PRIMARY KEY (ticket_id),
+    CONSTRAINT fk_sb_fact_ticket_org FOREIGN KEY (org_key) REFERENCES sb_dim_org (org_key)
+);
+INSERT INTO sb_fact_ticket (ticket_id, org_key, category, priority, created_date)
+SELECT i.ticket_id, d.org_key, i.category, i.priority, i.created_date
+FROM sb_ticket_import i
+JOIN sb_dim_org d ON d.source_org_id = i.source_org_id;
+@verify
+SELECT (SELECT COUNT(*) FROM sb_ticket_import) AS import_rows,
+       (SELECT COUNT(*) FROM sb_dim_org)       AS dim_rows,
+       (SELECT COUNT(*) FROM sb_fact_ticket)   AS fact_rows,
+       (SELECT COUNT(*) FROM sb_ticket_import i
+         WHERE NOT EXISTS (SELECT 1
+                           FROM sb_fact_ticket f
+                           JOIN sb_dim_org d ON d.org_key = f.org_key
+                           WHERE f.ticket_id = i.ticket_id
+                             AND d.org_name = i.org_name
+                             AND d.country_code = i.country_code
+                             AND d.segment = i.segment
+                             AND f.category = i.category
+                             AND f.priority = i.priority
+                             AND f.created_date = i.created_date)) AS unreconstructable_rows;
+@cleanup
+DROP TABLE IF EXISTS sb_fact_ticket;
+DROP TABLE IF EXISTS sb_dim_org;
+DROP TABLE IF EXISTS sb_ticket_import
+@assert
+rows[0][3] == '0' and num(rows[0][1]) < num(rows[0][2])
+@explanation
+**Normalization** stores each fact once:
+- 1NF: atomic columns, no repeating groups;
+- 2NF/3NF: non-key attributes depend on the whole key and only on the key. Organization attributes depend on the organization, not on the ticket, so they move to their own table.
+
+The surrogate key (`org_key`) decouples the warehouse from the source system, while the unique natural key (`source_org_id`) prevents duplicate dimension rows on reloads. Choosing `org_name` as the natural key would be a real bug here: two different companies share a name.
+
+The **reconstruction check** proves the decomposition is lossless: joining fact and dimension reproduces every import row. Analytical warehouses often denormalize again for speed (star schema); the point is to do it deliberately.
+@mistakes
+- Natural keys that are not actually unique (names).
+- Loading facts before dimensions (FK violations), or dropping tables in the wrong order (drop facts first).
+@performance
+The FK on `org_key` costs a lookup per inserted fact; bulk loads sometimes disable checks temporarily, which then requires re-validation.
+@interview
+Normalization questions are common for data engineering; showing a lossless-join check is a strong answer.
+
+### SQL-153
+title: Create, inspect and drop indexes
+difficulty: Medium
+primary: Index creation and removal
+secondary: composite and unique indexes, redundant prefix indexes, catalog queries per dialect
+concepts: index_ddl, composite_index, index_basics, create_table
+roles: AI, MLE
+time: 15
+dialect: BOTH
+tables: llm_requests(request_id, model_name, requested_at, trace_id)
+columns: index_name, column_position, column_name
+compare: ordered
+@context
+On a sandbox copy of the request log, the platform team adds indexes for the two most common access paths (model + time range, and trace lookups) and removes an index made redundant by the composite one.
+@problem
+Create `sb_requests` from `llm_requests (request_id, model_name, requested_at, trace_id)`. Create a single-column index on `model_name`, a composite index on `(model_name, requested_at)` and a unique index on `trace_id`. Then drop the single-column index and list the remaining indexes with their columns from the system catalog.
+@expected
+3 rows: the composite index (2 columns) and the unique trace index.
+@edge_cases
+- `DROP INDEX` syntax differs: PostgreSQL `DROP INDEX name;` (index names are schema-wide), MySQL `DROP INDEX name ON table;` (names are per table).
+- Unique indexes allow several NULLs in both engines (NULLs are not equal to each other); PostgreSQL 15+ offers `NULLS NOT DISTINCT` to change that.
+@hint1
+`CREATE INDEX name ON table (col1, col2);`, `CREATE UNIQUE INDEX ...`.
+@hint2
+The single-column index on `model_name` is a prefix of the composite index, so the composite one can serve its queries too.
+@hint3
+Catalog: PostgreSQL `pg_index` + `pg_attribute`; MySQL `information_schema.statistics`.
+@solution_pg
+DROP TABLE IF EXISTS sb_requests;
+CREATE TABLE sb_requests AS
+SELECT request_id, model_name, requested_at, trace_id FROM llm_requests;
+CREATE INDEX ix_sb_requests_model ON sb_requests (model_name);
+CREATE INDEX ix_sb_requests_model_time ON sb_requests (model_name, requested_at);
+CREATE UNIQUE INDEX ux_sb_requests_trace ON sb_requests (trace_id);
+DROP INDEX ix_sb_requests_model;
+SELECT ic.relname AS index_name,
+       k.ord      AS column_position,
+       a.attname  AS column_name
+FROM pg_class t
+JOIN pg_index ix ON ix.indrelid = t.oid
+JOIN pg_class ic ON ic.oid = ix.indexrelid
+CROSS JOIN LATERAL unnest(CAST(ix.indkey AS SMALLINT[])) WITH ORDINALITY AS k(attnum, ord)
+JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.attnum
+WHERE t.relname = 'sb_requests'
+ORDER BY index_name, column_position;
+@solution_mysql
+DROP TABLE IF EXISTS sb_requests;
+CREATE TABLE sb_requests AS
+SELECT request_id, model_name, requested_at, trace_id FROM llm_requests;
+CREATE INDEX ix_sb_requests_model ON sb_requests (model_name);
+CREATE INDEX ix_sb_requests_model_time ON sb_requests (model_name, requested_at);
+CREATE UNIQUE INDEX ux_sb_requests_trace ON sb_requests (trace_id);
+DROP INDEX ix_sb_requests_model ON sb_requests;
+SELECT index_name   AS index_name,
+       seq_in_index AS column_position,
+       column_name  AS column_name
+FROM information_schema.statistics
+WHERE table_schema = DATABASE()
+  AND table_name = 'sb_requests'
+ORDER BY index_name, column_position;
+@cleanup
+DROP TABLE IF EXISTS sb_requests
+@assert
+len(rows) == 3
+@dialect_note
+PostgreSQL has no `information_schema` view for indexes; use `pg_indexes` (definition text) or `pg_index` joined to `pg_attribute` (columns), as here. MySQL exposes them in `information_schema.statistics` (one row per index column, `seq_in_index` = position). Also note: MySQL automatically creates an index for every foreign key if none exists; PostgreSQL does not.
+@explanation
+- A **composite index** on `(model_name, requested_at)` serves `WHERE model_name = ?`, `WHERE model_name = ? AND requested_at BETWEEN ...` and ordered scans by time within a model. It makes a separate index on `model_name` alone **redundant**, since that index only costs write time and storage.
+- A **unique index** both speeds up lookups and enforces uniqueness (trace IDs must not repeat).
+- Dropping and creating indexes are schema changes: on big tables, use `CREATE INDEX CONCURRENTLY` (PostgreSQL) or online DDL (`ALGORITHM=INPLACE, LOCK=NONE` in MySQL) to avoid blocking writes.
+@mistakes
+- Creating one index per column "just in case" (write amplification, worse plans).
+- Copying PostgreSQL's `DROP INDEX name` to MySQL (syntax error without `ON table`).
+@performance
+Every index speeds up some reads and slows every write; review index usage (`pg_stat_user_indexes`, MySQL `sys.schema_unused_indexes`) periodically.
+@interview
+Expect "which indexes would you create for these queries, and which would you drop?".

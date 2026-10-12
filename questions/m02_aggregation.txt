@@ -1,0 +1,766 @@
+### SQL-016
+title: Order statistics by status
+difficulty: Easy
+primary: COUNT, SUM, AVG, MIN, MAX with GROUP BY
+secondary: ROUND, ORDER BY aggregate
+concepts: aggregates, group_by, order_by
+roles: DS
+time: 6
+dialect: BOTH
+tables: orders(status, order_total, order_ts)
+columns: status, orders, total_amount, avg_amount, first_order_ts, last_order_ts
+compare: ordered
+@context
+Before building revenue dashboards, an analyst profiles the `orders` table to understand how the order statuses are distributed.
+@problem
+For each order `status`, return the number of orders, the sum and the average of `order_total` (average rounded to 2 decimals), and the earliest and latest `order_ts`. Sort by number of orders descending.
+@expected
+One row per status (4 rows); columns `status, orders, total_amount, avg_amount, first_order_ts, last_order_ts`.
+@edge_cases
+- Every non-aggregated column in SELECT must appear in GROUP BY (MySQL enforces this with ONLY_FULL_GROUP_BY, which is on by default).
+- Ties in the order count would need a tie-breaker; add `status`.
+@hint1
+GROUP BY the column that defines a row of the output.
+@hint2
+All five aggregates can be computed in one pass.
+@hint3
+`SELECT status, COUNT(*), SUM(order_total), ROUND(AVG(order_total), 2), MIN(order_ts), MAX(order_ts) FROM orders GROUP BY status`.
+@solution
+SELECT status,
+       COUNT(*)                   AS orders,
+       SUM(order_total)           AS total_amount,
+       ROUND(AVG(order_total), 2) AS avg_amount,
+       MIN(order_ts)              AS first_order_ts,
+       MAX(order_ts)              AS last_order_ts
+FROM orders
+GROUP BY status
+ORDER BY orders DESC, status;
+@explanation
+GROUP BY collapses the table to one row per distinct `status`. Each aggregate is then computed over the rows of its group. `AVG` on a DECIMAL column returns DECIMAL in both engines, so ROUND works directly. (Contrast with DOUBLE in SQL-014.)
+
+The ORDER BY uses the output alias `orders`. Both engines allow aliases in ORDER BY, but not in WHERE (see SQL-019 for HAVING).
+@mistakes
+- Selecting `order_id` without aggregating it: PostgreSQL raises an error, MySQL raises an error under ONLY_FULL_GROUP_BY (older MySQL versions silently returned an arbitrary value).
+- Calling `total_amount` "revenue". Pending and canceled orders never generated revenue.
+@performance
+One sequential scan plus a hash aggregate. Fine for any size that fits the workbook.
+@interview
+A warm-up question. Interviewers check that the candidate knows what GROUP BY does to the row count and why ONLY_FULL_GROUP_BY exists.
+
+### SQL-017
+title: COUNT(*) versus COUNT(column) versus COUNT(DISTINCT)
+difficulty: Easy
+primary: COUNT(*) vs COUNT(column)
+secondary: COUNT DISTINCT, AVG ignores NULLs
+concepts: count_star_vs_col, count_distinct, null_aware_agg, aggregates
+roles: DS
+time: 8
+dialect: BOTH
+tables: support_tickets(ticket_id, user_id, csat_score, first_response_at)
+columns: tickets, tickets_with_user, distinct_users, tickets_with_csat, avg_csat_rated, avg_csat_null_as_zero, unanswered
+compare: ordered
+@context
+The support manager's report says the average CSAT is 3.9. A colleague computed 1.7 from the same table. Both are "right" for different definitions.
+@problem
+Return one row with: total tickets, tickets that have a `user_id`, number of distinct users who opened tickets, tickets with a CSAT answer, average CSAT over rated tickets (2 decimals), average CSAT if unrated tickets were counted as 0 (2 decimals), and the number of tickets without a first response.
+@expected
+One row with seven columns. The two averages differ a lot.
+@edge_cases
+- `COUNT(col)` skips NULLs; `COUNT(*)` counts rows.
+- `AVG(col)` ignores NULLs in both numerator and denominator.
+- `COUNT(DISTINCT col)` also ignores NULL.
+@hint1
+Each of the requested numbers is one aggregate expression.
+@hint2
+Counting NULLs: `COUNT(*) - COUNT(col)` or `SUM(CASE WHEN col IS NULL THEN 1 ELSE 0 END)`.
+@hint3
+`AVG(COALESCE(csat_score, 0))` treats missing answers as zero, which is usually wrong but shows the effect.
+@solution
+SELECT COUNT(*)                                   AS tickets,
+       COUNT(user_id)                             AS tickets_with_user,
+       COUNT(DISTINCT user_id)                    AS distinct_users,
+       COUNT(csat_score)                          AS tickets_with_csat,
+       ROUND(AVG(csat_score), 2)                  AS avg_csat_rated,
+       ROUND(AVG(COALESCE(csat_score, 0)), 2)     AS avg_csat_null_as_zero,
+       COUNT(*) - COUNT(first_response_at)        AS unanswered
+FROM support_tickets;
+@assert
+num(rows[0][0]) > num(rows[0][1]) > num(rows[0][2])
+num(rows[0][4]) > num(rows[0][5])
+@explanation
+- `COUNT(*)` counts rows, `COUNT(expr)` counts rows where expr is not NULL, and `COUNT(DISTINCT expr)` counts distinct non-NULL values.
+- `AVG(csat_score)` = SUM over non-NULL / COUNT of non-NULL. It answers "how satisfied are customers **who answered**?"
+- `AVG(COALESCE(csat_score, 0))` puts every unrated ticket in the denominator with a score of 0. That is almost always the wrong business definition, but it shows how NULL handling moves a metric.
+- `AVG` of a SMALLINT returns NUMERIC in PostgreSQL and DECIMAL in MySQL, so there is no integer-division problem here.
+@mistakes
+- Using `COUNT(csat_score)` as "number of tickets".
+- Reporting an average without stating the denominator, for example the response rate of the survey.
+@performance
+One scan. COUNT(DISTINCT) needs a sort or hash of the distinct values, which is more expensive than plain counts on big data (see SQL-094 for approximate alternatives).
+@interview
+Classic. Strong answers also mention *survey response bias*: the 45% of customers who answered are not a random sample.
+
+### SQL-018
+title: CSAT satisfaction rate without integer division
+difficulty: Medium
+primary: Ratios and percentages
+secondary: integer division, conditional aggregation, HAVING
+concepts: ratios, conditional_aggregation, having, cast
+roles: DS
+time: 10
+dialect: BOTH
+tables: support_tickets(category, csat_score)
+columns: category, rated_tickets, satisfied, satisfaction_pct
+compare: ordered
+@context
+"Satisfied" means a CSAT of 4 or 5. Leadership wants the satisfaction rate per ticket category, but only for categories with at least 30 rated tickets so the numbers are meaningful.
+@problem
+Per `category`, return `rated_tickets` (tickets with a CSAT), `satisfied` (CSAT >= 4) and `satisfaction_pct` (satisfied / rated x 100, 1 decimal). Keep categories with at least 30 rated tickets. Sort by `satisfaction_pct` descending, then category.
+@expected
+One row per qualifying category.
+@edge_cases
+- In PostgreSQL, `COUNT(...) / COUNT(...)` is integer division: 45 / 60 = 0.
+- MySQL's `/` always returns a decimal, so the same query "works" in MySQL and fails silently in PostgreSQL.
+- Categories with zero rated tickets would cause division by zero; HAVING removes them, and NULLIF guards anyway.
+@hint1
+Compute numerator and denominator with conditional aggregation, then divide.
+@hint2
+Force decimal arithmetic by multiplying by `100.0` before dividing.
+@hint3
+Filter groups with `HAVING COUNT(csat_score) >= 30`.
+@solution
+SELECT category,
+       COUNT(csat_score)                                         AS rated_tickets,
+       SUM(CASE WHEN csat_score >= 4 THEN 1 ELSE 0 END)          AS satisfied,
+       ROUND(100.0 * SUM(CASE WHEN csat_score >= 4 THEN 1 ELSE 0 END)
+             / NULLIF(COUNT(csat_score), 0), 1)                  AS satisfaction_pct
+FROM support_tickets
+GROUP BY category
+HAVING COUNT(csat_score) >= 30
+ORDER BY satisfaction_pct DESC, category;
+@explanation
+1. `SUM(CASE WHEN csat_score >= 4 THEN 1 ELSE 0 END)` counts satisfied answers. NULL scores fail the condition and add 0.
+2. `100.0 * x / y` makes the numerator DECIMAL, so the division is exact in PostgreSQL. Without the `.0`, PostgreSQL would return an integer quotient (0 for most rows).
+3. `HAVING` filters *groups* after aggregation. The predicate must be repeated as an expression, because aliases cannot be referenced in HAVING in PostgreSQL (MySQL allows it as an extension).
+4. `NULLIF(..., 0)` is defensive: if the HAVING threshold were removed, empty categories would yield NULL instead of an error.
+@mistakes
+- `SUM(...) / COUNT(*)`: COUNT(*) includes unrated tickets, which changes the definition.
+- `HAVING satisfaction_pct > ...` works in MySQL and fails in PostgreSQL.
+@performance
+Single scan with hash aggregation.
+@interview
+Integer division is a top-5 SQL bug in analytics. Mentioning the engine difference earns extra credit.
+
+### SQL-019
+title: Large organizations by user count
+difficulty: Easy
+primary: HAVING
+secondary: conditional counting, aggregate-level filtering
+concepts: having, group_by, conditional_aggregation
+roles: DS
+time: 6
+dialect: BOTH
+tables: users(org_id, status)
+columns: org_id, total_users, active_users
+compare: ordered
+@context
+Customer success assigns a dedicated manager to organizations with more than 25 user accounts that have at least 20 active ones.
+@problem
+Return `org_id`, `total_users` and `active_users` (status `'active'`) for organizations matching both thresholds. Sort by `total_users` descending, then `org_id`.
+@expected
+One row per qualifying organization.
+@edge_cases
+- The status filter must not be in WHERE, otherwise `total_users` would only count active users.
+@hint1
+You need two different counts per organization, one of them conditional.
+@hint2
+Row filters go in WHERE, group filters in HAVING.
+@hint3
+`HAVING COUNT(*) > 25 AND SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END) >= 20`.
+@solution
+SELECT org_id,
+       COUNT(*)                                          AS total_users,
+       SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END) AS active_users
+FROM users
+GROUP BY org_id
+HAVING COUNT(*) > 25
+   AND SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END) >= 20
+ORDER BY total_users DESC, org_id;
+@explanation
+The query mixes a row-level concept (status) with a group-level threshold. Putting `status = 'active'` in WHERE would remove inactive users *before* grouping, so the total would be wrong. Conditional aggregation computes both counts from the same group, and HAVING then applies both thresholds.
+@mistakes
+- `WHERE status = 'active'` plus `HAVING COUNT(*) > 25` answers a different question.
+- Writing the HAVING with aliases (`HAVING total_users > 25`): this is a MySQL extension that fails in PostgreSQL.
+@performance
+An index on `users(org_id)` lets some plans aggregate in index order, but a hash aggregate over 1,800 rows is instant anyway.
+@interview
+Checks the WHERE-versus-HAVING distinction.
+
+### SQL-020
+title: Monthly revenue and average order value
+difficulty: Easy
+primary: Grouping by date periods
+secondary: DATE_TRUNC vs DATE_FORMAT, AOV, completed orders only
+concepts: date_bucketing, aggregates, ds_aov, date_functions
+roles: DS
+time: 10
+dialect: BOTH
+tables: orders(order_id, status, order_total, order_ts)
+columns: month_start, completed_orders, revenue, avg_order_value
+compare: ordered
+@context
+Finance tracks monthly revenue and average order value (AOV) of one-off product orders. Revenue counts completed orders only (refunds are handled separately in SQL-024).
+@problem
+For every month from January 2024 to June 2025, return `month_start` (the first day of the month, as a DATE), `completed_orders`, `revenue` (sum of `order_total`) and `avg_order_value` (revenue / completed orders, 2 decimals). Sort by month.
+@expected
+18 rows (one per month with completed orders), ascending.
+@edge_cases
+- Grouping by `EXTRACT(MONTH ...)` alone would merge January 2024 and January 2025.
+- Orders before 2024 exist and must be excluded.
+@hint1
+Truncate each timestamp to its month and group by that value.
+@hint2
+PostgreSQL: `DATE_TRUNC('month', ts)`. MySQL has no DATE_TRUNC; `DATE_FORMAT(ts, '%Y-%m-01')` builds the first day as a string that you can CAST to DATE.
+@hint3
+AOV = `SUM(order_total) / COUNT(*)` over the completed orders of the month, which is the same as `AVG(order_total)`.
+@solution_pg
+SELECT CAST(DATE_TRUNC('month', order_ts) AS DATE) AS month_start,
+       COUNT(*)                                    AS completed_orders,
+       SUM(order_total)                            AS revenue,
+       ROUND(AVG(order_total), 2)                  AS avg_order_value
+FROM orders
+WHERE status = 'completed'
+  AND order_ts >= TIMESTAMP '2024-01-01 00:00:00'
+  AND order_ts <  TIMESTAMP '2025-07-01 00:00:00'
+GROUP BY DATE_TRUNC('month', order_ts)
+ORDER BY month_start;
+@solution_mysql
+SELECT CAST(DATE_FORMAT(order_ts, '%Y-%m-01') AS DATE) AS month_start,
+       COUNT(*)                                        AS completed_orders,
+       SUM(order_total)                                AS revenue,
+       ROUND(AVG(order_total), 2)                      AS avg_order_value
+FROM orders
+WHERE status = 'completed'
+  AND order_ts >= TIMESTAMP '2024-01-01 00:00:00'
+  AND order_ts <  TIMESTAMP '2025-07-01 00:00:00'
+GROUP BY CAST(DATE_FORMAT(order_ts, '%Y-%m-01') AS DATE)
+ORDER BY month_start;
+@dialect_note
+PostgreSQL's `DATE_TRUNC('month', ts)` returns a TIMESTAMP at midnight on the first day, and casting it to DATE keeps the first day. MySQL lacks DATE_TRUNC. The common idioms are `DATE_FORMAT(ts, '%Y-%m-01')` (string → CAST to DATE) or `LAST_DAY(ts) + INTERVAL 1 DAY - INTERVAL 1 MONTH`.
+
+A *fully portable* version is possible but not recommended. You can group by `EXTRACT(YEAR FROM order_ts), EXTRACT(MONTH FROM order_ts)` and return those two numbers instead of a date. Rebuilding a DATE from them portably runs into engine differences: PostgreSQL pads `CHAR(n)` values, and MySQL's ONLY_FULL_GROUP_BY rejects expressions that are not literally in the GROUP BY. Use each engine's native truncation function.
+@explanation
+1. Filter first: completed orders in the 18-month window (half-open).
+2. Bucket each order into its month. Grouping by the truncated value (not by the month number) keeps different years apart.
+3. `AVG(order_total)` equals revenue / number of completed orders, because every row is one order. If the query joined order lines, AVG would be per line, not per order (see SQL-031).
+4. The DATE column sorts chronologically. A string like '2024-1' would sort incorrectly.
+@mistakes
+- `GROUP BY EXTRACT(MONTH FROM order_ts)` merges years.
+- Computing AOV from `order_items`, which averages lines, not orders.
+- Including refunded orders in revenue without subtracting refunds.
+@performance
+The range filter can use `orders(order_ts)`. Grouping on an expression is computed per row. For very large fact tables, store a pre-computed `order_month` column or use a calendar dimension.
+@interview
+Expect to discuss what "revenue" means (gross vs net of refunds, recognized vs booked) before writing SQL.
+
+### SQL-021
+title: LLM request outcomes pivoted by feature
+difficulty: Easy
+primary: Conditional aggregation (pivot)
+secondary: failure rate, ratios
+concepts: conditional_aggregation, ratios, ai_success_rate, group_by
+roles: AI
+time: 10
+dialect: BOTH
+tables: llm_requests(feature, status)
+columns: feature, requests, success, error, timeout, rate_limited, content_filtered, failure_rate_pct
+compare: ordered
+@context
+The AI platform team monitors which product features suffer most from LLM failures. A row per feature with outcome counts side by side is easier to read than a long table.
+@problem
+For each `feature`, return the total number of requests, one column per status (`success, error, timeout, rate_limited, content_filtered`), and `failure_rate_pct` = non-success requests / all requests x 100 (2 decimals). Sort by `failure_rate_pct` descending.
+@expected
+3 rows (one per feature), 8 columns.
+@edge_cases
+- A status that never occurs for a feature must show 0, not NULL. That is why the solution uses `SUM(CASE ... ELSE 0)`.
+- Definition choice: is `content_filtered` a failure? Here it is (the user got no answer). State such assumptions.
+@hint1
+One output column per status means one conditional aggregate per status.
+@hint2
+`SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END)` counts errors.
+@hint3
+`failure_rate_pct = 100.0 * SUM(CASE WHEN status <> 'success' THEN 1 ELSE 0 END) / COUNT(*)`.
+@solution
+SELECT feature,
+       COUNT(*)                                                     AS requests,
+       SUM(CASE WHEN status = 'success'          THEN 1 ELSE 0 END) AS success,
+       SUM(CASE WHEN status = 'error'            THEN 1 ELSE 0 END) AS error,
+       SUM(CASE WHEN status = 'timeout'          THEN 1 ELSE 0 END) AS timeout,
+       SUM(CASE WHEN status = 'rate_limited'     THEN 1 ELSE 0 END) AS rate_limited,
+       SUM(CASE WHEN status = 'content_filtered' THEN 1 ELSE 0 END) AS content_filtered,
+       ROUND(100.0 * SUM(CASE WHEN status <> 'success' THEN 1 ELSE 0 END) / COUNT(*), 2)
+                                                                    AS failure_rate_pct
+FROM llm_requests
+GROUP BY feature
+ORDER BY failure_rate_pct DESC, feature;
+@explanation
+Conditional aggregation is the portable pivot. PostgreSQL also offers `COUNT(*) FILTER (WHERE status = 'error')` (cleaner, PostgreSQL-only, see SQL-170), and MySQL can use `SUM(status = 'error')` because booleans are integers there. The CASE form works in both.
+
+**Why it matters for AI apps:** failure rates by feature tell you where to add retries, fallbacks to another model, or user-facing degradation. Rate limits and timeouts call for different fixes: quota and backoff for the first, model choice and prompt size for the second.
+@mistakes
+- Hard-coding the status list and forgetting a new status. Add a "sum of columns = requests" sanity check.
+- `COUNT(CASE WHEN status='error' THEN 1 END)` also works, because COUNT skips NULLs, but mixing styles confuses reviewers.
+@performance
+One scan; cost grows with the number of CASE branches only marginally.
+@interview
+Common pivot question. Mentioning FILTER and the boolean-sum shortcut, with their portability limits, shows depth.
+
+### SQL-022
+title: Revenue by product category across three tables
+difficulty: Medium
+primary: Aggregation across joins
+secondary: COUNT DISTINCT orders, line-level net revenue, multi-table join
+concepts: agg_across_joins, multi_join, count_distinct, ds_top_products
+roles: DS
+time: 10
+dialect: BOTH
+tables: order_items(order_id, product_id, quantity, unit_price, discount_amount); orders(order_id, status, order_ts); products(product_id, category_id); product_categories(category_id, category_name)
+columns: category_name, orders, units, net_revenue
+compare: ordered
+@context
+Product management asks which product categories drive revenue from completed orders placed in 2025.
+@problem
+For each leaf category, return the number of distinct orders containing it, total units, and net revenue (`quantity * unit_price - discount_amount`) from completed orders placed in 2025. Sort by `net_revenue` descending.
+@expected
+One row per category with sales; `orders` counts each order once per category.
+@edge_cases
+- One order can contain several lines of the same category, so `COUNT(*)` would count lines, not orders.
+- Order header `order_total` must not be summed here: it repeats once per line after the join (fan-out).
+@hint1
+Start from the line table, which is the grain of the measures you sum.
+@hint2
+Join upward to `orders` for the filter and to `products` → `product_categories` for the name.
+@hint3
+Use `COUNT(DISTINCT oi.order_id)` for the order count.
+@solution
+SELECT pc.category_name,
+       COUNT(DISTINCT oi.order_id)                                AS orders,
+       SUM(oi.quantity)                                           AS units,
+       SUM(oi.quantity * oi.unit_price - oi.discount_amount)      AS net_revenue
+FROM order_items oi
+JOIN orders o              ON o.order_id = oi.order_id
+JOIN products p            ON p.product_id = oi.product_id
+JOIN product_categories pc ON pc.category_id = p.category_id
+WHERE o.status = 'completed'
+  AND o.order_ts >= TIMESTAMP '2025-01-01 00:00:00'
+  AND o.order_ts <  TIMESTAMP '2025-07-01 00:00:00'
+GROUP BY pc.category_name
+ORDER BY net_revenue DESC, pc.category_name;
+@explanation
+Reason about **grain** first: the measures (quantity, price, discount) live on `order_items`, one row per order line. Joining to `orders`, `products` and `product_categories` moves along many-to-one relationships, so the line count stays the same and summing line amounts is safe.
+
+`COUNT(DISTINCT oi.order_id)` answers "in how many orders did this category appear?". `COUNT(*)` would answer "how many lines".
+@mistakes
+- `SUM(o.order_total)` after joining lines: every order's total is repeated once per line, which inflates revenue (see SQL-031).
+- Filtering on `products.is_active`, which would drop revenue from discontinued products that was really earned.
+@performance
+The join to `orders` is through the primary key, and `order_items(product_id)` supports the product join. The date filter on `orders(order_ts)` drives the plan.
+@interview
+Interviewers want to hear the word "grain" and see the candidate pick the right table to aggregate.
+
+### SQL-023
+title: First and last order of repeat buyers
+difficulty: Easy
+primary: MIN and MAX per group
+secondary: HAVING on a count, status filter
+concepts: aggregates, having, group_by
+roles: DS
+time: 6
+dialect: BOTH
+tables: orders(user_id, status, order_ts, order_total)
+columns: user_id, completed_orders, first_order_ts, last_order_ts, lifetime_value
+compare: ordered
+@context
+The CRM team wants a list of loyal buyers (at least 5 completed orders) with their first and last purchase times and lifetime value.
+@problem
+Return `user_id`, `completed_orders`, `first_order_ts`, `last_order_ts` and `lifetime_value` (sum of `order_total`) for users with at least 5 completed orders. Sort by `lifetime_value` descending, then `user_id`.
+@expected
+One row per qualifying user.
+@edge_cases
+- Only completed orders count, both for the threshold and for the amounts.
+@hint1
+Filter rows to completed orders first, then group by user.
+@hint2
+The threshold is a group property, so it goes in HAVING.
+@hint3
+`HAVING COUNT(*) >= 5`.
+@solution
+SELECT user_id,
+       COUNT(*)         AS completed_orders,
+       MIN(order_ts)    AS first_order_ts,
+       MAX(order_ts)    AS last_order_ts,
+       SUM(order_total) AS lifetime_value
+FROM orders
+WHERE status = 'completed'
+GROUP BY user_id
+HAVING COUNT(*) >= 5
+ORDER BY lifetime_value DESC, user_id;
+@explanation
+WHERE removes non-completed orders before grouping, so all aggregates and the HAVING threshold refer to completed orders only. MIN/MAX on timestamps return the earliest and latest values. They work on any orderable type: numbers, strings, dates.
+@mistakes
+- Putting `status = 'completed'` in HAVING: it is not an aggregate. PostgreSQL rejects it, and MySQL would require it in GROUP BY.
+@performance
+The index `orders(user_id, order_ts)` makes MIN/MAX per user cheap for single-user lookups. For the whole table a hash aggregate is used.
+@interview
+Basic, but often extended: "now also return the product of their first order", which needs window functions (SQL-061).
+
+### SQL-024
+title: Refund rate by sales channel
+difficulty: Medium
+primary: Ratios with NULL-aware sums
+secondary: joining payments to orders, COALESCE in SUM, two different denominators
+concepts: ratios, null_aware_agg, agg_across_joins, coalesce_nullif
+roles: DS
+time: 12
+dialect: BOTH
+tables: orders(order_id, status, sales_channel); payments(order_id, status, amount, refunded_amount)
+columns: sales_channel, paid_orders, refunded_orders, refund_rate_pct, collected_amount, refunded_amount, refunded_amount_pct
+compare: ordered
+@context
+Finance wants to know whether some sales channels generate disproportionate refunds, both by count and by money.
+@problem
+Using **payments that succeeded or were later refunded** (status `'succeeded'` or `'refunded'`), compute per `sales_channel` of the order: `paid_orders` (distinct orders), `refunded_orders` (distinct orders with a refunded payment), `refund_rate_pct` (2 decimals), `collected_amount` (sum of payment `amount`), `refunded_amount` (sum of `refunded_amount`, 0 if none) and `refunded_amount_pct` (2 decimals). Sort by `sales_channel`.
+@expected
+3 rows (web, sales, marketplace).
+@edge_cases
+- `refunded_amount` is NULL for non-refunded payments. SUM ignores NULLs, but SUM over an all-NULL group returns NULL, not 0.
+- Partial refunds make the count-based and amount-based rates differ.
+- Failed attempts must not count as paid.
+@hint1
+Join payments to orders to get the channel, after filtering payments to the two relevant statuses.
+@hint2
+Count refunded orders with `COUNT(DISTINCT CASE WHEN p.status = 'refunded' THEN p.order_id END)`.
+@hint3
+Wrap money sums in `COALESCE(SUM(...), 0)` and divide with `NULLIF(..., 0)`.
+@solution
+SELECT o.sales_channel,
+       COUNT(DISTINCT p.order_id)                                              AS paid_orders,
+       COUNT(DISTINCT CASE WHEN p.status = 'refunded' THEN p.order_id END)      AS refunded_orders,
+       ROUND(100.0 * COUNT(DISTINCT CASE WHEN p.status = 'refunded' THEN p.order_id END)
+             / NULLIF(COUNT(DISTINCT p.order_id), 0), 2)                        AS refund_rate_pct,
+       SUM(p.amount)                                                           AS collected_amount,
+       COALESCE(SUM(p.refunded_amount), 0)                                     AS refunded_amount,
+       ROUND(100.0 * COALESCE(SUM(p.refunded_amount), 0) / NULLIF(SUM(p.amount), 0), 2)
+                                                                               AS refunded_amount_pct
+FROM payments p
+JOIN orders o ON o.order_id = p.order_id
+WHERE p.status IN ('succeeded', 'refunded')
+GROUP BY o.sales_channel
+ORDER BY o.sales_channel;
+@explanation
+1. Filtering payments to succeeded/refunded leaves one successful payment per paid order (failed retries are excluded). `COUNT(DISTINCT order_id)` still protects against double counting if an order ever had two successful payments.
+2. `COUNT(DISTINCT CASE WHEN ... THEN order_id END)` counts refunded orders: the CASE yields NULL otherwise, and COUNT ignores NULLs.
+3. `SUM(refunded_amount)` ignores NULLs; COALESCE converts an all-NULL group to 0.
+4. Two rates with two denominators: share of orders refunded and share of money refunded. Partial refunds make the second smaller.
+@mistakes
+- Counting refunds from `orders.status = 'refunded'` while summing money from payments. Both are valid sources, but mixing them hides inconsistencies.
+- Including failed payments in `collected_amount`.
+@performance
+`payments(order_id)` index plus the orders primary key make the join cheap.
+@interview
+Shows careful thinking about NULLs in sums and about which denominator a rate uses.
+
+### SQL-025
+title: Daily active users and engagement depth in June 2025
+difficulty: Easy
+primary: COUNT DISTINCT per period
+secondary: events per active user, date bucketing
+concepts: count_distinct, date_bucketing, ratios, ds_mau
+roles: DS
+time: 8
+dialect: BOTH
+tables: events(user_id, event_ts, event_name)
+columns: event_date, active_users, events, events_per_active_user
+compare: ordered
+@context
+Product analytics defines a daily active user (DAU) as a user with at least one event that day (UTC). Engagement depth is events per active user.
+@problem
+For each day of June 2025, return `event_date`, `active_users`, `events` and `events_per_active_user` (2 decimals). Sort by date.
+@expected
+Up to 30 rows, one per day with activity.
+@edge_cases
+- Duplicate events (client retries) inflate `events` but not `active_users`. That is accepted here (SQL-064 removes them).
+- Server-side `purchase` events count as activity by this definition.
+@hint1
+Group events by calendar day.
+@hint2
+`COUNT(DISTINCT user_id)` gives DAU; `COUNT(*)` gives events.
+@hint3
+Divide with `1.0 *` (or `100.0`-style) to avoid integer division in PostgreSQL.
+@solution
+SELECT CAST(event_ts AS DATE)                                   AS event_date,
+       COUNT(DISTINCT user_id)                                  AS active_users,
+       COUNT(*)                                                 AS events,
+       ROUND(1.0 * COUNT(*) / COUNT(DISTINCT user_id), 2)       AS events_per_active_user
+FROM events
+WHERE event_ts >= TIMESTAMP '2025-06-01 00:00:00'
+  AND event_ts <  TIMESTAMP '2025-07-01 00:00:00'
+GROUP BY CAST(event_ts AS DATE)
+ORDER BY event_date;
+@explanation
+DAU is a distinct count per day. It cannot be summed across days to get monthly actives, because a user active on 10 days would count 10 times. Monthly active users need their own distinct count (SQL-078). The ratio uses `1.0 *` so PostgreSQL does not truncate.
+@mistakes
+- `SUM(DAU)` as MAU.
+- Integer division producing whole-number ratios in PostgreSQL.
+@performance
+`events(event_name, event_ts)` does not start with `event_ts` alone. PostgreSQL can still use it for the range only through a skip-scan (PostgreSQL 18) or by scanning. A dedicated `(event_ts)` index or partitioning by date helps large event tables.
+@interview
+Expect the follow-up "why can't you add up DAUs into MAU?"; this is non-additivity of distinct counts.
+
+### SQL-026
+title: Token usage with subtotals (ROLLUP)
+difficulty: Hard
+primary: GROUP BY ROLLUP / WITH ROLLUP
+secondary: GROUPING(), subtotal labelling, dialect syntax
+concepts: group_by, aggregates, dialect_functions, ai_volume
+roles: AI
+time: 12
+dialect: BOTH
+tables: llm_requests(model_name, feature, input_tokens, output_tokens, requested_at)
+columns: model_name, feature, requests, total_tokens
+compare: ordered
+@context
+The monthly AI usage report shows requests and tokens per model and feature, with a subtotal per model and a grand total, for June 2025.
+@problem
+Return requests and total tokens (`input_tokens + COALESCE(output_tokens, 0)`) for June 2025 grouped by `model_name` and `feature`, plus a subtotal row per model (feature = `'ALL'`) and a grand-total row (model = `'ALL'`, feature = `'ALL'`). Order: models alphabetically with each model's subtotal after its features, grand total last.
+@expected
+Detail rows + one subtotal per model + one grand total.
+@edge_cases
+- Rollup rows carry NULL in the rolled-up columns. Use `GROUPING()` rather than `IS NULL` to recognise them, because real NULL keys would be ambiguous.
+- `output_tokens` is NULL for failed requests.
+@hint1
+Both engines support ROLLUP but spell it differently.
+@hint2
+PostgreSQL: `GROUP BY ROLLUP (model_name, feature)`. MySQL: `GROUP BY model_name, feature WITH ROLLUP`.
+@hint3
+Label with `CASE WHEN GROUPING(feature) = 1 THEN 'ALL' ELSE feature END` and order by `GROUPING(model_name), model_name, GROUPING(feature), feature`.
+@solution_pg
+SELECT CASE WHEN GROUPING(model_name) = 1 THEN 'ALL' ELSE model_name END AS model_name,
+       CASE WHEN GROUPING(feature) = 1    THEN 'ALL' ELSE feature END    AS feature,
+       COUNT(*)                                           AS requests,
+       SUM(input_tokens + COALESCE(output_tokens, 0))     AS total_tokens
+FROM llm_requests
+WHERE requested_at >= TIMESTAMP '2025-06-01 00:00:00'
+  AND requested_at <  TIMESTAMP '2025-07-01 00:00:00'
+GROUP BY ROLLUP (model_name, feature)
+ORDER BY GROUPING(llm_requests.model_name), llm_requests.model_name,
+         GROUPING(llm_requests.feature), llm_requests.feature;
+@solution_mysql
+SELECT CASE WHEN GROUPING(model_name) = 1 THEN 'ALL' ELSE model_name END AS model_name,
+       CASE WHEN GROUPING(feature) = 1    THEN 'ALL' ELSE feature END    AS feature,
+       COUNT(*)                                           AS requests,
+       SUM(input_tokens + COALESCE(output_tokens, 0))     AS total_tokens
+FROM llm_requests
+WHERE requested_at >= TIMESTAMP '2025-06-01 00:00:00'
+  AND requested_at <  TIMESTAMP '2025-07-01 00:00:00'
+GROUP BY model_name, feature WITH ROLLUP
+ORDER BY GROUPING(llm_requests.model_name), llm_requests.model_name,
+         GROUPING(llm_requests.feature), llm_requests.feature;
+@dialect_note
+PostgreSQL implements the SQL-standard `ROLLUP`, `CUBE` and `GROUPING SETS`. MySQL supports only `WITH ROLLUP` (no CUBE or GROUPING SETS) plus the `GROUPING()` function (8.0+); ORDER BY together with WITH ROLLUP is allowed from 8.0.12. In both engines, ORDER BY qualifies the base columns with the table name so that `model_name` refers to the grouped column and not to the CASE alias of the same name.
+@explanation
+ROLLUP(a, b) produces the grouping sets (a, b), (a), (). `GROUPING(col)` returns 1 when `col` was rolled up in that row. Labelling and sorting with GROUPING is robust even if the data had genuine NULL keys.
+
+**Why it matters for AI apps:** token totals by model and feature are the basis for cost allocation (chargeback) and capacity planning; subtotals make the report readable without a BI tool.
+@mistakes
+- `COALESCE(model_name, 'ALL')` mislabels a real NULL model as a subtotal.
+- Summing `input_tokens + output_tokens` without COALESCE: failed requests contribute NULL and silently drop out of the sum.
+@performance
+Same scan as a normal GROUP BY plus a little extra aggregation work.
+@interview
+Shows reporting fluency. Mentioning GROUPING SETS/CUBE and MySQL's limitations is a plus.
+
+### SQL-027
+title: Average output tokens and the NULL denominator question
+difficulty: Easy
+primary: NULL-aware averages
+secondary: AVG ignores NULL vs COALESCE to zero, COUNT(col)
+concepts: null_aware_agg, count_star_vs_col, aggregates, ai_high_tokens
+roles: AI
+time: 8
+dialect: BOTH
+tables: llm_requests(model_name, output_tokens, status)
+columns: model_name, requests, requests_with_output, avg_output_tokens_answered, avg_output_tokens_all_requests
+compare: ordered
+@context
+Capacity planning needs "average completion length per model". A failed request has `output_tokens = NULL`. Two engineers produced different numbers.
+@problem
+Per `model_name`, return all requests, requests with a non-NULL `output_tokens`, the average output tokens over answered requests, and the average over all requests treating NULL as 0 (both 1 decimal). Sort by model name.
+@expected
+5 rows, one per model.
+@edge_cases
+- Both averages are "correct" for different questions: the size of an answer versus tokens generated per request sent.
+@hint1
+AVG silently drops NULLs from numerator and denominator.
+@hint2
+`AVG(COALESCE(output_tokens, 0))` keeps every request in the denominator.
+@hint3
+`COUNT(output_tokens)` is the denominator AVG actually used.
+@solution
+SELECT model_name,
+       COUNT(*)                                   AS requests,
+       COUNT(output_tokens)                       AS requests_with_output,
+       ROUND(AVG(output_tokens), 1)               AS avg_output_tokens_answered,
+       ROUND(AVG(COALESCE(output_tokens, 0)), 1)  AS avg_output_tokens_all_requests
+FROM llm_requests
+GROUP BY model_name
+ORDER BY model_name;
+@explanation
+`AVG(output_tokens)` = SUM / COUNT(output_tokens), the size of a typical completion. `AVG(COALESCE(output_tokens, 0))` = SUM / COUNT(*), the expected output per request sent, which is what a cost forecast needs when failures are free. The gap between the two grows with the failure rate.
+
+**Why it matters for AI apps:** output tokens are usually the most expensive tokens. Forecasting spend with the "answered only" average over-estimates cost when many requests fail before generating output.
+@mistakes
+- Reporting one average without saying which denominator it uses.
+- Treating NULL as 0 when computing "typical answer length" for UI design.
+@performance
+Trivial aggregation.
+@interview
+Tests whether the candidate asks "what should happen to NULLs?" before computing a metric.
+
+### SQL-028
+title: Average session length: overall versus average of user averages
+difficulty: Hard
+primary: Aggregation granularity (weighted vs unweighted averages)
+secondary: derived table, timestamp differences, per-dialect duration
+concepts: aggregates, derived_table, date_functions, ds_analysis_dataset
+roles: DS
+time: 15
+dialect: BOTH
+tables: sessions(session_id, user_id, started_at, ended_at, device_type)
+columns: device_type, sessions, users, avg_minutes_per_session, avg_of_user_avg_minutes
+compare: ordered
+@context
+The mobile team claims mobile sessions are longer than desktop ones; the desktop team claims the opposite. Each team uses a different average.
+@problem
+For sessions started in Q2 2025 with a known `ended_at`, return per `device_type`: number of sessions, distinct users, the overall mean session length in minutes (every session weighs the same), and the mean of per-user mean session lengths (every user weighs the same). Both averages with 2 decimals. Sort by device type.
+@expected
+3 rows (desktop, mobile, tablet).
+@edge_cases
+- Sessions without `ended_at` have unknown length; exclude them and say so.
+- Heavy users with many short sessions pull the session-weighted mean down but have only one vote in the user-weighted mean.
+@hint1
+The second metric needs two levels of aggregation: per (device, user), then per device.
+@hint2
+Compute session minutes first. PostgreSQL: `EXTRACT(EPOCH FROM ended_at - started_at) / 60`. MySQL: `TIMESTAMPDIFF(SECOND, started_at, ended_at) / 60`.
+@hint3
+Aggregate per user in a derived table, then aggregate again: `AVG(user_avg)` per device, `SUM(n)` for sessions, `COUNT(*)` for users, and a weighted mean `SUM(total_minutes) / SUM(n)`.
+@solution_pg
+SELECT device_type,
+       SUM(n_sessions)                                 AS sessions,
+       COUNT(*)                                        AS users,
+       ROUND(SUM(total_minutes) / SUM(n_sessions), 2)  AS avg_minutes_per_session,
+       ROUND(AVG(user_avg_minutes), 2)                 AS avg_of_user_avg_minutes
+FROM (
+    SELECT device_type,
+           user_id,
+           COUNT(*)                                              AS n_sessions,
+           SUM(EXTRACT(EPOCH FROM (ended_at - started_at)) / 60) AS total_minutes,
+           AVG(EXTRACT(EPOCH FROM (ended_at - started_at)) / 60) AS user_avg_minutes
+    FROM sessions
+    WHERE ended_at IS NOT NULL
+      AND started_at >= TIMESTAMP '2025-04-01 00:00:00'
+      AND started_at <  TIMESTAMP '2025-07-01 00:00:00'
+    GROUP BY device_type, user_id
+) per_user
+GROUP BY device_type
+ORDER BY device_type;
+@solution_mysql
+SELECT device_type,
+       SUM(n_sessions)                                 AS sessions,
+       COUNT(*)                                        AS users,
+       ROUND(SUM(total_minutes) / SUM(n_sessions), 2)  AS avg_minutes_per_session,
+       ROUND(AVG(user_avg_minutes), 2)                 AS avg_of_user_avg_minutes
+FROM (
+    SELECT device_type,
+           user_id,
+           COUNT(*)                                                 AS n_sessions,
+           SUM(TIMESTAMPDIFF(SECOND, started_at, ended_at) / 60)    AS total_minutes,
+           AVG(TIMESTAMPDIFF(SECOND, started_at, ended_at) / 60)    AS user_avg_minutes
+    FROM sessions
+    WHERE ended_at IS NOT NULL
+      AND started_at >= TIMESTAMP '2025-04-01 00:00:00'
+      AND started_at <  TIMESTAMP '2025-07-01 00:00:00'
+    GROUP BY device_type, user_id
+) per_user
+GROUP BY device_type
+ORDER BY device_type;
+@explanation
+1. The inner query (a *derived table*) has grain (device, user). It keeps both the per-user mean and the ingredients of the overall mean (session count and total minutes).
+2. The outer query rolls up to device. The session-weighted mean must be recomputed as `SUM(total) / SUM(n)`. **Averaging the inner averages would give the user-weighted number instead.**
+3. The two numbers answer different questions: "how long is a typical session?" versus "how long are a typical user's sessions?". Neither is wrong; the report must say which one it shows.
+
+This is the aggregation version of Simpson's-paradox-style confusion: the weighting changes the conclusion.
+@mistakes
+- `AVG(avg_minutes)` presented as the overall average.
+- Including sessions with NULL `ended_at` (their duration is NULL, so they drop out of AVG anyway, but they still count in `COUNT(*)`).
+@performance
+Two-level aggregation over ~3,000 sessions is cheap. For large data, the same pattern runs in one scan plus a small second aggregation.
+@interview
+Senior DS interviews love "average of averages". Expect to justify which weighting the business question needs.
+
+### SQL-029
+title: Latency summary statistics per model
+difficulty: Medium
+primary: Statistical summaries with aggregates
+secondary: STDDEV_SAMP, coefficient of variation, CAST before ROUND, filtering cache hits
+concepts: stats_summary, aggregates, cast, ai_latency_compare
+roles: AI, DS
+time: 10
+dialect: BOTH
+tables: llm_requests(model_name, latency_ms, status, cache_hit, requested_at)
+columns: model_name, requests, mean_ms, stddev_ms, min_ms, max_ms, cv
+compare: ordered
+@context
+Before setting latency alerts, the AI platform team wants basic distribution statistics per model for successful, non-cached requests in Q2 2025.
+@problem
+Per `model_name`: number of requests, mean latency, sample standard deviation, min, max (mean and stddev rounded to 1 decimal) and the coefficient of variation `cv` = stddev / mean (3 decimals). Sort by mean latency ascending.
+@expected
+One row per model with qualifying requests.
+@edge_cases
+- Cache hits (~50-150 ms) would distort provider latency; exclude them.
+- `STDDEV_SAMP` returns DOUBLE PRECISION in PostgreSQL; ROUND needs a DECIMAL cast there.
+- A model with a single request has a NULL sample standard deviation.
+@hint1
+Filter to `status = 'success' AND cache_hit = FALSE` for Q2 2025.
+@hint2
+Both engines provide `STDDEV_SAMP` (and `STDDEV_POP`).
+@hint3
+`ROUND(CAST(STDDEV_SAMP(latency_ms) AS DECIMAL(12,4)), 1)`.
+@solution
+SELECT model_name,
+       COUNT(*)                                                         AS requests,
+       ROUND(AVG(latency_ms), 1)                                        AS mean_ms,
+       ROUND(CAST(STDDEV_SAMP(latency_ms) AS DECIMAL(14,4)), 1)         AS stddev_ms,
+       MIN(latency_ms)                                                  AS min_ms,
+       MAX(latency_ms)                                                  AS max_ms,
+       ROUND(CAST(STDDEV_SAMP(latency_ms) / AVG(latency_ms) AS DECIMAL(14,6)), 3) AS cv
+FROM llm_requests
+WHERE status = 'success'
+  AND cache_hit = FALSE
+  AND requested_at >= TIMESTAMP '2025-04-01 00:00:00'
+  AND requested_at <  TIMESTAMP '2025-07-01 00:00:00'
+GROUP BY model_name
+ORDER BY mean_ms, model_name;
+@explanation
+- Mean and standard deviation summarize the distribution, but latency is right-skewed (long tail). The max is often 5-10x the mean, which is why SLOs use percentiles (SQL-117).
+- The coefficient of variation makes the spread comparable across models with different speeds.
+- `AVG(int)` returns NUMERIC/DECIMAL, which ROUND accepts. `STDDEV_SAMP` returns a double in PostgreSQL, so it is cast first.
+
+**Why it matters for AI apps:** a high CV means unpredictable response times. Users perceive variance as slowness even when the mean is good.
+@mistakes
+- Using `STDDEV` without knowing it is population (MySQL) or sample (PostgreSQL) depending on the engine. `STDDEV_SAMP`/`STDDEV_POP` are explicit and portable.
+- Mixing cache hits into provider latency.
+@performance
+`llm_requests(model_name, requested_at)` supports this query well: equality on the first column, range on the second, per group.
+@interview
+Shows statistical literacy: mean vs median, skew, and choosing the right spread measure.

@@ -1,0 +1,7 @@
+plan_id,plan_name,tier_rank,price_per_seat_month,annual_discount_pct,seat_limit,is_active,launched_on
+1,Free,0,0,,3,true,2022-01-10
+2,Starter,1,12,15,10,true,2022-01-10
+3,Pro,2,29,20,50,true,2023-04-01
+4,Business,3,49,20,200,true,2022-06-01
+5,Enterprise,4,89,20,,true,2022-06-01
+6,Pro (Legacy),2,25,15,50,false,2021-03-01

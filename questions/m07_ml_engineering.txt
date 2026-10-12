@@ -1,0 +1,1466 @@
+### SQL-096
+title: Class distribution and imbalance ratio per observation date
+difficulty: Easy
+primary: Class balance of a binary target
+secondary: excluding test accounts and unlabeled rows, ratios
+concepts: ml_class_balance, ml_binary_target, conditional_aggregation, ratios
+roles: MLE
+time: 8
+dialect: BOTH
+tables: training_labels(entity_id, label_name, observation_date, label_value); ml_entities(entity_id, is_test_account)
+columns: observation_date, labeled_rows, positives, positive_rate_pct, negatives_per_positive
+compare: ordered
+@context
+Before training the churn classifier, the ML engineer checks how imbalanced the `churned_30d` target is at each monthly observation date.
+@problem
+For each `observation_date`, using rows with a non-NULL `label_value` and excluding test accounts, return `labeled_rows`, `positives`, `positive_rate_pct` (2 decimals) and `negatives_per_positive` (2 decimals). Sort by date.
+@expected
+7 rows (2024-11-01 … 2025-05-01); 2025-06-01 has no labels yet.
+@edge_cases
+- Duplicate label rows exist (SQL-097); this first profile counts raw rows and says so.
+- A date with 0 positives would make the ratio divide by zero.
+@hint1
+Join labels to entities to exclude test accounts, then group by observation date.
+@hint2
+`SUM(label_value)` counts positives because the label is 0/1.
+@hint3
+`negatives_per_positive = (labeled − positives) / NULLIF(positives, 0)`.
+@solution
+SELECT l.observation_date,
+       COUNT(*)                                                        AS labeled_rows,
+       SUM(l.label_value)                                              AS positives,
+       ROUND(100.0 * SUM(l.label_value) / COUNT(*), 2)                 AS positive_rate_pct,
+       ROUND(1.0 * (COUNT(*) - SUM(l.label_value)) / NULLIF(SUM(l.label_value), 0), 2) AS negatives_per_positive
+FROM training_labels l
+JOIN ml_entities e ON e.entity_id = l.entity_id
+WHERE l.label_name = 'churned_30d'
+  AND l.label_value IS NOT NULL
+  AND e.is_test_account = FALSE
+GROUP BY l.observation_date
+ORDER BY l.observation_date;
+@explanation
+For a 0/1 target, `SUM(label)` is the positive count and `AVG(label)` the positive rate. Reporting the imbalance per observation date (not only overall) reveals drift in the base rate, which matters for threshold choice and for comparing metrics across months.
+
+Test accounts are excluded because their synthetic activity is not representative of real customers. Including them would bias both features and labels.
+@mistakes
+- Counting NULL labels as negatives, e.g. with `COALESCE(label_value, 0)`; a pending outcome is not "did not churn".
+- Reporting only overall balance, which hides month-to-month swings.
+@performance
+Small table; the join uses the `ml_entities` primary key.
+@interview
+Expect follow-ups: how would you handle 1:20 imbalance? (class weights, resampling, threshold tuning, PR-AUC instead of accuracy).
+
+### SQL-097
+title: Duplicate and conflicting training labels
+difficulty: Medium
+primary: Detecting duplicate training examples
+secondary: authoritative row selection with ROW_NUMBER, conflict detection
+concepts: ml_duplicate_examples, dedup_window, row_number, having, count_distinct
+roles: MLE
+time: 12
+dialect: BOTH
+tables: training_labels(label_id, entity_id, label_name, observation_date, label_value, label_available_at)
+columns: entity_id, observation_date, label_rows, distinct_values, authoritative_label
+compare: ordered
+@context
+The label job was re-run for some dates. Re-runs append rows instead of replacing them, so some `(entity_id, observation_date)` pairs have two labels, sometimes with different values. The documented rule: the row with the latest `label_available_at` (then highest `label_id`) is authoritative.
+@problem
+List every `(entity_id, observation_date)` with more than one `churned_30d` label row: `label_rows`, `distinct_values` and the `authoritative_label`. Sort by `observation_date`, `entity_id`.
+@expected
+About 15–20 duplicated pairs; a handful have 2 distinct values.
+@edge_cases
+- `COUNT(DISTINCT label_value)` ignores NULLs; duplicated rows here all have values.
+@hint1
+Number rows within each `(entity_id, observation_date)` by recency.
+@hint2
+`ROW_NUMBER() OVER (PARTITION BY entity_id, observation_date ORDER BY label_available_at DESC, label_id DESC)`.
+@hint3
+Aggregate per pair with `COUNT(*)`, `COUNT(DISTINCT label_value)` and `MAX(CASE WHEN rn = 1 THEN label_value END)`, and keep pairs with more than one row.
+@solution
+SELECT entity_id,
+       observation_date,
+       COUNT(*)                                   AS label_rows,
+       COUNT(DISTINCT label_value)                AS distinct_values,
+       MAX(CASE WHEN rn = 1 THEN label_value END) AS authoritative_label
+FROM (
+    SELECT entity_id, observation_date, label_value,
+           ROW_NUMBER() OVER (PARTITION BY entity_id, observation_date
+                              ORDER BY label_available_at DESC, label_id DESC) AS rn
+    FROM training_labels
+    WHERE label_name = 'churned_30d'
+) x
+GROUP BY entity_id, observation_date
+HAVING COUNT(*) > 1
+ORDER BY observation_date, entity_id;
+@assert
+any(r[3] == '2' for r in rows)
+@explanation
+Duplicated training examples over-weight some entities, and *conflicting* duplicates inject label noise: the same features with both labels. The fix is a deterministic rule that picks one row per key. ROW_NUMBER with an explicit ordering (most recent availability, then highest ID as the final tie-breaker) encodes it. `MAX(CASE WHEN rn = 1 ...)` extracts the winner during aggregation.
+
+This query is a **data test**: in a healthy pipeline it returns zero rows. Teams run such checks in CI or as Great-Expectations/dbt tests before training.
+@mistakes
+- `SELECT DISTINCT entity_id, observation_date, label_value`: keeps both conflicting rows.
+- Choosing `MAX(label_value)`, which silently prefers churners.
+@performance
+One partitioned sort over ~1,800 rows; `training_labels(entity_id, observation_date)` index matches the partition key.
+@interview
+"How do you deduplicate training data?" is a standard MLE question; the deterministic tie-breaker is what interviewers look for.
+
+### SQL-098
+title: Rebuild the churn label from raw sessions and reconcile
+difficulty: Advanced
+primary: Generating a binary classification target from events
+secondary: eligibility rules, future window, label validation with FULL-OUTER-style comparison
+concepts: ml_binary_target, ml_pipeline_validation, multiple_ctes, conditional_aggregation, anti_join
+roles: MLE
+time: 25
+dialect: BOTH
+tables: ml_entities(entity_id, user_id, registered_at); sessions(user_id, started_at); training_labels(label_id, entity_id, label_name, observation_date, label_value, label_available_at)
+columns: rebuilt_examples, stored_examples, matching, value_mismatch, only_in_rebuilt, only_in_stored
+compare: ordered
+@context
+The label definition is documented: an entity gets a label for observation date D if it was **registered by D** and had **at least 2 sessions in [D − 30 days, D)**; the label is 1 if the user had **no session in [D, D + 30 days)**. Before trusting the stored labels for D = 2025-03-01, rebuild them from `sessions` and reconcile.
+@problem
+Return one row: `rebuilt_examples`, `stored_examples` (authoritative stored rows for that date, see SQL-097), `matching`, `value_mismatch`, `only_in_rebuilt` and `only_in_stored`.
+@expected
+One row; a correct pipeline shows full agreement (mismatch and only-in counts 0).
+@edge_cases
+- Use the authoritative row for duplicated stored labels.
+- Registration and session windows are half-open intervals relative to midnight of D.
+@hint1
+Build the eligible population and the label with two conditional counts per entity.
+@hint2
+`SUM(CASE WHEN s.started_at >= D - 30 days AND s.started_at < D THEN 1 ELSE 0 END) >= 2` for eligibility, and the same for `[D, D + 30 days)` with `= 0` for the label.
+@hint3
+Compare the rebuilt and stored sets with a LEFT JOIN in each direction (or a FULL OUTER JOIN in PostgreSQL), counting matches and mismatches.
+@solution
+WITH rebuilt AS (
+    SELECT e.entity_id,
+           CASE WHEN SUM(CASE WHEN s.started_at >= TIMESTAMP '2025-03-01 00:00:00'
+                               AND s.started_at <  TIMESTAMP '2025-03-01 00:00:00' + INTERVAL '30' DAY
+                              THEN 1 ELSE 0 END) = 0 THEN 1 ELSE 0 END AS label_value
+    FROM ml_entities e
+    JOIN sessions s ON s.user_id = e.user_id
+    WHERE e.registered_at <= TIMESTAMP '2025-03-01 00:00:00'
+    GROUP BY e.entity_id
+    HAVING SUM(CASE WHEN s.started_at >= TIMESTAMP '2025-03-01 00:00:00' - INTERVAL '30' DAY
+                     AND s.started_at <  TIMESTAMP '2025-03-01 00:00:00'
+                    THEN 1 ELSE 0 END) >= 2
+),
+stored_labels AS (
+    SELECT entity_id, label_value
+    FROM (
+        SELECT entity_id, label_value,
+               ROW_NUMBER() OVER (PARTITION BY entity_id ORDER BY label_available_at DESC, label_id DESC) AS rn
+        FROM training_labels
+        WHERE label_name = 'churned_30d'
+          AND observation_date = DATE '2025-03-01'
+    ) x
+    WHERE rn = 1
+)
+SELECT (SELECT COUNT(*) FROM rebuilt)                                              AS rebuilt_examples,
+       (SELECT COUNT(*) FROM stored_labels)                                               AS stored_examples,
+       (SELECT COUNT(*) FROM rebuilt r JOIN stored_labels s ON s.entity_id = r.entity_id
+         WHERE s.label_value = r.label_value)                                      AS matching,
+       (SELECT COUNT(*) FROM rebuilt r JOIN stored_labels s ON s.entity_id = r.entity_id
+         WHERE s.label_value <> r.label_value OR s.label_value IS NULL)            AS value_mismatch,
+       (SELECT COUNT(*) FROM rebuilt r
+         WHERE NOT EXISTS (SELECT 1 FROM stored_labels s WHERE s.entity_id = r.entity_id)) AS only_in_rebuilt,
+       (SELECT COUNT(*) FROM stored_labels s
+         WHERE NOT EXISTS (SELECT 1 FROM rebuilt r WHERE r.entity_id = s.entity_id)) AS only_in_stored;
+@assert
+num(rows[0][0]) == num(rows[0][2]) and num(rows[0][3]) == 0 and num(rows[0][4]) == 0 and num(rows[0][5]) == 0
+@explanation
+1. **Population** (who gets a label): registered by D and ≥ 2 sessions in the 30 days before D, expressed in HAVING over a per-entity aggregation.
+2. **Target**: 1 when the user has no session in the 30 days starting at D. The inner CASE counts future sessions per entity, and the outer CASE turns "0 sessions" into 1.
+3. **Reconciliation**: four counts cover every way two keyed datasets can differ: same key and same value, same key with a different value, and a key present on only one side.
+
+Only users with sessions are candidates. That is correct here because eligibility requires sessions, which makes the INNER JOIN to `sessions` safe.
+
+A label job that matches its written definition on a sample date is the cheapest insurance against silent target bugs, which are invisible in model metrics.
+@mistakes
+- Using `<=` at the window end: a session at exactly D + 30 days would wrongly count.
+- Comparing against raw stored rows, so the duplicate re-runs show up as mismatches.
+- Naming a CTE `stored`: it is a **reserved word in MySQL** (from `GENERATED ALWAYS AS (...) STORED`). PostgreSQL accepts it, MySQL fails with a syntax error.
+@performance
+Sessions are aggregated per entity once; restrict them by date in production (`started_at` between D − 30 and D + 30 days) to avoid scanning all history.
+@interview
+"How do you know your labels are right?" Rebuilding them from source data and reconciling is a strong, concrete answer.
+
+### SQL-099
+title: Point-in-time-correct training set
+difficulty: Advanced
+primary: Point-in-time feature joins
+secondary: as-of join with availability (ingested_at), latest snapshot per example
+concepts: ml_point_in_time, ml_training_set, row_number, range_join, multiple_ctes
+roles: MLE
+time: 25
+dialect: BOTH
+tables: training_labels(label_id, entity_id, label_name, observation_date, label_value, label_available_at); ml_entities(entity_id, is_test_account); entity_features(entity_id, as_of_ts, sessions_28d, days_since_last_session, open_tickets, avg_session_minutes, ingested_at)
+columns: entity_id, label_value, feature_as_of_ts, sessions_28d, days_since_last_session, open_tickets, avg_session_minutes
+compare: ordered
+@context
+The churn model is trained on examples (entity, observation date D, label). Each example may only use features that were **available** at D: the snapshot must describe the past (`as_of_ts <= D`) **and** must already have been loaded into the feature store (`ingested_at <= D`). This is point-in-time correctness.
+@problem
+Build the training rows for D = 2025-03-01 (00:00 UTC): authoritative non-NULL labels of non-test entities, each joined to its latest available snapshot. Return `entity_id`, `label_value`, `feature_as_of_ts` and four features (`sessions_28d`, `days_since_last_session`, `open_tickets`, `avg_session_minutes`, the last rounded to 2 decimals). Keep examples without any available snapshot, with NULL features. Sort by `entity_id`.
+@expected
+One row per labeled entity for that date (a few hundred). Nearly all rows use the 2025-02-10 snapshot: the 2025-02-24 snapshot was only backfilled on 2025-03-20.
+@edge_cases
+- Using `as_of_ts <= D` alone would pick the 2025-02-24 backfilled snapshot, which did not exist on 2025-03-01: **leakage**.
+- Some entities lack a snapshot row (pipeline gaps) and fall back to an older one.
+@hint1
+Start from the authoritative labels (one row per entity for D).
+@hint2
+LEFT JOIN all snapshots that satisfy `as_of_ts <= D AND ingested_at <= D`, then keep the latest per entity with ROW_NUMBER.
+@hint3
+Filter `rn = 1 OR rn IS NULL` (the latter for entities without any available snapshot), or apply ROW_NUMBER inside a derived table that is then LEFT JOINed.
+@solution
+WITH labels AS (
+    SELECT entity_id, label_value
+    FROM (
+        SELECT l.entity_id, l.label_value,
+               ROW_NUMBER() OVER (PARTITION BY l.entity_id
+                                  ORDER BY l.label_available_at DESC, l.label_id DESC) AS rn
+        FROM training_labels l
+        WHERE l.label_name = 'churned_30d'
+          AND l.observation_date = DATE '2025-03-01'
+    ) x
+    WHERE rn = 1 AND label_value IS NOT NULL
+),
+available AS (
+    SELECT f.entity_id, f.as_of_ts, f.sessions_28d, f.days_since_last_session,
+           f.open_tickets, f.avg_session_minutes,
+           ROW_NUMBER() OVER (PARTITION BY f.entity_id ORDER BY f.as_of_ts DESC) AS rn
+    FROM entity_features f
+    WHERE f.as_of_ts    <= TIMESTAMP '2025-03-01 00:00:00'
+      AND f.ingested_at <= TIMESTAMP '2025-03-01 00:00:00'
+)
+SELECT l.entity_id,
+       l.label_value,
+       a.as_of_ts                                    AS feature_as_of_ts,
+       a.sessions_28d,
+       a.days_since_last_session,
+       a.open_tickets,
+       CAST(a.avg_session_minutes AS DECIMAL(10,2))  AS avg_session_minutes
+FROM labels l
+JOIN ml_entities e ON e.entity_id = l.entity_id AND e.is_test_account = FALSE
+LEFT JOIN available a ON a.entity_id = l.entity_id AND a.rn = 1
+ORDER BY l.entity_id;
+@assert
+not any(r[2] is not None and r[2].startswith('2025-02-24') for r in rows)
+@explanation
+The two conditions in `available` encode the two meanings of time in a feature store:
+- **event time** (`as_of_ts`): the period the feature describes;
+- **availability time** (`ingested_at`): when a model could have read it.
+
+A model scoring at D could only read rows with both times ≤ D. Picking the latest such row per entity (ROW_NUMBER) gives exactly what the production scorer saw, so training and serving match ("train/serve skew" avoided).
+
+The `rn = 1` condition sits in the LEFT JOIN's ON clause, so entities without any available snapshot are kept, with NULL features. Whether to keep or drop them is a modelling choice, but it must be explicit and match what serving does.
+@mistakes
+- Joining on `as_of_ts <= D` only: training sees backfilled data that serving never had.
+- Joining the *closest* snapshot in absolute time, which may be in the future.
+- `WHERE a.rn = 1` instead of putting it in ON, which silently drops examples without features.
+@performance
+The window over the available snapshots scans features once; the primary key `(entity_id, as_of_ts)` supports the per-entity ordering.
+@interview
+The single most important MLE SQL concept. Interviewers want to hear "as of event time AND availability time".
+
+### SQL-100
+title: Leakage audit: naive versus point-in-time feature joins
+difficulty: Advanced
+primary: Target leakage detection
+secondary: comparing two as-of join rules, counting examples affected per date
+concepts: ml_leakage, ml_point_in_time, row_number, multiple_ctes, conditional_aggregation
+roles: MLE
+time: 25
+dialect: BOTH
+tables: training_labels(entity_id, label_name, observation_date, label_value); ml_entities(entity_id, is_test_account); entity_features(entity_id, as_of_ts, ingested_at)
+columns: observation_date, examples, naive_uses_unavailable_snapshot, no_available_snapshot, pct_leaky
+compare: ordered
+@context
+A previous training pipeline joined features with `as_of_ts <= observation_date` only. Quantify how many training examples per observation date used a snapshot that was **not yet available** at that date (late arrival or backfill), and how many have no available snapshot at all.
+@problem
+For every observation date with labels (non-test entities, non-NULL labels; count distinct entities), compare the snapshot chosen by the naive rule (latest `as_of_ts <= D`) with the point-in-time rule (latest with `as_of_ts <= D AND ingested_at <= D`). Return `examples`, `naive_uses_unavailable_snapshot` (naive snapshot ≠ PIT snapshot), `no_available_snapshot` and `pct_leaky` (1 decimal). Sort by date.
+@expected
+7 rows; 2025-03-01 is almost entirely leaky (backfill), other dates are affected by late-arriving rows.
+@edge_cases
+- Comparing the chosen `as_of_ts` values is enough: if the naive snapshot was available, both rules pick the same row.
+- NULL-safe comparison: an entity with no PIT snapshot but a naive one counts as leaky.
+@hint1
+For each example, compute two timestamps: the naive and the PIT snapshot.
+@hint2
+`MAX(f.as_of_ts)` with the two different conditions, using conditional aggregation over one join.
+@hint3
+`MAX(CASE WHEN f.ingested_at <= l.observation_date THEN f.as_of_ts END)` gives the PIT snapshot.
+@solution
+WITH examples AS (
+    SELECT DISTINCT l.entity_id, l.observation_date
+    FROM training_labels l
+    JOIN ml_entities e ON e.entity_id = l.entity_id
+    WHERE l.label_name = 'churned_30d'
+      AND l.label_value IS NOT NULL
+      AND e.is_test_account = FALSE
+),
+chosen AS (
+    SELECT x.entity_id,
+           x.observation_date,
+           MAX(f.as_of_ts)                                                    AS naive_ts,
+           MAX(CASE WHEN f.ingested_at <= x.observation_date THEN f.as_of_ts END) AS pit_ts
+    FROM examples x
+    LEFT JOIN entity_features f
+           ON f.entity_id = x.entity_id
+          AND f.as_of_ts <= x.observation_date
+    GROUP BY x.entity_id, x.observation_date
+)
+SELECT observation_date,
+       COUNT(*) AS examples,
+       SUM(CASE WHEN naive_ts IS NOT NULL AND (pit_ts IS NULL OR naive_ts <> pit_ts) THEN 1 ELSE 0 END)
+           AS naive_uses_unavailable_snapshot,
+       SUM(CASE WHEN pit_ts IS NULL THEN 1 ELSE 0 END) AS no_available_snapshot,
+       ROUND(100.0 * SUM(CASE WHEN naive_ts IS NOT NULL AND (pit_ts IS NULL OR naive_ts <> pit_ts) THEN 1 ELSE 0 END)
+             / COUNT(*), 1) AS pct_leaky
+FROM chosen
+GROUP BY observation_date
+ORDER BY observation_date;
+@assert
+max(num(r[4]) for r in rows) > 50
+@explanation
+Both rules can be evaluated in **one** join with conditional aggregation: the naive rule is `MAX(as_of_ts)` over the past snapshots, and the PIT rule takes the max over those also ingested by D. Where they differ, the naive pipeline trained on data that the production scorer could not have seen.
+
+Why it matters: leaky examples make offline metrics look better than production performance. Here the 2025-03-01 date is dominated by the backfill. That kind of leakage is invisible unless availability timestamps are stored at all, which is an argument for always recording `ingested_at`.
+
+Comparing a DATE (`observation_date`) with TIMESTAMP columns is fine in both engines: the date is promoted to midnight.
+@mistakes
+- Treating all late rows as harmless "because the values are correct". Correct values that arrived late still leak, because production never had them at scoring time.
+- Not counting examples whose PIT snapshot is NULL.
+@performance
+The join produces at most ~20 snapshot rows per example; the PK `(entity_id, as_of_ts)` makes it an index range scan.
+@interview
+Advanced MLE question: quantifying leakage, not just knowing the definition.
+
+### SQL-101
+title: How future features fake model quality
+difficulty: Advanced
+primary: Target leakage through future data
+secondary: comparing feature separation between classes under two join rules
+concepts: ml_leakage, ml_point_in_time, multiple_ctes, ratios, stats_summary
+roles: MLE
+time: 20
+dialect: BOTH
+tables: training_labels(label_id, entity_id, label_name, observation_date, label_value, label_available_at); ml_entities(entity_id, is_test_account); entity_features(entity_id, as_of_ts, days_since_last_session, ingested_at)
+columns: feature_join, churned_avg_days_since_session, retained_avg_days_since_session, separation_ratio
+compare: ordered
+@context
+A junior engineer built features by joining each label to the entity's **most recent snapshot in the table** (2025-06-30), arguing that "newer features are more accurate". Show the effect on `days_since_last_session` for the 2025-04-01 labels.
+@problem
+For authoritative, non-test, non-NULL labels with D = 2025-04-01, compute the average `days_since_last_session` for churned (1) and retained (0) entities under two joins: `'point_in_time'` (latest snapshot available at D) and `'latest_in_table'` (latest snapshot overall). Return `feature_join`, both averages (1 decimal) and `separation_ratio` = churned / retained (2 decimals). Sort by `feature_join`.
+@expected
+2 rows; the latest-in-table version shows a dramatically larger separation.
+@edge_cases
+- Churned users stop using the product, so snapshots taken *after* D encode the outcome itself.
+@hint1
+Compute both snapshot timestamps per example, then join the feature values for each.
+@hint2
+PIT: `MAX(as_of_ts)` with `as_of_ts <= D AND ingested_at <= D`; latest: `MAX(as_of_ts)` without conditions.
+@hint3
+UNION ALL the two variants with a label column, then aggregate by variant and label.
+@solution
+WITH labels AS (
+    SELECT entity_id, label_value
+    FROM (
+        SELECT l.entity_id, l.label_value,
+               ROW_NUMBER() OVER (PARTITION BY l.entity_id ORDER BY l.label_available_at DESC, l.label_id DESC) AS rn
+        FROM training_labels l
+        WHERE l.label_name = 'churned_30d' AND l.observation_date = DATE '2025-04-01'
+    ) x
+    JOIN ml_entities e USING (entity_id)
+    WHERE x.rn = 1 AND x.label_value IS NOT NULL AND e.is_test_account = FALSE
+),
+snap AS (
+    SELECT l.entity_id,
+           l.label_value,
+           MAX(CASE WHEN f.as_of_ts <= TIMESTAMP '2025-04-01 00:00:00'
+                     AND f.ingested_at <= TIMESTAMP '2025-04-01 00:00:00' THEN f.as_of_ts END) AS pit_ts,
+           MAX(f.as_of_ts) AS latest_ts
+    FROM labels l
+    JOIN entity_features f ON f.entity_id = l.entity_id
+    GROUP BY l.entity_id, l.label_value
+),
+both_joins AS (
+    SELECT 'point_in_time' AS feature_join, s.label_value, f.days_since_last_session
+    FROM snap s JOIN entity_features f ON f.entity_id = s.entity_id AND f.as_of_ts = s.pit_ts
+    UNION ALL
+    SELECT 'latest_in_table', s.label_value, f.days_since_last_session
+    FROM snap s JOIN entity_features f ON f.entity_id = s.entity_id AND f.as_of_ts = s.latest_ts
+)
+SELECT feature_join,
+       ROUND(AVG(CASE WHEN label_value = 1 THEN days_since_last_session END), 1) AS churned_avg_days_since_session,
+       ROUND(AVG(CASE WHEN label_value = 0 THEN days_since_last_session END), 1) AS retained_avg_days_since_session,
+       ROUND(AVG(CASE WHEN label_value = 1 THEN days_since_last_session END)
+             / AVG(CASE WHEN label_value = 0 THEN days_since_last_session END), 2) AS separation_ratio
+FROM both_joins
+GROUP BY feature_join
+ORDER BY feature_join;
+@assert
+num([r for r in rows if r[0]=='latest_in_table'][0][3]) > num([r for r in rows if r[0]=='point_in_time'][0][3])
+@explanation
+A user labelled "churned at D" has, by definition, no sessions after D. A snapshot taken weeks later therefore shows a huge `days_since_last_session` for churners. The feature *contains the label*. A model trained this way looks excellent offline and fails in production, where only past data exists.
+
+The comparison makes the leak measurable: the class separation of a single feature jumps when future snapshots are used. A sudden jump in a feature's importance or in offline AUC after a pipeline change is a classic leakage alarm.
+
+`USING (entity_id)` is a standard join shorthand supported by both engines.
+@mistakes
+- Believing "fresher features are always better" without checking when they were produced relative to the label.
+- Validating with a random split, which hides this leak; only a time-based split plus point-in-time joins expose it.
+@performance
+Two snapshot lookups per example via the primary key.
+@interview
+Explaining *why* future snapshots leak (the outcome changes the feature) is what interviewers grade.
+
+### SQL-102
+title: Time-based train / validation / test split
+difficulty: Hard
+primary: Time-based dataset splits
+secondary: CASE-based split assignment, entity overlap across splits
+concepts: ml_time_split, case, count_distinct, multiple_ctes
+roles: MLE
+time: 15
+dialect: BOTH
+tables: training_labels(label_id, entity_id, label_name, observation_date, label_value, label_available_at); ml_entities(entity_id, is_test_account)
+columns: split, first_obs, last_obs, examples, positives, positive_rate_pct, entities_also_in_train
+compare: ordered
+@context
+The team splits by time: train on observation dates up to 2025-02-01, validate on 2025-03-01 and 2025-04-01, test on 2025-05-01. Random splits would let the model see the future.
+@problem
+Assign each authoritative, non-NULL, non-test label to a split and return per split: `first_obs`, `last_obs`, `examples`, `positives`, `positive_rate_pct` (2 decimals) and `entities_also_in_train` (distinct entities of this split that also appear in train; NULL for train itself). Sort by `first_obs`.
+@expected
+3 rows (train, validation, test).
+@edge_cases
+- The same entity appears in several months; a time split prevents temporal leakage but not entity overlap.
+- 2025-06-01 labels are NULL and belong to no split.
+@hint1
+Assign splits with a CASE on `observation_date`.
+@hint2
+Deduplicate labels first (authoritative row).
+@hint3
+Entity overlap: `COUNT(DISTINCT CASE WHEN entity_id IN (SELECT entity_id FROM ... WHERE split = 'train') THEN entity_id END)`.
+@solution
+WITH labels AS (
+    SELECT x.entity_id, x.observation_date, x.label_value
+    FROM (
+        SELECT l.entity_id, l.observation_date, l.label_value,
+               ROW_NUMBER() OVER (PARTITION BY l.entity_id, l.observation_date
+                                  ORDER BY l.label_available_at DESC, l.label_id DESC) AS rn
+        FROM training_labels l
+        WHERE l.label_name = 'churned_30d'
+    ) x
+    JOIN ml_entities e ON e.entity_id = x.entity_id
+    WHERE x.rn = 1 AND x.label_value IS NOT NULL AND e.is_test_account = FALSE
+),
+split AS (
+    SELECT entity_id, observation_date, label_value,
+           CASE WHEN observation_date <= DATE '2025-02-01' THEN 'train'
+                WHEN observation_date <= DATE '2025-04-01' THEN 'validation'
+                ELSE 'test' END AS split
+    FROM labels
+)
+SELECT s.split,
+       MIN(s.observation_date)                     AS first_obs,
+       MAX(s.observation_date)                     AS last_obs,
+       COUNT(*)                                    AS examples,
+       SUM(s.label_value)                          AS positives,
+       ROUND(100.0 * SUM(s.label_value) / COUNT(*), 2) AS positive_rate_pct,
+       CASE WHEN s.split = 'train' THEN NULL
+            ELSE COUNT(DISTINCT CASE WHEN EXISTS (SELECT 1 FROM split t
+                                                  WHERE t.split = 'train' AND t.entity_id = s.entity_id)
+                                     THEN s.entity_id END)
+       END                                         AS entities_also_in_train
+FROM split s
+GROUP BY s.split
+ORDER BY first_obs;
+@explanation
+A **time-based split** trains on the past and evaluates on the future, mirroring how the model is used. The CASE thresholds make the split rule explicit and reproducible, unlike random sampling.
+
+The overlap column quantifies a remaining risk: many validation/test entities were also seen in training (at earlier dates). For churn models that is usually acceptable, since the model scores the same customers again later, but for problems where memorizing entities helps, add a **group split** by entity (e.g. `MOD(entity_id, 10) < 8` for train) in addition to the time cut.
+@mistakes
+- Random row-level splits on temporal data.
+- Forgetting that the label window (30 days) means train labels near the cut-off overlap the validation period. Leave a gap ("embargo") of at least the label horizon between splits for strict evaluation.
+@performance
+Small; the correlated EXISTS runs per distinct (split, entity) value and hits the CTE.
+@interview
+Expect "what is an embargo/purge gap and why?" as a follow-up.
+
+### SQL-103
+title: Feature missingness by snapshot date and source
+difficulty: Easy
+primary: Feature missingness monitoring
+secondary: NULL-rate per column, structural vs failure NULLs
+concepts: ml_missingness_by_date, ml_missing_features, null_aware_agg, ratios
+roles: MLE
+time: 12
+dialect: BOTH
+tables: entity_features(as_of_ts, feature_source, sessions_7d, events_28d, avg_session_minutes, seats_used_pct, days_since_last_session)
+columns: as_of_date, feature_source, rows_count, null_sessions_7d_pct, null_events_28d_pct, null_avg_minutes_pct, null_seats_used_pct, null_days_since_pct
+compare: ordered
+@context
+Feature-quality dashboards show the NULL rate per feature per snapshot. Some NULLs are structural (no session yet means no `days_since_last_session`), others are pipeline failures.
+@problem
+For snapshots in 2025 Q1, return per `as_of_date` and `feature_source`: `rows_count` and the NULL percentage (2 decimals) of five features. Sort by date, source.
+@expected
+One row per (snapshot date, source) in Q1 2025.
+@edge_cases
+- `COUNT(col)` counts non-NULL; NULL rate = 1 − COUNT(col)/COUNT(*).
+- `avg_session_minutes` and `days_since_last_session` have structural NULLs; `sessions_7d` and `events_28d` should never be NULL except on failures.
+@hint1
+Group by snapshot date and source.
+@hint2
+`100.0 * (COUNT(*) - COUNT(sessions_7d)) / COUNT(*)`.
+@hint3
+Repeat the expression for each feature.
+@solution
+SELECT CAST(as_of_ts AS DATE)                                              AS as_of_date,
+       feature_source,
+       COUNT(*)                                                            AS rows_count,
+       ROUND(100.0 * (COUNT(*) - COUNT(sessions_7d)) / COUNT(*), 2)        AS null_sessions_7d_pct,
+       ROUND(100.0 * (COUNT(*) - COUNT(events_28d)) / COUNT(*), 2)         AS null_events_28d_pct,
+       ROUND(100.0 * (COUNT(*) - COUNT(avg_session_minutes)) / COUNT(*), 2) AS null_avg_minutes_pct,
+       ROUND(100.0 * (COUNT(*) - COUNT(seats_used_pct)) / COUNT(*), 2)     AS null_seats_used_pct,
+       ROUND(100.0 * (COUNT(*) - COUNT(days_since_last_session)) / COUNT(*), 2) AS null_days_since_pct
+FROM entity_features
+WHERE as_of_ts >= TIMESTAMP '2025-01-01 00:00:00'
+  AND as_of_ts <  TIMESTAMP '2025-04-01 00:00:00'
+GROUP BY CAST(as_of_ts AS DATE), feature_source
+ORDER BY as_of_date, feature_source;
+@explanation
+`COUNT(*) - COUNT(col)` is the NULL count for that column. Monitoring it per snapshot catches pipeline breakages (a sudden spike), and grouping by source separates normal batch rows from backfilled ones.
+
+Interpretation needs domain knowledge: a high NULL rate for `avg_session_minutes` (no complete session in 28 days) is expected, so it is a *signal*. A NULL `sessions_7d` is a failure. Models should receive structural NULLs with a meaningful encoding, and failure NULLs should block training or trigger re-computation.
+
+**Grain:** one row per snapshot date and source.
+@mistakes
+- Imputing all NULLs with 0. "No complete session" is not "0 minutes".
+- Monitoring the overall NULL rate only, which averages away a one-day spike.
+@performance
+Single scan over Q1 snapshots.
+@interview
+Feature-quality monitoring is a common MLE system-design talking point; this is its SQL core.
+
+### SQL-104
+title: Entities with incomplete features in the latest snapshot
+difficulty: Medium
+primary: Finding incomplete or missing feature records
+secondary: anti-join for missing rows, UNION ALL of reasons
+concepts: ml_missing_features, anti_join, not_exists, union_all
+roles: MLE
+time: 15
+dialect: BOTH
+tables: ml_entities(entity_id, registered_at, is_test_account); entity_features(entity_id, as_of_ts, sessions_7d, sessions_28d, events_28d, open_tickets, seats_used_pct)
+columns: reason, entities
+compare: ordered
+@context
+The batch scorer requires a complete feature row for the most recent snapshot (2025-06-30). The on-call engineer wants to know how many non-test entities would fall back to older features and why.
+@problem
+For non-test entities registered before 2025-06-30, count entities by reason: `'missing_row'` (no row for the 2025-06-30 snapshot) and `'null_required_feature'` (row exists but any of `sessions_7d`, `sessions_28d`, `events_28d`, `open_tickets`, `seats_used_pct` is NULL). Return `reason`, `entities`, sorted by reason.
+@expected
+Two rows (both reasons occur).
+@edge_cases
+- An entity is either missing or present for one snapshot, so the reasons do not overlap.
+- `seats_used_pct` is also NULL when an org has no subscription at the snapshot. That is structural, but the scorer still cannot use the row.
+@hint1
+Missing rows: anti-join the entity list against the snapshot.
+@hint2
+NULL features: filter the snapshot rows with an OR of `IS NULL` tests.
+@hint3
+UNION ALL the two counts with a reason label.
+@solution
+SELECT 'missing_row' AS reason, COUNT(*) AS entities
+FROM ml_entities e
+WHERE e.is_test_account = FALSE
+  AND e.registered_at < TIMESTAMP '2025-06-30 00:00:00'
+  AND NOT EXISTS (SELECT 1 FROM entity_features f
+                  WHERE f.entity_id = e.entity_id
+                    AND f.as_of_ts = TIMESTAMP '2025-06-30 00:00:00')
+UNION ALL
+SELECT 'null_required_feature', COUNT(*)
+FROM ml_entities e
+JOIN entity_features f ON f.entity_id = e.entity_id
+                      AND f.as_of_ts = TIMESTAMP '2025-06-30 00:00:00'
+WHERE e.is_test_account = FALSE
+  AND e.registered_at < TIMESTAMP '2025-06-30 00:00:00'
+  AND (f.sessions_7d IS NULL OR f.sessions_28d IS NULL OR f.events_28d IS NULL
+       OR f.open_tickets IS NULL OR f.seats_used_pct IS NULL)
+ORDER BY reason;
+@assert
+len(rows) == 2 and all(num(r[1]) > 0 for r in rows)
+@explanation
+Completeness has two failure modes, and they need different queries:
+1. **Missing rows**: an anti-join from the expected population (`ml_entities`) to the snapshot. Only a population table can reveal what is absent.
+2. **Partial rows**: present but with NULLs in required columns.
+
+UNION ALL stacks both counts into one small report. The ORDER BY at the end applies to the combined result.
+
+**ML angle:** knowing *why* features are missing determines the fix: re-run the pipeline for missing rows, or fix the upstream source for NULLs, and decide what the scorer does meanwhile (fallback snapshot, default values, or skip).
+@mistakes
+- Checking NULLs only and never noticing missing rows.
+- Using `UNION`, which would merge two reasons that happen to have the same count.
+@performance
+The anti-join probes the primary key `(entity_id, as_of_ts)`.
+@interview
+Shows that the candidate thinks about "absent" data, not only NULL data.
+
+### SQL-105
+title: Validate stored features by recomputing them from raw sessions
+difficulty: Hard
+primary: Historical feature generation from event timestamps
+secondary: point-in-time windows, reconciliation, NULL-aware equality
+concepts: ml_historical_features, ml_pipeline_validation, range_join, conditional_aggregation, left_join
+roles: MLE
+time: 20
+dialect: BOTH
+tables: entity_features(entity_id, as_of_ts, sessions_7d, sessions_28d); ml_entities(entity_id, user_id, is_test_account); sessions(user_id, started_at)
+columns: is_test_account, rows_checked, both_match, mismatch, stored_null
+compare: ordered
+@context
+`sessions_7d` and `sessions_28d` are documented as counts of sessions in `[as_of_ts − 7 days, as_of_ts)` and `[as_of_ts − 28 days, as_of_ts)`. Recompute them from `sessions` for the 2025-06-16 snapshot and compare with the stored values.
+@problem
+Return per `is_test_account`: `rows_checked`, `both_match` (both stored features equal to the recomputed ones), `mismatch` (at least one differs, ignoring NULL stored values) and `stored_null` (at least one stored value NULL). Sort by `is_test_account`.
+@expected
+2 rows. Real accounts match except for NULL failures; test accounts mismatch (their features are synthetic).
+@edge_cases
+- Entities with no sessions in the window must recompute to 0 (LEFT JOIN + COALESCE).
+- Comparison with NULL stored values is UNKNOWN; classify them separately.
+@hint1
+Recompute both counts per entity with conditional aggregation over a LEFT JOIN from the snapshot rows to sessions.
+@hint2
+Restrict joined sessions to `[as_of_ts − 28 days, as_of_ts)` in the ON clause.
+@hint3
+Classify each row with CASE: stored NULL first, then equality of both features.
+@solution
+WITH recomputed AS (
+    SELECT f.entity_id,
+           e.is_test_account,
+           f.sessions_7d,
+           f.sessions_28d,
+           SUM(CASE WHEN s.started_at >= f.as_of_ts - INTERVAL '7' DAY THEN 1 ELSE 0 END) AS calc_7d,
+           COUNT(s.user_id)                                                           AS calc_28d
+    FROM entity_features f
+    JOIN ml_entities e ON e.entity_id = f.entity_id
+    LEFT JOIN sessions s
+           ON s.user_id = e.user_id
+          AND s.started_at >= f.as_of_ts - INTERVAL '28' DAY
+          AND s.started_at <  f.as_of_ts
+    WHERE f.as_of_ts = TIMESTAMP '2025-06-16 00:00:00'
+    GROUP BY f.entity_id, e.is_test_account, f.sessions_7d, f.sessions_28d
+)
+SELECT is_test_account,
+       COUNT(*) AS rows_checked,
+       SUM(CASE WHEN sessions_7d = calc_7d AND sessions_28d = calc_28d THEN 1 ELSE 0 END) AS both_match,
+       SUM(CASE WHEN sessions_7d IS NOT NULL AND sessions_28d IS NOT NULL
+                 AND (sessions_7d <> calc_7d OR sessions_28d <> calc_28d) THEN 1 ELSE 0 END) AS mismatch,
+       SUM(CASE WHEN sessions_7d IS NULL OR sessions_28d IS NULL THEN 1 ELSE 0 END)      AS stored_null
+FROM recomputed
+GROUP BY is_test_account
+ORDER BY is_test_account;
+@assert
+[r for r in rows if r[0] in ('0','f','false')][0][3] == '0'
+@explanation
+The LEFT JOIN attaches each snapshot row's sessions within the 28-day window, measured relative to that row's own `as_of_ts`. That is the definition of a historical, point-in-time feature. Conditional aggregation then derives the 7-day count from the same joined rows, and `COUNT(s.user_id)` returns 0 when no session matched.
+
+Real accounts: every non-NULL stored value equals the recomputation, so the feature pipeline implements its definition. Test accounts were seeded with synthetic activity in the feature store only, which is one more reason to exclude them.
+
+This "recompute and diff" test is how feature pipelines are validated after code changes, and how offline/online feature parity is checked.
+@mistakes
+- Using `<=` at the upper bound (a session exactly at `as_of_ts` belongs to the next snapshot).
+- Comparing with `=` and treating UNKNOWN as mismatch.
+@performance
+`sessions(user_id, started_at)` turns each window into an index range scan.
+@interview
+A concrete answer to "how do you test a feature pipeline?".
+
+### SQL-106
+title: Latest valid prediction per entity
+difficulty: Medium
+primary: Selecting the latest valid record per entity
+secondary: deterministic tie-breaking, filtering failed scores, model registry join
+concepts: ml_latest_prediction, row_number, dedup_window, top_n_per_group
+roles: MLE
+time: 12
+dialect: BOTH
+tables: model_predictions(prediction_id, model_version_id, entity_id, predicted_at, score, predicted_label); model_versions(model_version_id, model_name, stage)
+columns: entity_id, prediction_id, predicted_at, score, predicted_label
+compare: ordered
+@context
+The CRM integration shows each account's current churn risk: the most recent **valid** (non-NULL) score from the churn model currently in production.
+@problem
+For the churn model whose `stage` is `'production'`, return for every entity its latest prediction with a non-NULL score (`predicted_at` descending, then `prediction_id` descending): `entity_id`, `prediction_id`, `predicted_at`, `score` (4 decimals), `predicted_label`. Sort by `entity_id`.
+@expected
+One row per entity scored by the production version.
+@edge_cases
+- Re-runs create two predictions on the same day; the later one wins.
+- A failed (NULL) latest score must fall back to the previous valid score, so filter NULLs **before** ranking.
+@hint1
+Identify the production version through `model_versions`.
+@hint2
+`ROW_NUMBER() OVER (PARTITION BY entity_id ORDER BY predicted_at DESC, prediction_id DESC)` over valid rows.
+@hint3
+Keep `rn = 1`.
+@solution
+SELECT entity_id, prediction_id, predicted_at, CAST(score AS DECIMAL(6,4)) AS score, predicted_label
+FROM (
+    SELECT p.entity_id, p.prediction_id, p.predicted_at, p.score, p.predicted_label,
+           ROW_NUMBER() OVER (PARTITION BY p.entity_id
+                              ORDER BY p.predicted_at DESC, p.prediction_id DESC) AS rn
+    FROM model_predictions p
+    JOIN model_versions v ON v.model_version_id = p.model_version_id
+    WHERE v.model_name = 'churn_classifier'
+      AND v.stage = 'production'
+      AND p.score IS NOT NULL
+) ranked
+WHERE rn = 1
+ORDER BY entity_id;
+@explanation
+Filtering `score IS NOT NULL` before the window makes "latest **valid**" a single ranking step. Filtering afterwards would drop an entity whose latest run failed instead of falling back to its previous score. `prediction_id` as the final key keeps the choice deterministic even when two rows have the same timestamp.
+
+Looking up the production version by `stage` rather than hard-coding `model_version_id = 3` keeps the query correct after the next promotion.
+@mistakes
+- `MAX(predicted_at)` joined back to the table: duplicates on ties and more code.
+- Ranking first and filtering NULL scores afterwards.
+@performance
+`model_predictions(entity_id, predicted_at)` supports the per-entity ordering.
+@interview
+"Latest record per key" with validity rules and deterministic ties is a core production-SQL skill.
+
+### SQL-107
+title: Precision, recall, accuracy and F1 per model version
+difficulty: Advanced
+primary: Classification metrics from prediction and label tables
+secondary: confusion matrix with conditional aggregation, zero-denominator guards, dedup on both sides
+concepts: ml_metrics, ml_model_compare, multiple_ctes, conditional_aggregation, dedup_window
+roles: MLE
+time: 25
+dialect: BOTH
+tables: model_predictions(prediction_id, model_version_id, entity_id, predicted_at, score, predicted_label); model_versions(model_version_id, version_label, model_name); training_labels(label_id, entity_id, label_name, observation_date, label_value, label_available_at); ml_entities(entity_id, is_test_account)
+columns: version_label, examples, tp, fp, fn, tn, precision_pct, recall_pct, accuracy_pct, f1
+compare: ordered
+@context
+Each monthly run of the churn models scores entities on an observation date. Labels arrive 30+ days later. `predicted_label` is 1 when `score >= threshold`. Evaluate every churn model version on the predictions it actually made.
+@problem
+Per churn-classifier version, match each entity's **latest valid prediction per day** to the **authoritative** label of that observation date (`CAST(predicted_at AS DATE) = observation_date`), excluding test accounts and NULL labels. Return the confusion matrix and `precision_pct`, `recall_pct`, `accuracy_pct` (1 decimal) and `f1` (3 decimals). Sort by `version_label`.
+@expected
+4 rows (v1-v4; v4 only has its shadow predictions for 2025-05-01 evaluated).
+@edge_cases
+- Precision is undefined when there are no predicted positives; recall when there are no actual positives. Return NULL, not an error.
+- Both tables contain duplicates (re-runs, label re-runs); deduplicate each before joining, or the confusion matrix double counts.
+@hint1
+CTE 1: authoritative labels. CTE 2: latest valid prediction per (version, entity, day).
+@hint2
+TP = `SUM(CASE WHEN predicted_label = 1 AND label_value = 1 THEN 1 ELSE 0 END)`, and similarly FP, FN, TN.
+@hint3
+Precision = TP / NULLIF(TP + FP, 0); F1 = 2TP / NULLIF(2TP + FP + FN, 0).
+@solution
+WITH labels AS (
+    SELECT x.entity_id, x.observation_date, x.label_value
+    FROM (
+        SELECT l.entity_id, l.observation_date, l.label_value,
+               ROW_NUMBER() OVER (PARTITION BY l.entity_id, l.observation_date
+                                  ORDER BY l.label_available_at DESC, l.label_id DESC) AS rn
+        FROM training_labels l
+        WHERE l.label_name = 'churned_30d'
+    ) x
+    JOIN ml_entities e ON e.entity_id = x.entity_id
+    WHERE x.rn = 1 AND x.label_value IS NOT NULL AND e.is_test_account = FALSE
+),
+preds AS (
+    SELECT model_version_id, entity_id, pred_date, predicted_label
+    FROM (
+        SELECT p.model_version_id, p.entity_id, CAST(p.predicted_at AS DATE) AS pred_date, p.predicted_label,
+               ROW_NUMBER() OVER (PARTITION BY p.model_version_id, p.entity_id, CAST(p.predicted_at AS DATE)
+                                  ORDER BY p.predicted_at DESC, p.prediction_id DESC) AS rn
+        FROM model_predictions p
+        WHERE p.score IS NOT NULL
+    ) y
+    WHERE rn = 1
+),
+cm AS (
+    SELECT v.version_label,
+           COUNT(*)                                                                    AS examples,
+           SUM(CASE WHEN p.predicted_label = 1 AND l.label_value = 1 THEN 1 ELSE 0 END) AS tp,
+           SUM(CASE WHEN p.predicted_label = 1 AND l.label_value = 0 THEN 1 ELSE 0 END) AS fp,
+           SUM(CASE WHEN p.predicted_label = 0 AND l.label_value = 1 THEN 1 ELSE 0 END) AS fn,
+           SUM(CASE WHEN p.predicted_label = 0 AND l.label_value = 0 THEN 1 ELSE 0 END) AS tn
+    FROM preds p
+    JOIN labels l         ON l.entity_id = p.entity_id AND l.observation_date = p.pred_date
+    JOIN model_versions v ON v.model_version_id = p.model_version_id
+    WHERE v.model_name = 'churn_classifier'
+    GROUP BY v.version_label
+)
+SELECT version_label, examples, tp, fp, fn, tn,
+       ROUND(100.0 * tp / NULLIF(tp + fp, 0), 1)                AS precision_pct,
+       ROUND(100.0 * tp / NULLIF(tp + fn, 0), 1)                AS recall_pct,
+       ROUND(100.0 * (tp + tn) / NULLIF(examples, 0), 1)         AS accuracy_pct,
+       ROUND(2.0 * tp / NULLIF(2 * tp + fp + fn, 0), 3)          AS f1
+FROM cm
+ORDER BY version_label;
+@assert
+all(num(r[1]) == num(r[2]) + num(r[3]) + num(r[4]) + num(r[5]) for r in rows)
+@explanation
+**Column definitions:** `predicted_label` is the model's 0/1 decision at the run's `threshold`; `label_value` is the observed outcome (1 = churned). Each example is one (entity, observation date).
+
+1. Deduplicate both sides to the example grain first: authoritative labels and the latest valid prediction per model, entity and day. Without this, re-runs would add duplicate confusion-matrix entries.
+2. The confusion matrix is four conditional counts.
+3. Metrics with explicit zero guards: precision = TP / (TP + FP), recall = TP / (TP + FN), accuracy = (TP + TN) / N, F1 = 2TP / (2TP + FP + FN). This last form is algebraically equal to the harmonic mean of precision and recall, and avoids a division when both are 0.
+
+With ~18% positives, accuracy is dominated by negatives. Precision and recall (or PR-AUC) are the meaningful metrics. Versions use different thresholds (0.50 → 0.35), so part of the recall change is threshold choice, not model quality (compare at a common threshold in SQL-109).
+@mistakes
+- Joining raw predictions to raw labels (duplicates on both sides).
+- Using a model's threshold from `model_versions.default_threshold` when the run used a different one; `predicted_label` already reflects the run's actual threshold.
+@performance
+Window sorts over a few thousand rows each; joins on the deduplicated keys.
+@interview
+Computing metrics from raw tables, including dedup and zero-denominator handling, is a frequent MLE take-home task.
+
+### SQL-108
+title: Paired comparison: production v3 versus shadow v4
+difficulty: Hard
+primary: Comparing model versions on identical examples
+secondary: intersection of scored sets, metrics at each model's threshold, agreement rate
+concepts: ml_model_compare, ml_metrics, multiple_ctes, inner_join
+roles: MLE
+time: 20
+dialect: BOTH
+tables: model_predictions(prediction_id, model_version_id, entity_id, predicted_at, score, predicted_label); model_versions(model_version_id, version_label); training_labels(label_id, entity_id, label_name, observation_date, label_value, label_available_at); ml_entities(entity_id, is_test_account)
+columns: version_label, threshold, examples, precision_pct, recall_pct, f1, agreement_pct
+compare: ordered
+@context
+v4 ran in shadow mode next to v3 on 2025-05-01. A fair comparison must evaluate both versions on **exactly the same** labelled examples.
+@problem
+Take the entities scored validly by both v3 and v4 on 2025-05-01 (latest valid prediction per version and entity that day) that have an authoritative, non-NULL, non-test label. Per version, return the threshold used, `examples`, `precision_pct`, `recall_pct` (1 decimal), `f1` (3 decimals) and `agreement_pct`, the share of examples where both versions made the same decision (1 decimal; same value on both rows). Sort by version.
+@expected
+2 rows with identical `examples` and `agreement_pct`.
+@edge_cases
+- Evaluating each model on its own scored set would compare different populations if one model failed to score some entities.
+@hint1
+Build one row per entity with both versions' decisions side by side (join v3 to v4 on entity).
+@hint2
+Join that to the labels; then unpivot to one row per (version, example) with UNION ALL.
+@hint3
+Agreement = `AVG(CASE WHEN label_v3 = label_v4 THEN 1.0 ELSE 0 END)` over the paired rows.
+@solution
+WITH labels AS (
+    SELECT entity_id, label_value
+    FROM (
+        SELECT l.entity_id, l.label_value,
+               ROW_NUMBER() OVER (PARTITION BY l.entity_id ORDER BY l.label_available_at DESC, l.label_id DESC) AS rn
+        FROM training_labels l
+        WHERE l.label_name = 'churned_30d' AND l.observation_date = DATE '2025-05-01'
+    ) x
+    JOIN ml_entities e USING (entity_id)
+    WHERE x.rn = 1 AND x.label_value IS NOT NULL AND e.is_test_account = FALSE
+),
+latest AS (
+    SELECT model_version_id, entity_id, predicted_label, threshold
+    FROM (
+        SELECT p.model_version_id, p.entity_id, p.predicted_label, p.threshold,
+               ROW_NUMBER() OVER (PARTITION BY p.model_version_id, p.entity_id
+                                  ORDER BY p.predicted_at DESC, p.prediction_id DESC) AS rn
+        FROM model_predictions p
+        WHERE p.model_version_id IN (3, 4)
+          AND p.score IS NOT NULL
+          AND p.predicted_at >= TIMESTAMP '2025-05-01 00:00:00'
+          AND p.predicted_at <  TIMESTAMP '2025-05-02 00:00:00'
+    ) y
+    WHERE rn = 1
+),
+paired AS (
+    SELECT l.entity_id, l.label_value,
+           a.predicted_label AS pred_v3, a.threshold AS thr_v3,
+           b.predicted_label AS pred_v4, b.threshold AS thr_v4
+    FROM labels l
+    JOIN latest a ON a.entity_id = l.entity_id AND a.model_version_id = 3
+    JOIN latest b ON b.entity_id = l.entity_id AND b.model_version_id = 4
+),
+long_form AS (
+    SELECT 'v3' AS version_label, thr_v3 AS threshold, pred_v3 AS pred, label_value,
+           CASE WHEN pred_v3 = pred_v4 THEN 1 ELSE 0 END AS agree
+    FROM paired
+    UNION ALL
+    SELECT 'v4', thr_v4, pred_v4, label_value,
+           CASE WHEN pred_v3 = pred_v4 THEN 1 ELSE 0 END
+    FROM paired
+)
+SELECT version_label,
+       MAX(threshold)                                                                       AS threshold,
+       COUNT(*)                                                                             AS examples,
+       ROUND(100.0 * SUM(CASE WHEN pred = 1 AND label_value = 1 THEN 1 ELSE 0 END)
+             / NULLIF(SUM(CASE WHEN pred = 1 THEN 1 ELSE 0 END), 0), 1)                     AS precision_pct,
+       ROUND(100.0 * SUM(CASE WHEN pred = 1 AND label_value = 1 THEN 1 ELSE 0 END)
+             / NULLIF(SUM(label_value), 0), 1)                                              AS recall_pct,
+       ROUND(2.0 * SUM(CASE WHEN pred = 1 AND label_value = 1 THEN 1 ELSE 0 END)
+             / NULLIF(SUM(CASE WHEN pred = 1 THEN 1 ELSE 0 END) + SUM(label_value), 0), 3)  AS f1,
+       ROUND(100.0 * SUM(agree) / COUNT(*), 1)                                              AS agreement_pct
+FROM long_form
+GROUP BY version_label
+ORDER BY version_label;
+@assert
+rows[0][2] == rows[1][2] and rows[0][6] == rows[1][6]
+@explanation
+The **paired** design (same examples for both models) removes population differences from the comparison. With few examples, a paired test (McNemar on the disagreement cells) is far more powerful than comparing two independent accuracies.
+
+F1 uses the identity 2TP / (predicted positives + actual positives).
+
+Note the threshold column: v4 runs at 0.35 versus v3 at 0.40. Differences in precision and recall mix model quality with threshold choice. For a clean comparison, evaluate both at the same threshold or compare threshold-free metrics (AUC, SQL-114).
+@mistakes
+- Comparing v4's metrics on its scored set with v3's on a different set.
+- Forgetting that shadow scoring can fail for some entities, which changes the population.
+@performance
+All CTEs are small; the window over one day of predictions uses `model_predictions(model_version_id, predicted_at)`.
+@interview
+Shadow deployments and paired evaluation are senior MLE topics.
+
+### SQL-109
+title: Precision and recall across a threshold sweep
+difficulty: Hard
+primary: Threshold analysis
+secondary: CROSS JOIN with a list of thresholds, metrics per threshold
+concepts: ml_metrics, cross_join, conditional_aggregation, union_all
+roles: MLE
+time: 15
+dialect: BOTH
+tables: model_predictions(prediction_id, model_version_id, entity_id, predicted_at, score); training_labels(label_id, entity_id, label_name, observation_date, label_value, label_available_at); ml_entities(entity_id, is_test_account)
+columns: threshold, flagged_pct, precision_pct, recall_pct, f1
+compare: ordered
+@context
+Customer success can call about 25% of accounts per month. Choose v3's threshold from its labelled predictions (April and May 2025 runs).
+@problem
+For thresholds 0.20, 0.30, …, 0.70, recompute decisions from `score` for v3's latest valid prediction per entity and day, joined to authoritative non-test labels. Return `threshold`, `flagged_pct` (share predicted positive), `precision_pct`, `recall_pct` (1 decimal) and `f1` (3 decimals). Sort by threshold.
+@expected
+6 rows; lower thresholds flag more accounts with higher recall and lower precision.
+@edge_cases
+- Recompute decisions from the score; the stored `predicted_label` reflects only the run's threshold.
+@hint1
+Build the evaluation set once (score + label per example).
+@hint2
+CROSS JOIN it with a 6-row list of thresholds (UNION ALL of SELECTs).
+@hint3
+`pred = CASE WHEN score >= threshold THEN 1 ELSE 0 END`, then aggregate per threshold.
+@solution
+WITH labels AS (
+    SELECT x.entity_id, x.observation_date, x.label_value
+    FROM (
+        SELECT l.entity_id, l.observation_date, l.label_value,
+               ROW_NUMBER() OVER (PARTITION BY l.entity_id, l.observation_date
+                                  ORDER BY l.label_available_at DESC, l.label_id DESC) AS rn
+        FROM training_labels l
+        WHERE l.label_name = 'churned_30d'
+    ) x
+    JOIN ml_entities e ON e.entity_id = x.entity_id
+    WHERE x.rn = 1 AND x.label_value IS NOT NULL AND e.is_test_account = FALSE
+),
+scored AS (
+    SELECT entity_id, pred_date, score
+    FROM (
+        SELECT p.entity_id, CAST(p.predicted_at AS DATE) AS pred_date, p.score,
+               ROW_NUMBER() OVER (PARTITION BY p.entity_id, CAST(p.predicted_at AS DATE)
+                                  ORDER BY p.predicted_at DESC, p.prediction_id DESC) AS rn
+        FROM model_predictions p
+        WHERE p.model_version_id = 3 AND p.score IS NOT NULL
+    ) y
+    WHERE rn = 1
+),
+evalset AS (
+    SELECT s.score, l.label_value
+    FROM scored s
+    JOIN labels l ON l.entity_id = s.entity_id AND l.observation_date = s.pred_date
+),
+thresholds AS (
+    SELECT 0.20 AS threshold UNION ALL SELECT 0.30 UNION ALL SELECT 0.40
+    UNION ALL SELECT 0.50 UNION ALL SELECT 0.60 UNION ALL SELECT 0.70
+)
+SELECT t.threshold,
+       ROUND(100.0 * SUM(CASE WHEN e.score >= t.threshold THEN 1 ELSE 0 END) / COUNT(*), 1) AS flagged_pct,
+       ROUND(100.0 * SUM(CASE WHEN e.score >= t.threshold AND e.label_value = 1 THEN 1 ELSE 0 END)
+             / NULLIF(SUM(CASE WHEN e.score >= t.threshold THEN 1 ELSE 0 END), 0), 1)        AS precision_pct,
+       ROUND(100.0 * SUM(CASE WHEN e.score >= t.threshold AND e.label_value = 1 THEN 1 ELSE 0 END)
+             / NULLIF(SUM(e.label_value), 0), 1)                                             AS recall_pct,
+       ROUND(2.0 * SUM(CASE WHEN e.score >= t.threshold AND e.label_value = 1 THEN 1 ELSE 0 END)
+             / NULLIF(SUM(CASE WHEN e.score >= t.threshold THEN 1 ELSE 0 END) + SUM(e.label_value), 0), 3) AS f1
+FROM evalset e
+CROSS JOIN thresholds t
+GROUP BY t.threshold
+ORDER BY t.threshold;
+@assert
+len(rows) == 6
+num(rows[0][1]) >= num(rows[-1][1])
+@explanation
+The CROSS JOIN evaluates every example at every threshold in one pass. Metrics are recomputed from the score, so any threshold can be explored, not just the one the run used.
+
+Choosing the threshold is a **business** decision: with capacity to contact ~25% of accounts, pick the highest-recall threshold whose `flagged_pct` fits. F1 is a reasonable default but it encodes an arbitrary equal weighting of precision and recall.
+
+`score` is DOUBLE PRECISION and the thresholds are DECIMAL literals; `>=` compares them numerically in both engines.
+@mistakes
+- Re-using `predicted_label` (only valid for one threshold).
+- Choosing the F1-maximizing threshold without asking about the cost of false positives versus false negatives.
+@performance
+6 x evaluation set rows; tiny.
+@interview
+Threshold selection under operational constraints is a realistic MLE interview discussion.
+
+### SQL-110
+title: Score distribution drift with the Population Stability Index
+difficulty: Advanced
+primary: Detecting changes in prediction distributions
+secondary: fixed-width buckets, shares per run, LN, epsilon for empty buckets
+concepts: ml_prediction_drift, conditional_aggregation, window_agg, stats_summary
+roles: MLE
+time: 25
+dialect: BOTH
+tables: model_predictions(model_version_id, batch_id, score)
+columns: bucket, may_pct, june_pct, psi_contribution, psi_total
+compare: ordered
+@context
+Labels for the June run will not arrive until July, so monitoring relies on the score distribution itself. The Population Stability Index (PSI) compares the June 2025 production scores of v3 with May's.
+@problem
+Using v3's valid scores from batches `churn-2025-05-01-a` (reference) and `churn-2025-06-01-a` (current), bucket scores into 10 equal-width bins (`FLOOR(score * 10)`, with 1.0 in the top bin). Return per bucket the share of each month (`may_pct`, `june_pct`, 2 decimals), the PSI contribution `(june − may) x LN(june / may)` (4 decimals, shares as fractions) and the total PSI on every row (4 decimals). Sort by bucket.
+@expected
+Up to 10 rows.
+@edge_cases
+- An empty bucket makes LN undefined; replace zero shares with a small epsilon (0.0001).
+- Rule of thumb: PSI < 0.1 stable, 0.1–0.25 moderate shift, > 0.25 significant shift.
+@hint1
+Count scores per bucket for each batch with conditional aggregation, then divide by each batch's total.
+@hint2
+`LEAST(FLOOR(score * 10), 9)` gives buckets 0–9.
+@hint3
+Total PSI = `SUM(contribution) OVER ()`.
+@solution
+WITH scores AS (
+    SELECT batch_id, LEAST(FLOOR(score * 10), 9) AS bucket
+    FROM model_predictions
+    WHERE model_version_id = 3
+      AND score IS NOT NULL
+      AND batch_id IN ('churn-2025-05-01-a', 'churn-2025-06-01-a')
+),
+counts AS (
+    SELECT bucket,
+           SUM(CASE WHEN batch_id = 'churn-2025-05-01-a' THEN 1 ELSE 0 END) AS n_may,
+           SUM(CASE WHEN batch_id = 'churn-2025-06-01-a' THEN 1 ELSE 0 END) AS n_june
+    FROM scores
+    GROUP BY bucket
+),
+shares AS (
+    SELECT bucket,
+           GREATEST(1.0 * n_may  / SUM(n_may)  OVER (), 0.0001) AS p_may,
+           GREATEST(1.0 * n_june / SUM(n_june) OVER (), 0.0001) AS p_june
+    FROM counts
+)
+SELECT bucket,
+       ROUND(100 * p_may, 2)                                   AS may_pct,
+       ROUND(100 * p_june, 2)                                  AS june_pct,
+       ROUND((p_june - p_may) * LN(p_june / p_may), 4)          AS psi_contribution,
+       ROUND(SUM((p_june - p_may) * LN(p_june / p_may)) OVER (), 4) AS psi_total
+FROM shares
+ORDER BY bucket;
+@explanation
+PSI = Σ (actual − expected) · ln(actual / expected) over buckets. It is symmetric in its contribution sign: each term is ≥ 0. It summarizes how much a distribution moved. Score drift without label drift can indicate a changed population (new customer mix), a feature pipeline issue, or a model or config change, so investigate before acting.
+
+Implementation notes:
+- Fixed-width bins on [0, 1] make scores comparable across runs. Quantile bins from the reference run are an alternative.
+- `GREATEST(share, 0.0001)` avoids `ln(0)` and division by zero.
+- `LEAST`, `GREATEST`, `FLOOR` and `LN` exist in both engines.
+@mistakes
+- Comparing a full run with a partial re-run batch (`-b`), which contains a biased subset of entities.
+- Reading a small PSI as "model is fine". It only says the score distribution is stable, not that predictions are accurate.
+@performance
+One scan of two batches.
+@interview
+Drift monitoring without labels is a standard MLOps question; PSI is the expected metric to name and compute.
+
+### SQL-111
+title: Build the batch-inference input for the next run
+difficulty: Hard
+primary: Batch inference dataset
+secondary: eligibility rules, latest available snapshot at run time, LEFT JOIN for missing features
+concepts: ml_batch_inference, ml_point_in_time, row_number, left_join, having
+roles: MLE
+time: 18
+dialect: BOTH
+tables: ml_entities(entity_id, user_id, registered_at, is_test_account); sessions(user_id, started_at); entity_features(entity_id, as_of_ts, ingested_at, sessions_28d, days_since_last_session, open_tickets, avg_session_minutes, seats_used_pct)
+columns: entity_id, feature_as_of_ts, sessions_28d, days_since_last_session, open_tickets, avg_session_minutes, seats_used_pct
+compare: ordered
+@context
+The next monthly scoring run starts on 2025-07-01 at 02:00 UTC. It scores non-test entities that are eligible under the label definition (≥ 2 sessions in the 30 days before 2025-07-01) with the **latest snapshot ingested before the run starts**.
+@problem
+Return the scoring input: `entity_id`, `feature_as_of_ts` and the five features (`avg_session_minutes` and `seats_used_pct` rounded to 2 and 3 decimals). Include eligible entities that have no available snapshot, with NULL features. Sort by `entity_id`.
+@expected
+A few hundred rows, mostly using the 2025-06-30 snapshot; late-arriving rows fall back to 2025-06-16.
+@edge_cases
+- The 2025-06-30 snapshot is ingested a few hours after midnight; rows ingested after 02:00 are not usable.
+- The same eligibility as training (SQL-098) avoids training/serving population mismatch.
+@hint1
+Eligible entities: aggregate sessions per entity in `[2025-06-01, 2025-07-01)` with HAVING `COUNT(*) >= 2`.
+@hint2
+Available snapshots: `ingested_at <= TIMESTAMP '2025-07-01 02:00:00'`; rank by `as_of_ts DESC`.
+@hint3
+LEFT JOIN the ranked snapshots with `rn = 1` in the ON clause.
+@solution
+WITH eligible AS (
+    SELECT e.entity_id
+    FROM ml_entities e
+    JOIN sessions s ON s.user_id = e.user_id
+    WHERE e.is_test_account = FALSE
+      AND e.registered_at <= TIMESTAMP '2025-07-01 00:00:00'
+      AND s.started_at >= TIMESTAMP '2025-06-01 00:00:00'
+      AND s.started_at <  TIMESTAMP '2025-07-01 00:00:00'
+    GROUP BY e.entity_id
+    HAVING COUNT(*) >= 2
+),
+available AS (
+    SELECT f.*,
+           ROW_NUMBER() OVER (PARTITION BY f.entity_id ORDER BY f.as_of_ts DESC) AS rn
+    FROM entity_features f
+    WHERE f.ingested_at <= TIMESTAMP '2025-07-01 02:00:00'
+)
+SELECT el.entity_id,
+       a.as_of_ts                                    AS feature_as_of_ts,
+       a.sessions_28d,
+       a.days_since_last_session,
+       a.open_tickets,
+       CAST(a.avg_session_minutes AS DECIMAL(10,2))  AS avg_session_minutes,
+       CAST(a.seats_used_pct AS DECIMAL(10,3))       AS seats_used_pct
+FROM eligible el
+LEFT JOIN available a ON a.entity_id = el.entity_id AND a.rn = 1
+ORDER BY el.entity_id;
+@explanation
+Batch inference applies the **same population and the same point-in-time rule** as training, only with the run's start time as the cut-off. Defining eligibility with the label rule keeps training and serving populations aligned, and using `ingested_at` reproduces exactly what the scorer will be able to read at 02:00.
+
+Keeping entities without any available snapshot (LEFT JOIN) makes the problem visible: the scorer must decide on a fallback, and the count of such entities is a useful run metric.
+
+`f.*` in a CTE is acceptable for an internal step but the final SELECT lists columns explicitly (SQL-155).
+@mistakes
+- Joining the 2025-06-30 snapshot by date equality: entities whose row arrived late or is missing would get no features.
+- Using a different eligibility rule than training.
+@performance
+The session aggregation uses `sessions(user_id, started_at)`; the window ranks only rows ingested before the cut-off.
+@interview
+Shows that the candidate thinks about serving-time data availability, not only training.
+
+### SQL-112
+title: Stale features at scoring time and delayed labels
+difficulty: Hard
+primary: Monitoring stale features and delayed labels
+secondary: two grains reported side by side, date-relative thresholds
+concepts: ml_stale_delayed, multiple_ctes, left_join, conditional_aggregation
+roles: MLE
+time: 20
+dialect: BOTH
+tables: model_predictions(model_version_id, batch_id, predicted_at, feature_as_of_ts); training_labels(label_id, entity_id, label_name, observation_date, label_value, label_available_at)
+columns: run_date, predictions, stale_feature_predictions, unlogged_feature_snapshot, labels, delayed_labels
+compare: ordered
+@context
+Two health signals per monthly cycle: at scoring time, did predictions use fresh features (snapshot ≤ 14 days old)? After the outcome window, did labels arrive on time (≤ 3 days after the 30-day window closed)?
+@problem
+For each run date (date of the production `-a` batch of churn models v1–v3), return `predictions`, `stale_feature_predictions` (logged `feature_as_of_ts` older than `predicted_at − 14 days`), `unlogged_feature_snapshot` (NULL `feature_as_of_ts`), `labels` (authoritative non-NULL labels with that observation date) and `delayed_labels` (`label_available_at` later than observation date + 33 days). Sort by run date.
+@expected
+8 rows; the June run has 0 labels.
+@edge_cases
+- Labels for the latest run are not available yet; LEFT JOIN so the run still appears.
+- Stale features and unlogged snapshots are different problems; count them separately.
+@hint1
+Aggregate predictions per run date and labels per observation date separately.
+@hint2
+Join the two aggregates on `run_date = observation_date` with a LEFT JOIN.
+@hint3
+`feature_as_of_ts < predicted_at - INTERVAL '14' DAY` and `label_available_at > observation_date + INTERVAL '33' DAY`.
+@solution
+WITH runs AS (
+    SELECT CAST(predicted_at AS DATE)                                                       AS run_date,
+           COUNT(*)                                                                         AS predictions,
+           SUM(CASE WHEN feature_as_of_ts < predicted_at - INTERVAL '14' DAY THEN 1 ELSE 0 END) AS stale_feature_predictions,
+           SUM(CASE WHEN feature_as_of_ts IS NULL THEN 1 ELSE 0 END)                        AS unlogged_feature_snapshot
+    FROM model_predictions
+    WHERE model_version_id IN (1, 2, 3)
+      AND batch_id LIKE 'churn-%-a'
+    GROUP BY CAST(predicted_at AS DATE)
+),
+lab AS (
+    SELECT observation_date,
+           COUNT(*) AS labels,
+           SUM(CASE WHEN label_available_at > observation_date + INTERVAL '33' DAY THEN 1 ELSE 0 END) AS delayed_labels
+    FROM (
+        SELECT l.*,
+               ROW_NUMBER() OVER (PARTITION BY entity_id, observation_date
+                                  ORDER BY label_available_at DESC, label_id DESC) AS rn
+        FROM training_labels l
+        WHERE label_name = 'churned_30d'
+    ) x
+    WHERE rn = 1 AND label_value IS NOT NULL
+    GROUP BY observation_date
+)
+SELECT r.run_date,
+       r.predictions,
+       r.stale_feature_predictions,
+       r.unlogged_feature_snapshot,
+       COALESCE(l.labels, 0)         AS labels,
+       COALESCE(l.delayed_labels, 0) AS delayed_labels
+FROM runs r
+LEFT JOIN lab l ON l.observation_date = r.run_date
+ORDER BY r.run_date;
+@assert
+len(rows) == 8
+rows[-1][4] == '0'
+@explanation
+Two aggregates at the same grain (one row per monthly cycle) are joined on the date. Each side keeps its own logic:
+- **Feature staleness** at scoring time comes from the prediction log (`feature_as_of_ts` vs `predicted_at`). A NULL means the scorer did not log it, which is an observability gap worth tracking on its own.
+- **Label delay** compares availability with the earliest possible time (observation + 30 days) plus a 3-day tolerance.
+
+`DATE + INTERVAL` yields a timestamp/datetime in both engines, which compares correctly with `label_available_at`.
+
+Delayed labels shrink the usable training set for the most recent months and delay monitoring; stale features silently degrade predictions. Both belong on an ML health dashboard.
+@mistakes
+- INNER JOIN, which hides the latest run (no labels yet).
+- Counting raw label rows (duplicates) instead of authoritative ones.
+@performance
+Two small aggregations.
+@interview
+MLOps monitoring beyond accuracy (freshness, completeness, delays) is a senior MLE discussion point.
+
+### SQL-113
+title: Features that changed after the prediction was made
+difficulty: Advanced
+primary: Detecting features updated after prediction time
+secondary: availability vs event time, EXISTS for newer late-arriving snapshots
+concepts: ml_features_after_pred, ml_point_in_time, ml_leakage, semi_join, conditional_aggregation
+roles: MLE
+time: 20
+dialect: BOTH
+tables: model_predictions(prediction_id, model_version_id, entity_id, batch_id, predicted_at, feature_as_of_ts); entity_features(entity_id, as_of_ts, ingested_at)
+columns: batch_id, predictions, logged_snapshot_not_yet_ingested, newer_snapshot_arrived_later
+compare: ordered
+@context
+Two different problems hide behind "the features changed after the prediction":
+1. The prediction log claims a snapshot that was **ingested after** the prediction time, which is impossible in a correct system and points to a logging bug or a re-scored row with an old timestamp.
+2. A **newer** snapshot (`as_of_ts <= predicted_at`) existed in event time but was ingested **after** the prediction, so the model legitimately used older features. A re-score would differ.
+@problem
+For churn-model batches (v1–v4), return per `batch_id`: `predictions`, `logged_snapshot_not_yet_ingested` (problem 1) and `newer_snapshot_arrived_later` (problem 2: a snapshot newer than the logged one, with `as_of_ts <= predicted_at` and `ingested_at > predicted_at`). Sort by `batch_id`.
+@expected
+One row per churn batch; problem 1 appears in one batch, problem 2 around late arrivals and the backfill.
+@edge_cases
+- Predictions with NULL `feature_as_of_ts` cannot be checked for problem 1; for problem 2 any late snapshot ≤ predicted_at counts.
+@hint1
+Problem 1: join the logged snapshot and compare its `ingested_at` with `predicted_at`.
+@hint2
+Problem 2: EXISTS a snapshot of the same entity with `as_of_ts > COALESCE(feature_as_of_ts, '1900-01-01')`, `as_of_ts <= predicted_at` and `ingested_at > predicted_at`.
+@hint3
+Aggregate both flags per batch with conditional sums.
+@solution
+SELECT p.batch_id,
+       COUNT(*) AS predictions,
+       SUM(CASE WHEN f.ingested_at > p.predicted_at THEN 1 ELSE 0 END) AS logged_snapshot_not_yet_ingested,
+       SUM(CASE WHEN EXISTS (SELECT 1 FROM entity_features n
+                             WHERE n.entity_id = p.entity_id
+                               AND n.as_of_ts > COALESCE(p.feature_as_of_ts, TIMESTAMP '1900-01-01 00:00:00')
+                               AND n.as_of_ts <= p.predicted_at
+                               AND n.ingested_at > p.predicted_at)
+                THEN 1 ELSE 0 END) AS newer_snapshot_arrived_later
+FROM model_predictions p
+LEFT JOIN entity_features f
+       ON f.entity_id = p.entity_id
+      AND f.as_of_ts = p.feature_as_of_ts
+WHERE p.model_version_id IN (1, 2, 3, 4)
+GROUP BY p.batch_id
+ORDER BY p.batch_id;
+@assert
+sum(int(r[2]) for r in rows) >= 10
+@explanation
+Every feature row carries two times: `as_of_ts` (what it describes) and `ingested_at` (when it became readable). Comparing both with the prediction time separates:
+- **impossible** situations (logged snapshot not yet ingested), which are integrity bugs that also mean the offline record of "what the model saw" is wrong;
+- **expected** late-data situations, where the model correctly used older features. They explain why a later re-score differs and quantify how much late data affects serving.
+
+The LEFT JOIN keeps predictions whose snapshot was not logged. Their comparison with NULL is UNKNOWN and contributes 0 to problem 1.
+@mistakes
+- Treating problem 2 as leakage: it is the opposite (serving had less information than a later replay).
+- Ignoring `ingested_at` and only comparing `as_of_ts` with `predicted_at`.
+@performance
+One correlated EXISTS per prediction (≈ 3,000) on the primary key `(entity_id, as_of_ts)`.
+@interview
+Distinguishing event time from processing time is a key data-engineering concept that MLE interviews probe.
+
+### SQL-114
+title: ROC AUC in SQL with the rank-sum formula
+difficulty: Advanced
+primary: Threshold-free model evaluation
+secondary: Mann-Whitney U, average ranks for ties, per-model partitions
+concepts: ml_metrics, ml_model_compare, rank, window_agg, stats_summary
+roles: MLE
+time: 25
+dialect: BOTH
+tables: model_predictions(prediction_id, model_version_id, entity_id, predicted_at, score); model_versions(model_version_id, version_label, model_name); training_labels(label_id, entity_id, label_name, observation_date, label_value, label_available_at); ml_entities(entity_id, is_test_account)
+columns: version_label, positives, negatives, auc
+compare: ordered
+@context
+Thresholds differ between versions, so precision and recall do not compare model quality fairly. ROC AUC is threshold-free: the probability that a random churner receives a higher score than a random non-churner.
+@problem
+Using the same deduplicated (prediction, authoritative label) examples as SQL-107, compute AUC per churn-model version with the rank-sum (Mann–Whitney) formula, giving tied scores their average rank. Return `version_label`, `positives`, `negatives`, `auc` (4 decimals). Sort by version.
+@expected
+4 rows; AUC increases with newer versions.
+@edge_cases
+- Ties: each tied score receives the mean of the ranks it spans; otherwise AUC is biased.
+- A version with only one class has undefined AUC (NULL).
+@hint1
+Rank all examples of a version by score ascending.
+@hint2
+Average rank = `RANK() OVER (PARTITION BY v ORDER BY score) + (COUNT(*) OVER (PARTITION BY v, score) − 1) / 2.0`.
+@hint3
+AUC = (Σ ranks of positives − P(P + 1)/2) / (P · N).
+@solution
+WITH labels AS (
+    SELECT x.entity_id, x.observation_date, x.label_value
+    FROM (
+        SELECT l.entity_id, l.observation_date, l.label_value,
+               ROW_NUMBER() OVER (PARTITION BY l.entity_id, l.observation_date
+                                  ORDER BY l.label_available_at DESC, l.label_id DESC) AS rn
+        FROM training_labels l
+        WHERE l.label_name = 'churned_30d'
+    ) x
+    JOIN ml_entities e ON e.entity_id = x.entity_id
+    WHERE x.rn = 1 AND x.label_value IS NOT NULL AND e.is_test_account = FALSE
+),
+preds AS (
+    SELECT model_version_id, entity_id, pred_date, score
+    FROM (
+        SELECT p.model_version_id, p.entity_id, CAST(p.predicted_at AS DATE) AS pred_date, p.score,
+               ROW_NUMBER() OVER (PARTITION BY p.model_version_id, p.entity_id, CAST(p.predicted_at AS DATE)
+                                  ORDER BY p.predicted_at DESC, p.prediction_id DESC) AS rn
+        FROM model_predictions p
+        WHERE p.score IS NOT NULL
+    ) y
+    WHERE rn = 1
+),
+ranked AS (
+    SELECT v.version_label,
+           l.label_value,
+           RANK() OVER (PARTITION BY v.version_label ORDER BY p.score)
+             + (COUNT(*) OVER (PARTITION BY v.version_label, p.score) - 1) / 2.0 AS avg_rank
+    FROM preds p
+    JOIN labels l         ON l.entity_id = p.entity_id AND l.observation_date = p.pred_date
+    JOIN model_versions v ON v.model_version_id = p.model_version_id
+    WHERE v.model_name = 'churn_classifier'
+)
+SELECT version_label,
+       SUM(label_value)                    AS positives,
+       COUNT(*) - SUM(label_value)         AS negatives,
+       ROUND((SUM(CASE WHEN label_value = 1 THEN avg_rank ELSE 0 END)
+              - SUM(label_value) * (SUM(label_value) + 1) / 2.0)
+             / NULLIF(SUM(label_value) * (COUNT(*) - SUM(label_value)), 0), 4) AS auc
+FROM ranked
+GROUP BY version_label
+ORDER BY version_label;
+@assert
+all(0.5 < num(r[3]) <= 1 for r in rows)
+@explanation
+The Mann–Whitney U statistic counts, over all (positive, negative) pairs, how often the positive is ranked higher (ties count ½). Dividing by P·N gives exactly the ROC AUC, without building a ROC curve. Using ranks makes it an O(n log n) sort instead of an O(P·N) self-join.
+
+Tie handling: `RANK()` gives tied rows the *lowest* rank of their group; adding (group size − 1)/2 converts it to the average rank.
+
+Comparing versions on AUC removes the threshold confound seen in SQL-107. To compare v3 and v4 strictly, restrict both to the same paired examples (as in SQL-108).
+@mistakes
+- Using ROW_NUMBER (arbitrary order inside ties), which makes AUC depend on row order.
+- Computing AUC over raw, duplicated predictions.
+@performance
+One partitioned sort per version; trivial at this scale and fine for millions of rows in a warehouse.
+@interview
+Computing AUC in SQL is an impressive but practical skill; explaining the probabilistic meaning is the key.
+
+### SQL-115
+title: Offline test metrics versus production performance
+difficulty: Hard
+primary: Comparing model versions offline and online
+secondary: unpivoting computed metrics, joining to an evaluation table, gap analysis
+concepts: ml_model_compare, ml_metrics, union_all, multiple_ctes, inner_join
+roles: MLE
+time: 25
+dialect: BOTH
+tables: model_evaluations(model_version_id, eval_split, metric_name, metric_value); model_versions(model_version_id, version_label, model_name); model_predictions(prediction_id, model_version_id, entity_id, predicted_at, predicted_label, score); training_labels(label_id, entity_id, label_name, observation_date, label_value, label_available_at); ml_entities(entity_id, is_test_account)
+columns: version_label, metric_name, offline_test, online, gap
+compare: ordered
+@context
+The model registry stores offline test-set metrics computed at training time. Production performance (from predictions and later labels) is often worse. A large gap indicates leakage in offline evaluation, distribution shift, or a training/serving skew.
+@problem
+For churn versions v1–v3 (production models), compute online precision, recall and F1 as in SQL-107 and compare them with `model_evaluations` (`eval_split = 'test'`). Return `version_label`, `metric_name`, `offline_test`, `online` and `gap` = online − offline (all 3 decimals, as fractions). Sort by version, metric.
+@expected
+9 rows (3 versions x 3 metrics).
+@edge_cases
+- Offline metrics are stored as fractions (0–1); keep the online ones in the same unit.
+@hint1
+Compute TP/FP/FN per version (reuse the SQL-107 CTEs).
+@hint2
+Unpivot to (version, metric_name, online) with UNION ALL.
+@hint3
+Join to `model_evaluations` on version and metric name.
+@solution
+WITH labels AS (
+    SELECT x.entity_id, x.observation_date, x.label_value
+    FROM (
+        SELECT l.entity_id, l.observation_date, l.label_value,
+               ROW_NUMBER() OVER (PARTITION BY l.entity_id, l.observation_date
+                                  ORDER BY l.label_available_at DESC, l.label_id DESC) AS rn
+        FROM training_labels l
+        WHERE l.label_name = 'churned_30d'
+    ) x
+    JOIN ml_entities e ON e.entity_id = x.entity_id
+    WHERE x.rn = 1 AND x.label_value IS NOT NULL AND e.is_test_account = FALSE
+),
+preds AS (
+    SELECT model_version_id, entity_id, pred_date, predicted_label
+    FROM (
+        SELECT p.model_version_id, p.entity_id, CAST(p.predicted_at AS DATE) AS pred_date, p.predicted_label,
+               ROW_NUMBER() OVER (PARTITION BY p.model_version_id, p.entity_id, CAST(p.predicted_at AS DATE)
+                                  ORDER BY p.predicted_at DESC, p.prediction_id DESC) AS rn
+        FROM model_predictions p
+        WHERE p.score IS NOT NULL AND p.model_version_id IN (1, 2, 3)
+    ) y
+    WHERE rn = 1
+),
+cm AS (
+    SELECT p.model_version_id,
+           SUM(CASE WHEN p.predicted_label = 1 AND l.label_value = 1 THEN 1 ELSE 0 END) AS tp,
+           SUM(CASE WHEN p.predicted_label = 1 AND l.label_value = 0 THEN 1 ELSE 0 END) AS fp,
+           SUM(CASE WHEN p.predicted_label = 0 AND l.label_value = 1 THEN 1 ELSE 0 END) AS fn
+    FROM preds p
+    JOIN labels l ON l.entity_id = p.entity_id AND l.observation_date = p.pred_date
+    GROUP BY p.model_version_id
+),
+online AS (
+    SELECT model_version_id, 'precision' AS metric_name, 1.0 * tp / NULLIF(tp + fp, 0) AS online FROM cm
+    UNION ALL
+    SELECT model_version_id, 'recall', 1.0 * tp / NULLIF(tp + fn, 0) FROM cm
+    UNION ALL
+    SELECT model_version_id, 'f1', 2.0 * tp / NULLIF(2 * tp + fp + fn, 0) FROM cm
+)
+SELECT v.version_label,
+       o.metric_name,
+       ROUND(CAST(ev.metric_value AS DECIMAL(10,4)), 3)            AS offline_test,
+       ROUND(o.online, 3)                                          AS online,
+       ROUND(o.online - CAST(ev.metric_value AS DECIMAL(10,4)), 3) AS gap
+FROM online o
+JOIN model_versions v     ON v.model_version_id = o.model_version_id
+JOIN model_evaluations ev ON ev.model_version_id = o.model_version_id
+                         AND ev.metric_name = o.metric_name
+                         AND ev.eval_split = 'test'
+ORDER BY v.version_label, o.metric_name;
+@assert
+len(rows) == 9
+@explanation
+The offline table is in **long** format (one row per metric), so the computed online metrics are unpivoted the same way with UNION ALL before joining on `(model_version_id, metric_name)`. `metric_value` is DOUBLE PRECISION; casting to DECIMAL makes PostgreSQL's ROUND work and keeps both engines' outputs identical.
+
+Interpreting the gap:
+- consistently negative gaps → offline evaluation was optimistic (leakage, random instead of time-based split, different population);
+- gaps that grow over time → drift;
+- positive gaps happen with small online samples (noise).
+@mistakes
+- Comparing percentages with fractions.
+- Comparing online metrics of all runs with offline metrics computed on a test set from a different period without saying so.
+@performance
+Same cost as SQL-107; the final join is tiny.
+@interview
+Shows ownership beyond training: verifying that offline promises hold in production.
