@@ -302,3 +302,7 @@ SQL_Practice_Workbook/
 ```
 
 All companies, people, products, models and documents are fictional. Model names such as `atlas-large` or `nimbus-pro` do not refer to real products.
+
+## License
+
+Released under the [MIT License](LICENSE). You may use, copy, modify and share this workbook, including commercially, as long as the copyright and license notice stay with it.
